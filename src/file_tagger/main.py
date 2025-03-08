@@ -4,11 +4,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QTreeView, QListWidget, QPushButton, 
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-                           QComboBox, QHeaderView)
+                           QComboBox)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
 from PySide6.QtGui import QColor
 from sqlalchemy import and_, or_
-from models import init_db, File, Tag
+from .models import init_db, File, Tag
 
 class FileTagManager(QMainWindow):
     def __init__(self):
@@ -377,6 +377,3 @@ def main():
     window = FileTagManager()
     window.show()
     sys.exit(app.exec())
-
-if __name__ == '__main__':
-    main()
