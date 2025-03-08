@@ -40,3 +40,7 @@ htmlcov/
 *.db
 *.sqlite3
 *.sqlite
+
+# Encrypted configuration files
+config.encrypted
+.salt

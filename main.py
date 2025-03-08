@@ -4,21 +4,43 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QTreeView, QListWidget, QPushButton, 
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-                           QComboBox, QHeaderView)
+                           QComboBox, QHeaderView, QMenuBar, QMenu)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
 from PySide6.QtGui import QColor
 from sqlalchemy import and_, or_
 from models import init_db, File, Tag
+from config import Config
+from api_settings import APISettingsDialog
 
 class FileTagManager(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db_session = init_db()
+        # Initialize config with a password dialog
+        self.init_config()
         self.initUI()
+
+    def init_config(self):
+        password, ok = QInputDialog.getText(
+            self, 'Configuration Password', 
+            'Enter password to encrypt/decrypt settings:',
+            QLineEdit.Password
+        )
+        if not ok:
+            sys.exit(0)
+        self.config = Config(password)
         
     def initUI(self):
         self.setWindowTitle('File Tagger')
         self.setGeometry(100, 100, 1200, 700)
+        
+        # Create menu bar
+        menubar = self.menuBar()
+        settings_menu = menubar.addMenu('Settings')
+        
+        # Add API Settings action
+        api_settings_action = settings_menu.addAction('API Settings')
+        api_settings_action.triggered.connect(self.show_api_settings)
         
         # Create central widget and main layout
         central_widget = QWidget()
@@ -62,20 +84,28 @@ class FileTagManager(QMainWindow):
         self.tree.setSortingEnabled(True)
         self.tree.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.tree.header().setSectionsClickable(True)
-        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         
-        # Set initial directory
-        initial_path = QDir.homePath()
-        self.tree.setRootIndex(self.model.index(initial_path))
+        # Configure column resizing behavior
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.tree.header().setStretchLastSection(False)
+        
+        # Set initial column sizes
         self.tree.setColumnWidth(0, 250)  # Name column
         self.tree.setColumnWidth(1, 100)  # Size column
         self.tree.setColumnWidth(2, 100)  # Type column
         self.tree.setColumnWidth(3, 150)  # Date Modified column
         
+        # Set minimum column widths to prevent columns from becoming too narrow
+        self.tree.header().setMinimumSectionSize(50)
+        
         # Connect signals
         self.tree.selectionModel().selectionChanged.connect(self.on_file_selected)
         self.tree.doubleClicked.connect(self.on_item_double_clicked)
         explorer_layout.addWidget(self.tree)
+        
+        # Set initial directory
+        initial_path = QDir.homePath()
+        self.tree.setRootIndex(self.model.index(initial_path))
         
         # Update initial path display
         self.path_display.setText(initial_path)
@@ -226,7 +256,7 @@ class FileTagManager(QMainWindow):
     def delete_tag(self):
         current_item = self.tag_list.currentItem()
         if current_item:
-            tag = self.db_session.query(Tag).filter_by(name=current_item.text()).first()
+            tag = self.db_session.query(Tag).filter_by(name(current_item.text())).first()
             if tag:
                 self.db_session.delete(tag)
                 self.db_session.commit()
@@ -378,6 +408,10 @@ class FileTagManager(QMainWindow):
             # Select the file in the tree view
             self.tree.setCurrentIndex(self.model.index(file_path))
             self.tree.scrollTo(self.model.index(file_path))
+
+    def show_api_settings(self):
+        dialog = APISettingsDialog(self.config, self)
+        dialog.exec()
 
 def main():
     app = QApplication(sys.argv)
