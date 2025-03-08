@@ -256,7 +256,7 @@ class FileTagManager(QMainWindow):
     def delete_tag(self):
         current_item = self.tag_list.currentItem()
         if current_item:
-            tag = self.db_session.query(Tag).filter_by(name(current_item.text())).first()
+            tag = self.db_session.query(Tag).filter_by(name=current_item.text()).first()
             if tag:
                 self.db_session.delete(tag)
                 self.db_session.commit()
