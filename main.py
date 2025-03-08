@@ -55,20 +55,22 @@ class FileTagManager(QMainWindow):
         
         # File system model and view
         self.model = QFileSystemModel()
-        self.model.setRootPath(QDir.rootPath())
+        self.model.setRootPath("")  # Set empty string to allow access to all drives
         
         self.tree = QTreeView()
         self.tree.setModel(self.model)
-        self.tree.setRootIndex(self.model.index(QDir.homePath()))  # Start from home directory
+        self.tree.setSortingEnabled(True)
+        self.tree.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        self.tree.header().setSectionsClickable(True)
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        
+        # Set initial directory
+        initial_path = QDir.homePath()
+        self.tree.setRootIndex(self.model.index(initial_path))
         self.tree.setColumnWidth(0, 250)  # Name column
         self.tree.setColumnWidth(1, 100)  # Size column
         self.tree.setColumnWidth(2, 100)  # Type column
         self.tree.setColumnWidth(3, 150)  # Date Modified column
-        
-        # Enable sorting
-        self.tree.setSortingEnabled(True)
-        self.tree.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
-        self.tree.header().setSectionsClickable(True)
         
         # Connect signals
         self.tree.selectionModel().selectionChanged.connect(self.on_file_selected)
@@ -76,7 +78,7 @@ class FileTagManager(QMainWindow):
         explorer_layout.addWidget(self.tree)
         
         # Update initial path display
-        self.path_display.setText(QDir.homePath())
+        self.path_display.setText(initial_path)
         
         # Tag management section
         tag_layout = QVBoxLayout()
@@ -285,7 +287,13 @@ class FileTagManager(QMainWindow):
     def on_drive_changed(self, index):
         if index >= 0:
             drive_path = self.drive_combo.itemData(index)
-            self.tree.setRootIndex(self.model.index(drive_path))
+            # Update model and view for the new drive
+            model_index = self.model.index(drive_path)
+            self.tree.setRootIndex(model_index)
+            # Ensure sorting is maintained after drive change
+            current_column = self.tree.header().sortIndicatorSection()
+            current_order = self.tree.header().sortIndicatorOrder()
+            self.tree.sortByColumn(current_column, current_order)
             self.path_display.setText(drive_path)
 
     def go_home(self):
