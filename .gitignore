@@ -44,3 +44,4 @@ htmlcov/
 # Encrypted configuration files
 config.encrypted
 .salt
+.passhash

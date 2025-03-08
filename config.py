@@ -5,9 +5,11 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
+import hashlib
 
 CONFIG_FILE = "config.encrypted"
 SALT_FILE = ".salt"
+PASS_HASH_FILE = ".passhash"
 
 def generate_key(password: str, salt: bytes = None) -> bytes:
     """Generate an encryption key from password and salt."""
@@ -37,8 +39,53 @@ def get_encryption_key(password: str) -> Fernet:
     key = generate_key(password, salt)
     return Fernet(key)
 
+def hash_password(password: str, salt: bytes = None) -> tuple[str, bytes]:
+    """Hash password with a salt using SHA256."""
+    if salt is None:
+        salt = os.urandom(32)
+    key = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt,
+        100000
+    )
+    return base64.b64encode(key).decode('utf-8'), salt
+
+def verify_password(password: str) -> bool:
+    """Verify if the password matches the stored hash."""
+    if not os.path.exists(PASS_HASH_FILE):
+        return True  # First time setup
+    
+    try:
+        with open(PASS_HASH_FILE, 'rb') as f:
+            stored_data = json.load(f)
+            stored_hash = stored_data['hash']
+            salt = base64.b64decode(stored_data['salt'])
+            
+        password_hash, _ = hash_password(password, salt)
+        return password_hash == stored_hash
+    except Exception:
+        return False
+
+def store_password_hash(password: str):
+    """Store the hashed password."""
+    password_hash, salt = hash_password(password)
+    with open(PASS_HASH_FILE, 'w') as f:
+        json.dump({
+            'hash': password_hash,
+            'salt': base64.b64encode(salt).decode('utf-8')
+        }, f)
+
 class Config:
     def __init__(self, password: str):
+        """Initialize config with password verification."""
+        if not verify_password(password):
+            raise ValueError("Invalid password")
+            
+        # Store password hash if this is first time setup
+        if not os.path.exists(PASS_HASH_FILE):
+            store_password_hash(password)
+            
         self.password = password
         self.fernet = get_encryption_key(password)
         self.config_data = self._load_config()
