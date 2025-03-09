@@ -4,13 +4,15 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QTreeView, QListWidget, QPushButton, 
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-                           QComboBox, QHeaderView, QMenuBar, QMenu)
+                           QComboBox, QHeaderView, QMenuBar, QMenu, QDialog)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
 from PySide6.QtGui import QColor
 from sqlalchemy import and_, or_
 from models import init_db, File, Tag
 from config import Config
 from api_settings import APISettingsDialog
+from password_management import PasswordManagementDialog
+from tag_suggestion import TagSuggestionDialog
 
 class FileTagManager(QMainWindow):
     def __init__(self):
@@ -41,6 +43,10 @@ class FileTagManager(QMainWindow):
         # Add API Settings action
         api_settings_action = settings_menu.addAction('API Settings')
         api_settings_action.triggered.connect(self.show_api_settings)
+        
+        # Add Password Management action
+        password_action = settings_menu.addAction('Password Management')
+        password_action.triggered.connect(self.show_password_management)
         
         # Create central widget and main layout
         central_widget = QWidget()
@@ -147,9 +153,12 @@ class FileTagManager(QMainWindow):
         add_file_tag_btn.clicked.connect(self.add_tag_to_file)
         remove_file_tag_btn = QPushButton("Remove Tag from File")
         remove_file_tag_btn.clicked.connect(self.remove_tag_from_file)
+        suggest_tags_btn = QPushButton("Suggest Tags (AI)")
+        suggest_tags_btn.clicked.connect(self.suggest_tags)
         
         file_tag_buttons.addWidget(add_file_tag_btn)
         file_tag_buttons.addWidget(remove_file_tag_btn)
+        file_tag_buttons.addWidget(suggest_tags_btn)
         file_tags_layout.addLayout(file_tag_buttons)
         
         # Search section
@@ -256,7 +265,7 @@ class FileTagManager(QMainWindow):
     def delete_tag(self):
         current_item = self.tag_list.currentItem()
         if current_item:
-            tag = self.db_session.query(Tag).filter_by(name=current_item.text()).first()
+            tag = self.db_session.query(Tag).filter_by(name(current_item.text())).first()
             if tag:
                 self.db_session.delete(tag)
                 self.db_session.commit()
@@ -412,6 +421,25 @@ class FileTagManager(QMainWindow):
     def show_api_settings(self):
         dialog = APISettingsDialog(self.config, self)
         dialog.exec()
+
+    def show_password_management(self):
+        dialog = PasswordManagementDialog(self.config, self)
+        dialog.exec()
+
+    def suggest_tags(self):
+        """Open the tag suggestion dialog for the current file."""
+        if not self.current_file_path:
+            QMessageBox.warning(self, "Error", "Please select a file first!")
+            return
+            
+        if os.path.isdir(self.current_file_path):
+            QMessageBox.warning(self, "Error", "Please select a file, not a directory!")
+            return
+            
+        dialog = TagSuggestionDialog(self.config, self.db_session, self.current_file_path, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh_tags()
+            self.refresh_file_tags()
 
 def main():
     app = QApplication(sys.argv)
