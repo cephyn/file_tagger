@@ -1,22 +1,24 @@
 import os
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Callable
 import mimetypes
 import hashlib
 import json
 from datetime import datetime, timedelta
 import importlib
+from pypdf import PdfReader
 from models import TagSuggestionCache
 
-MAX_CONTENT_SIZE = 1024 * 1024  # 1MB max for content analysis
+MAX_AI_CONTENT_SIZE = 10 * 1024 * 1024  # 10MB max for AI analysis
 CACHE_DURATION = timedelta(days=7)  # Cache suggestions for 7 days
 
 class AIService:
-    def __init__(self, provider: str, api_key: str, db_session):
+    def __init__(self, provider: str, api_key: str, db_session, progress_callback: Callable[[str, int], None] = None):
         """Initialize AI service with provider and API key."""
         self.provider = provider
         self.api_key = api_key
         self.db_session = db_session
         self.modules = {}  # Store imported modules
+        self.progress_callback = progress_callback
         self._setup_client()
         
     def _setup_client(self):
@@ -31,6 +33,7 @@ class AIService:
             elif self.provider == 'gemini':
                 self.modules['google'] = importlib.import_module('google.generativeai')
                 self.modules['google'].configure(api_key=self.api_key)
+                # Do not alter the model in the next line
                 self.model = self.modules['google'].GenerativeModel('gemini-2.0-flash-lite')
             else:
                 raise ValueError(f"Unsupported provider: {self.provider}")
@@ -49,6 +52,9 @@ class AIService:
             
     def _get_file_info(self, file_path: str) -> Tuple[str, str]:
         """Get file information and sample content for analysis."""
+        if self.progress_callback:
+            self.progress_callback("Starting file analysis...", 0)
+
         filename = os.path.basename(file_path)
         mime_type, _ = mimetypes.guess_type(file_path)
         size = os.path.getsize(file_path)
@@ -59,19 +65,47 @@ class AIService:
         content_sample = ""
         
         try:
-            with open(file_path, 'rb') as f:
+            with open(file_path, "rb") as f:
                 # Read first chunk for hashing
                 chunk = f.read(8192)
                 hasher.update(chunk)
                 
                 # For text files, try to get content sample
-                if mime_type and mime_type.startswith('text/'):
+                if mime_type and mime_type.startswith("text/"):
+                    if self.progress_callback:
+                        self.progress_callback("Extracting text content...", 30)
                     try:
                         f.seek(0)
-                        content = f.read(MAX_CONTENT_SIZE).decode('utf-8')
-                        content_sample = f"\nContent Sample:\n{content[:1000]}..."
+                        content = f.read(MAX_AI_CONTENT_SIZE).decode("utf-8")
+                        content_sample = f"\\nContent Sample:\\n{content[:1000]}..."
                     except:
                         pass  # Ignore decoding errors
+                # For PDF files, extract text without size limit
+                elif mime_type == "application/pdf":
+                    try:
+                        f.seek(0)
+                        reader = PdfReader(f)
+                        text = ""
+                        total_pages = len(reader.pages)
+                        
+                        # Extract text from all pages with progress updates
+                        for i, page in enumerate(reader.pages):
+                            if self.progress_callback:
+                                progress = 30 + int((i / total_pages) * 40)  # 30-70% progress
+                                self.progress_callback(f"Extracting text from page {i+1}/{total_pages}...", progress)
+                            text += page.extract_text()
+                            
+                        # Trim content for AI analysis if needed
+                        if len(text.encode("utf-8")) > MAX_AI_CONTENT_SIZE:
+                            if self.progress_callback:
+                                self.progress_callback("Trimming content for AI analysis...", 75)
+                            text = text.encode("utf-8")[:MAX_AI_CONTENT_SIZE].decode("utf-8", errors="ignore")
+                            text += "...(truncated for AI analysis)"
+                            
+                        if text:
+                            content_sample = f"\\nContent Sample:\\n{text}"
+                    except Exception as e:
+                        print(f"Warning: Could not extract PDF text: {e}")
                 
                 # Continue hashing rest of file
                 while chunk := f.read(8192):
@@ -81,12 +115,15 @@ class AIService:
             print(f"Warning: Could not read file content: {e}")
         
         file_info = (
-            f"Filename: {filename}\n"
-            f"Type: {mime_type}\n"
-            f"Size: {size} bytes\n"
+            f"Filename: {filename}\\n"
+            f"Type: {mime_type}\\n"
+            f"Size: {size} bytes\\n"
             f"Last modified: {modified}"
             f"{content_sample}"
         )
+
+        if self.progress_callback:
+            self.progress_callback("File analysis complete", 80)
         
         return file_info, hasher.hexdigest()
         
@@ -99,21 +136,29 @@ class AIService:
         file_info, file_hash = self._get_file_info(file_path)
         cached = self._check_cache(file_path, file_hash)
         if cached:
+            if self.progress_callback:
+                self.progress_callback("Using cached results", 100)
             return self._parse_cached_suggestions(cached)
             
+        if self.progress_callback:
+            self.progress_callback("Preparing AI analysis...", 85)
+
         prompt = (
-            f"Analyze this file information and suggest appropriate tags:\n\n{file_info}\n\n"
-            f"Existing tags in the system: {', '.join(existing_tags)}\n\n"
-            "Provide your response in this format:\n"
-            "EXISTING_TAGS: tag1 (confidence), tag2 (confidence), ...\n"
-            "NEW_TAGS: tag1 (confidence), tag2 (confidence), ...\n"
-            "EXPLANATION: brief explanation of why these tags were chosen\n\n"
-            "Notes:\n"
-            "- Confidence should be a number between 0 and 1\n"
-            "- Only suggest tags with confidence > 0.3\n"
+            f"Analyze this file information and suggest appropriate tags:\\n\\n{file_info}\\n\\n"
+            f"Existing tags in the system: {', '.join(existing_tags)}\\n\\n"
+            "Provide your response in this format:\\n"
+            "EXISTING_TAGS: tag1 (confidence), tag2 (confidence), ...\\n"
+            "NEW_TAGS: tag1 (confidence), tag2 (confidence), ...\\n"
+            "EXPLANATION: brief explanation of why these tags were chosen\\n\\n"
+            "Notes:\\n"
+            "- Confidence should be a number between 0 and 1\\n"
+            "- Only suggest tags with confidence > 0.3\\n"
             "- Consider both the filename and content (if available)"
         )
         
+        if self.progress_callback:
+            self.progress_callback("Sending to AI service...", 90)
+
         if self.provider == 'openai':
             result = self._analyze_openai(prompt, existing_tags)
         elif self.provider == 'anthropic':
@@ -124,7 +169,12 @@ class AIService:
             raise ValueError(f"Unsupported provider: {self.provider}")
             
         # Cache the results
+        if self.progress_callback:
+            self.progress_callback("Caching results...", 95)
         self._cache_suggestions(file_path, file_hash, result)
+
+        if self.progress_callback:
+            self.progress_callback("Analysis complete", 100)
         return result
             
     def _analyze_openai(self, prompt: str, existing_tags: List[str]) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]]]:

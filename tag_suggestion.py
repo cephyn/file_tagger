@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QLabel, QListWidget, QMessageBox, QProgressDialog,
-                            QListWidgetItem, QProgressBar, QWidget)
+                            QListWidgetItem, QProgressBar, QWidget, QApplication)
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
@@ -65,9 +65,21 @@ class TagSuggestionDialog(QDialog):
         layout = QVBoxLayout(self)
         
         # File info
-        self.file_label = QLabel(f"Analyzing: {self.file_path}")
+        self.file_label = QLabel(f"Selected file: {self.file_path}")
         self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
+        
+        # Progress section
+        progress_layout = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setTextVisible(True)
+        
+        self.status_label = QLabel("Ready")
+        progress_layout.addWidget(self.status_label, stretch=1)
+        progress_layout.addWidget(self.progress_bar)
+        layout.addLayout(progress_layout)
         
         # Cache status
         self.cache_label = QLabel("")
@@ -133,14 +145,15 @@ class TagSuggestionDialog(QDialog):
         list_widget.addItem(item)
         list_widget.setItemWidget(item, confidence_widget)
         
+    def _update_progress(self, status: str, progress: int):
+        """Update progress bar and status label."""
+        self.status_label.setText(status)
+        self.progress_bar.setValue(progress)
+        QApplication.processEvents()  # Ensure UI updates
+        
     def analyze_file(self, force_refresh=False):
         """Analyze the file using the configured AI provider."""
         try:
-            # Show progress dialog
-            progress = QProgressDialog("Analyzing file...", None, 0, 0, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            
             # Get all existing tags
             existing_tags = [tag.name for tag in self.db_session.query(Tag).all()]
             
@@ -161,10 +174,18 @@ class TagSuggestionDialog(QDialog):
                 ).delete()
                 self.db_session.commit()
             
-            # Create AI service and analyze
-            service = AIService(provider, api_key, self.db_session)
+            # Create AI service with progress callback
+            service = AIService(
+                provider, 
+                api_key, 
+                self.db_session,
+                progress_callback=self._update_progress
+            )
+            
+            # Analyze file
             existing_matches, new_suggestions = service.analyze_file(
-                self.file_path, existing_tags
+                self.file_path, 
+                existing_tags
             )
             
             # Update lists
@@ -193,9 +214,10 @@ class TagSuggestionDialog(QDialog):
                 self.cache_label.setText("Generated new suggestions")
                 self.cache_label.setStyleSheet("color: green;")
             
-            progress.close()
+            self._update_progress("Ready", 100)
             
         except Exception as e:
+            self._update_progress("Error", 0)
             QMessageBox.warning(self, "Error", f"Failed to analyze file: {str(e)}")
             
     def apply_tags(self):

@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QTreeView, QListWidget, QPushButton, 
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-                           QComboBox, QHeaderView, QMenuBar, QMenu, QDialog)
+                           QComboBox, QHeaderView, QMenuBar, QMenu, QDialog, QFileDialog)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
 from PySide6.QtGui import QColor
 from sqlalchemy import and_, or_
@@ -43,6 +43,10 @@ class FileTagManager(QMainWindow):
         # Add API Settings action
         api_settings_action = settings_menu.addAction('API Settings')
         api_settings_action.triggered.connect(self.show_api_settings)
+        
+        # Add Set Home Directory action
+        home_dir_action = settings_menu.addAction('Set Home Directory')
+        home_dir_action.triggered.connect(self.set_home_directory)
         
         # Add Password Management action
         password_action = settings_menu.addAction('Password Management')
@@ -109,12 +113,19 @@ class FileTagManager(QMainWindow):
         self.tree.doubleClicked.connect(self.on_item_double_clicked)
         explorer_layout.addWidget(self.tree)
         
-        # Set initial directory
-        initial_path = QDir.homePath()
+        # Set initial directory from config
+        initial_path = self.config.get_home_directory()
         self.tree.setRootIndex(self.model.index(initial_path))
         
         # Update initial path display
         self.path_display.setText(initial_path)
+        
+        # Update drive combo to match initial path
+        drive = os.path.splitdrive(initial_path)[0] + os.path.sep
+        for i in range(self.drive_combo.count()):
+            if self.drive_combo.itemData(i).startswith(drive):
+                self.drive_combo.setCurrentIndex(i)
+                break
         
         # Tag management section
         tag_layout = QVBoxLayout()
@@ -265,7 +276,7 @@ class FileTagManager(QMainWindow):
     def delete_tag(self):
         current_item = self.tag_list.currentItem()
         if current_item:
-            tag = self.db_session.query(Tag).filter_by(name(current_item.text())).first()
+            tag = self.db_session.query(Tag).filter_by(name=current_item.text()).first()
             if tag:
                 self.db_session.delete(tag)
                 self.db_session.commit()
@@ -336,7 +347,8 @@ class FileTagManager(QMainWindow):
             self.path_display.setText(drive_path)
 
     def go_home(self):
-        home_path = QDir.homePath()
+        """Navigate to the configured home directory."""
+        home_path = self.config.get_home_directory()
         self.tree.setRootIndex(self.model.index(home_path))
         self.path_display.setText(home_path)
         # Select the drive containing home directory
@@ -440,6 +452,30 @@ class FileTagManager(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.refresh_tags()
             self.refresh_file_tags()
+
+    def set_home_directory(self):
+        """Open dialog to set home directory."""
+        current_dir = self.config.get_home_directory()
+        new_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Home Directory",
+            current_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if new_dir:
+            if self.config.set_home_directory(new_dir):
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    "Home directory updated successfully.\nNew location will be used next time you start the application."
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "Failed to set home directory. Please ensure the selected directory exists and is accessible."
+                )
 
 def main():
     app = QApplication(sys.argv)

@@ -132,14 +132,21 @@ class Config:
                     'gemini': '',
                     'anthropic': ''
                 },
-                'selected_provider': 'openai'
+                'selected_provider': 'openai',
+                'home_directory': str(Path.home())  # Default to user's home directory
             }
         
         try:
             with open(CONFIG_FILE, 'rb') as f:
                 encrypted_data = f.read()
             decrypted_data = self.fernet.decrypt(encrypted_data)
-            return json.loads(decrypted_data)
+            config = json.loads(decrypted_data)
+            
+            # Add home_directory if it doesn't exist in older config files
+            if 'home_directory' not in config:
+                config['home_directory'] = str(Path.home())
+                
+            return config
         except Exception:
             return {
                 'api_keys': {
@@ -147,7 +154,8 @@ class Config:
                     'gemini': '',
                     'anthropic': ''
                 },
-                'selected_provider': 'openai'
+                'selected_provider': 'openai',
+                'home_directory': str(Path.home())
             }
     
     def save(self):
@@ -267,3 +275,15 @@ class Config:
             
         except Exception:
             return False, ""
+
+    def set_home_directory(self, path: str):
+        """Set the home directory for the file browser."""
+        if os.path.exists(path) and os.path.isdir(path):
+            self.config_data['home_directory'] = str(Path(path))
+            self.save()
+            return True
+        return False
+    
+    def get_home_directory(self) -> str:
+        """Get the configured home directory."""
+        return self.config_data.get('home_directory', str(Path.home()))
