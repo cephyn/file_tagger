@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QLabel, QListWidget, QMessageBox, QProgressDialog,
                             QListWidgetItem, QProgressBar, QWidget, QApplication,
                             QTextEdit)
-from PySide6.QtCore import Qt, QSize, QRandomGenerator, Signal
+from PySide6.QtCore import Qt, QSize, QRandomGenerator, Signal, QEvent
 from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -95,17 +95,27 @@ class ConfidenceWidget(QWidget):
         # Store the original tag name and confidence for later use
         self.tag_name = tag
         self.confidence = confidence
+        self.progress_bar = progress
         
-        # Make the widget use hand cursor to indicate it's clickable
-        self.setCursor(Qt.PointingHandCursor)
+        # Only make the progress bar use hand cursor to indicate it's clickable
+        self.progress_bar.setCursor(Qt.PointingHandCursor)
         
-        # Add tooltip about clicking for explanation
-        self.setToolTip(f"Click for explanation of {tag} tag")
+        # Add tooltip only to the progress bar
+        self.progress_bar.setToolTip(f"Click for explanation of {tag} tag")
+        
+        # Install event filter on progress bar to catch clicks
+        self.progress_bar.installEventFilter(self)
+        
+    def eventFilter(self, obj, event):
+        """Filter events to capture clicks on the progress bar."""
+        if obj == self.progress_bar and event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.clicked.emit(self.tag_name, self.confidence)
+            return True
+        return super().eventFilter(obj, event)
         
     def mousePressEvent(self, event):
-        """Handle mouse click events to emit our custom signal."""
-        if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.tag_name, self.confidence)
+        """Handle mouse click events but don't trigger explanation."""
+        # No longer emit signal for the whole widget
         super().mousePressEvent(event)
 
 class TagSuggestionDialog(QDialog):

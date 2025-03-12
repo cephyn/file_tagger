@@ -32,7 +32,10 @@ A Windows file management application that allows users to add custom tags to fi
 ### Supported AI Providers
 - OpenAI (GPT-3.5)
 - Google Gemini
-- Anthropic Claude
+- Anthropic Claude (Claude-3 Sonnet)
+- Local Models
+  - LlamaCPP compatible models
+  - CTransformers compatible models
 
 ### Security
 - Password-protected configuration
@@ -42,11 +45,20 @@ A Windows file management application that allows users to add custom tags to fi
 
 ## Installation
 
-1. Ensure you have Python 3.8 or higher installed
+1. Ensure you have Python 3.11 or higher installed
 2. Clone this repository
 3. Install dependencies:
    ```
    pip install -r requirements.txt
+   ```
+
+4. Optional: For local AI model support
+   ```
+   # For LlamaCPP models
+   pip install llama-cpp-python
+   
+   # For CTransformers models
+   pip install ctransformers
    ```
 
 ## Running the Application
@@ -63,8 +75,10 @@ On first run, you'll be prompted to set a password for encrypting your settings.
 ### API Configuration
 1. Click on "Settings" in the menu bar
 2. Select "API Settings"
-3. Choose your AI provider
-4. Enter your API key (can toggle visibility)
+3. Choose your AI provider:
+   - For cloud providers (OpenAI, Gemini, Claude): Enter your API key
+   - For local models: Select model type (LlamaCPP/CTransformers) and choose model file
+4. Optionally customize the AI system message
 5. Click Save
 
 ### Home Directory Setup
@@ -108,6 +122,7 @@ file_tagger/
 
 ## Dependencies
 
+Main Dependencies:
 - PySide6 - GUI framework
 - SQLAlchemy - Database ORM
 - cryptography - Secure storage of API keys
@@ -115,6 +130,10 @@ file_tagger/
 - google-generativeai - Google Gemini API client
 - anthropic - Claude API client
 - pypdf - PDF text extraction
+
+Optional Dependencies:
+- llama-cpp-python - Local LlamaCPP model support
+- ctransformers - Local CTransformers model support
 
 ## Security Features
 
@@ -125,6 +144,15 @@ file_tagger/
 - File content is only analyzed temporarily, never stored
 - Tag suggestions are cached securely in the local database
 - Recovery key system for password reset
+
+## Customization
+
+### AI System Message
+You can customize the system message used for AI interactions:
+1. Go to Settings > API Settings
+2. Edit the system message in the provided text area
+3. Click Save to apply changes
+4. Use "Reset to Default" to restore the original message
 
 ## License
 

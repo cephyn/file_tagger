@@ -67,8 +67,6 @@ class FileTagManager(QMainWindow):
         
         # Drive selection
         self.drive_combo = QComboBox()
-        self.update_drive_list()
-        self.drive_combo.currentIndexChanged.connect(self.on_drive_changed)
         
         home_btn = QPushButton("Home")
         home_btn.clicked.connect(self.go_home)
@@ -120,12 +118,19 @@ class FileTagManager(QMainWindow):
         # Update initial path display
         self.path_display.setText(initial_path)
         
-        # Update drive combo to match initial path
+        # First populate the drive list
+        self.update_drive_list()
+        
+        # Now set the correct drive based on initial path
         drive = os.path.splitdrive(initial_path)[0] + os.path.sep
         for i in range(self.drive_combo.count()):
             if self.drive_combo.itemData(i).startswith(drive):
                 self.drive_combo.setCurrentIndex(i)
                 break
+        
+        # Connect drive combo change event after setting the initial value
+        # to avoid triggering it during initialization
+        self.drive_combo.currentIndexChanged.connect(self.on_drive_changed)
         
         # Tag management section
         tag_layout = QVBoxLayout()
