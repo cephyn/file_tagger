@@ -1,15 +1,61 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QLabel, QListWidget, QMessageBox, QProgressDialog,
-                            QListWidgetItem, QProgressBar, QWidget, QApplication)
-from PySide6.QtCore import Qt, QSize
+                            QListWidgetItem, QProgressBar, QWidget, QApplication,
+                            QTextEdit)
+from PySide6.QtCore import Qt, QSize, QRandomGenerator, Signal
 from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
 from datetime import datetime
+import random
 from models import Tag, File, TagSuggestionCache
 from ai_service import AIService
 from config import Config
 
+class TagExplanationDialog(QDialog):
+    """Dialog to display explanations for tag suggestions."""
+    def __init__(self, tag_name, confidence, explanation, parent=None):
+        super().__init__(parent)
+        self.tag_name = tag_name
+        self.confidence = confidence
+        self.explanation = explanation
+        self.initUI()
+        
+    def initUI(self):
+        self.setWindowTitle(f'Tag Explanation: {self.tag_name}')
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        
+        # Tag name and confidence
+        header_layout = QHBoxLayout()
+        tag_label = QLabel(f"<b>Tag:</b> {self.tag_name}")
+        confidence_label = QLabel(f"<b>Confidence:</b> {self.confidence:.2f}")
+        header_layout.addWidget(tag_label)
+        header_layout.addWidget(confidence_label)
+        layout.addLayout(header_layout)
+        
+        # Explanation text
+        explanation_label = QLabel("<b>Explanation:</b>")
+        layout.addWidget(explanation_label)
+        
+        explanation_text = QTextEdit()
+        explanation_text.setReadOnly(True)
+        explanation_text.setPlainText(self.explanation)
+        explanation_text.setMinimumHeight(200)
+        layout.addWidget(explanation_text)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+        
+        # Set dialog size
+        self.setMinimumWidth(400)
+        self.resize(500, 300)
+
 class ConfidenceWidget(QWidget):
+    # Signal emitted when widget is clicked
+    clicked = Signal(str, float)
+    
     def __init__(self, tag: str, confidence: float, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
@@ -46,8 +92,21 @@ class ConfidenceWidget(QWidget):
         progress.setStyleSheet(style)
         layout.addWidget(progress)
         
-        # Store the original tag name for later use
+        # Store the original tag name and confidence for later use
         self.tag_name = tag
+        self.confidence = confidence
+        
+        # Make the widget use hand cursor to indicate it's clickable
+        self.setCursor(Qt.PointingHandCursor)
+        
+        # Add tooltip about clicking for explanation
+        self.setToolTip(f"Click for explanation of {tag} tag")
+        
+    def mousePressEvent(self, event):
+        """Handle mouse click events to emit our custom signal."""
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.tag_name, self.confidence)
+        super().mousePressEvent(event)
 
 class TagSuggestionDialog(QDialog):
     def __init__(self, config: Config, db_session: Session, file_path: str, parent=None):
@@ -56,6 +115,8 @@ class TagSuggestionDialog(QDialog):
         self.db_session = db_session
         self.file_path = file_path
         self.using_cache = False
+        self.explanation_text = ""
+        self.tag_explanations = {}  # Dictionary to store tag-specific explanations
         self.initUI()
         self.analyze_file()
         
@@ -111,6 +172,11 @@ class TagSuggestionDialog(QDialog):
         tag_layout.addLayout(new_section)
         layout.addLayout(tag_layout)
         
+        # Info label about clicking for explanations
+        info_label = QLabel("Click on any tag confidence bar for an explanation of why it was suggested")
+        info_label.setStyleSheet("color: blue; font-style: italic;")
+        layout.addWidget(info_label)
+        
         # Buttons
         button_layout = QHBoxLayout()
         
@@ -138,6 +204,7 @@ class TagSuggestionDialog(QDialog):
         item.setSizeHint(QSize(0, 40))  # Set appropriate height for the widget
         
         confidence_widget = ConfidenceWidget(tag, confidence)
+        confidence_widget.clicked.connect(self.show_tag_explanation)
         
         # Store the widget reference to prevent garbage collection
         item.setData(Qt.UserRole, confidence_widget)
@@ -150,6 +217,18 @@ class TagSuggestionDialog(QDialog):
         self.status_label.setText(status)
         self.progress_bar.setValue(progress)
         QApplication.processEvents()  # Ensure UI updates
+    
+    def show_tag_explanation(self, tag_name: str, confidence: float):
+        """Show explanation dialog for the selected tag."""
+        # Get the general explanation
+        explanation = self.explanation_text
+        
+        # Check for tag-specific explanations (could be implemented in the future)
+        tag_specific = ""
+        
+        # Show the explanation dialog
+        dialog = TagExplanationDialog(tag_name, confidence, explanation, self)
+        dialog.exec()
         
     def analyze_file(self, force_refresh=False):
         """Analyze the file using the configured AI provider."""
@@ -161,7 +240,20 @@ class TagSuggestionDialog(QDialog):
             provider = self.config.get_selected_provider()
             api_key = self.config.get_api_key(provider)
             
-            if not api_key:
+            # Get custom system message
+            system_message = self.config.get_system_message()
+            
+            # For local models, handle the local model settings instead of API key
+            if provider == 'local':
+                local_model_path = self.config.get_local_model_path()
+                local_model_type = self.config.get_local_model_type()
+                
+                if not local_model_path:
+                    QMessageBox.warning(self, "Error", 
+                                      "No local model path configured.\n"
+                                      "Please configure it in Settings > API Settings.")
+                    return
+            elif not api_key:
                 QMessageBox.warning(self, "Error", 
                                   "No API key configured for the selected provider.\n"
                                   "Please configure it in Settings > API Settings.")
@@ -175,18 +267,33 @@ class TagSuggestionDialog(QDialog):
                 self.db_session.commit()
             
             # Create AI service with progress callback
-            service = AIService(
-                provider, 
-                api_key, 
-                self.db_session,
-                progress_callback=self._update_progress
-            )
+            if provider == 'local':
+                service = AIService(
+                    provider, 
+                    api_key="", 
+                    db_session=self.db_session,
+                    progress_callback=self._update_progress,
+                    local_model_path=local_model_path,
+                    local_model_type=local_model_type,
+                    system_message=system_message
+                )
+            else:
+                service = AIService(
+                    provider, 
+                    api_key, 
+                    db_session=self.db_session,
+                    progress_callback=self._update_progress,
+                    system_message=system_message
+                )
             
             # Analyze file
-            existing_matches, new_suggestions = service.analyze_file(
+            existing_matches, new_suggestions, explanation = service.analyze_file(
                 self.file_path, 
                 existing_tags
             )
+            
+            # Store the explanation
+            self.explanation_text = explanation
             
             # Update lists
             self.existing_list.clear()
@@ -249,11 +356,16 @@ class TagSuggestionDialog(QDialog):
                 if tag and tag not in file_obj.tags:
                     file_obj.tags.append(tag)
             
-            # Create and add new tags
+            # Create and add new tags with random colors
             for tag_name in selected_new:
                 tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
                 if not tag:
-                    tag = Tag(name=tag_name, color='#808080')  # Default gray color
+                    # Generate random color with good saturation and brightness
+                    hue = random.randint(0, 359)
+                    saturation = random.randint(128, 255)  # Medium to high saturation
+                    value = random.randint(180, 255)  # Medium to high brightness
+                    random_color = QColor.fromHsv(hue, saturation, value).name()
+                    tag = Tag(name=tag_name, color=random_color)
                     self.db_session.add(tag)
                 if tag not in file_obj.tags:
                     file_obj.tags.append(tag)

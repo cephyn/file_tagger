@@ -14,6 +14,9 @@ SALT_FILE = ".salt"
 PASS_HASH_FILE = ".passhash"
 RECOVERY_FILE = ".recovery"
 
+# Default system message for AI interactions
+DEFAULT_SYSTEM_MESSAGE = "You are a helpful AI assistant for tagging and organizing files."
+
 def generate_key(password: str, salt: bytes = None) -> bytes:
     """Generate an encryption key from password and salt."""
     if salt is None:
@@ -133,7 +136,12 @@ class Config:
                     'anthropic': ''
                 },
                 'selected_provider': 'openai',
-                'home_directory': str(Path.home())  # Default to user's home directory
+                'home_directory': str(Path.home()),  # Default to user's home directory
+                'local_models': {
+                    'model_path': '',
+                    'model_type': 'llama'  # Default model type
+                },
+                'system_message': DEFAULT_SYSTEM_MESSAGE
             }
         
         try:
@@ -146,6 +154,17 @@ class Config:
             if 'home_directory' not in config:
                 config['home_directory'] = str(Path.home())
                 
+            # Add local_models if it doesn't exist in older config files
+            if 'local_models' not in config:
+                config['local_models'] = {
+                    'model_path': '',
+                    'model_type': 'llama'
+                }
+            
+            # Add system_message if it doesn't exist in older config files
+            if 'system_message' not in config:
+                config['system_message'] = DEFAULT_SYSTEM_MESSAGE
+                
             return config
         except Exception:
             return {
@@ -155,7 +174,12 @@ class Config:
                     'anthropic': ''
                 },
                 'selected_provider': 'openai',
-                'home_directory': str(Path.home())
+                'home_directory': str(Path.home()),
+                'local_models': {
+                    'model_path': '',
+                    'model_type': 'llama'
+                },
+                'system_message': DEFAULT_SYSTEM_MESSAGE
             }
     
     def save(self):
@@ -287,3 +311,38 @@ class Config:
     def get_home_directory(self) -> str:
         """Get the configured home directory."""
         return self.config_data.get('home_directory', str(Path.home()))
+
+    def set_local_model_path(self, path: str):
+        """Set the local AI model path."""
+        if os.path.exists(path):
+            self.config_data['local_models']['model_path'] = path
+            self.save()
+            return True
+        return False
+    
+    def get_local_model_path(self) -> str:
+        """Get the local AI model path."""
+        return self.config_data.get('local_models', {}).get('model_path', '')
+    
+    def set_local_model_type(self, model_type: str):
+        """Set the local AI model type."""
+        self.config_data['local_models']['model_type'] = model_type
+        self.save()
+    
+    def get_local_model_type(self) -> str:
+        """Get the local AI model type."""
+        return self.config_data.get('local_models', {}).get('model_type', 'llama')
+    
+    def set_system_message(self, message: str):
+        """Set the custom system message for AI interactions."""
+        self.config_data['system_message'] = message
+        self.save()
+    
+    def get_system_message(self) -> str:
+        """Get the custom system message for AI interactions."""
+        return self.config_data.get('system_message', DEFAULT_SYSTEM_MESSAGE)
+    
+    def reset_system_message(self):
+        """Reset the system message to the default value."""
+        self.config_data['system_message'] = DEFAULT_SYSTEM_MESSAGE
+        self.save()
