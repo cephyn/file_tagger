@@ -4,12 +4,14 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QTreeView, QListWidget, QPushButton, 
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-                           QComboBox, QHeaderView, QMenuBar, QMenu, QDialog, QFileDialog)
+                           QComboBox, QHeaderView, QMenuBar, QMenu, QDialog, QFileDialog,
+                           QTabWidget, QProgressDialog)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
 from PySide6.QtGui import QColor
 from sqlalchemy import and_, or_
 from models import init_db, File, Tag
 from config import Config
+from vector_search import VectorSearch
 from api_settings import APISettingsDialog
 from password_management import PasswordManagementDialog
 from tag_suggestion import TagSuggestionDialog
@@ -20,6 +22,8 @@ class FileTagManager(QMainWindow):
         self.db_session = init_db()
         # Initialize config with a password dialog
         self.init_config()
+        # Initialize vector search
+        self.vector_search = VectorSearch(self.db_session)
         self.initUI()
 
     def init_config(self):
@@ -179,72 +183,185 @@ class FileTagManager(QMainWindow):
         
         # Search section
         search_section = QVBoxLayout()
-        search_label = QLabel("Search by Tags")
-        search_section.addWidget(search_label)
         
-        # Search results
+        # Create tab widget for different search types
+        search_tabs = QTabWidget()
+        
+        # Tag search tab
+        tag_search_tab = QWidget()
+        tag_search_layout = QVBoxLayout(tag_search_tab)
+        tag_search_label = QLabel("Search by Tags")
+        tag_search_layout.addWidget(tag_search_label)
+        
+        # Move existing search results widget to tag search tab
         self.search_results = QListWidget()
         self.search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
-        search_section.addWidget(self.search_results)
+        tag_search_layout.addWidget(self.search_results)
         
-        # Search controls
+        # Move existing search controls to tag search tab
         search_controls = QHBoxLayout()
-        
-        # Boolean operators
         self.and_radio = QRadioButton("AND")
         self.or_radio = QRadioButton("OR")
         self.and_radio.setChecked(True)
-        
         search_controls.addWidget(self.and_radio)
         search_controls.addWidget(self.or_radio)
-        
-        # Search button
         search_btn = QPushButton("Search")
         search_btn.clicked.connect(self.search_by_tags)
         search_controls.addWidget(search_btn)
+        tag_search_layout.addLayout(search_controls)
         
-        search_section.addLayout(search_controls)
+        # RAG search tab
+        rag_search_tab = QWidget()
+        rag_search_layout = QVBoxLayout(rag_search_tab)
+        
+        # Query input
+        query_layout = QHBoxLayout()
+        self.query_input = QLineEdit()
+        self.query_input.setPlaceholderText("Enter your search query...")
+        query_layout.addWidget(self.query_input)
+        
+        rag_search_btn = QPushButton("Search")
+        rag_search_btn.clicked.connect(self.search_by_content)
+        query_layout.addWidget(rag_search_btn)
+        
+        rag_search_layout.addLayout(query_layout)
+        
+        # Tag filter section
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Filter by tags:"))
+        self.rag_and_radio = QRadioButton("AND")
+        self.rag_or_radio = QRadioButton("OR")
+        self.rag_and_radio.setChecked(True)
+        filter_layout.addWidget(self.rag_and_radio)
+        filter_layout.addWidget(self.rag_or_radio)
+        rag_search_layout.addLayout(filter_layout)
+        
+        # Tag filter list
+        self.tag_filter_list = QListWidget()
+        self.tag_filter_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        rag_search_layout.addWidget(self.tag_filter_list)
+        
+        # RAG search results
+        self.rag_search_results = QListWidget()
+        self.rag_search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
+        rag_search_layout.addWidget(self.rag_search_results)
+        
+        # Index management button
+        reindex_btn = QPushButton("Reindex Files")
+        reindex_btn.clicked.connect(self.reindex_files)
+        rag_search_layout.addWidget(reindex_btn)
+        
+        # Add tabs
+        search_tabs.addTab(tag_search_tab, "Tag Search")
+        search_tabs.addTab(rag_search_tab, "Content Search")
+        search_section.addWidget(search_tabs)
         
         # Add all sections to main layout
         layout.addLayout(explorer_layout, stretch=2)
         layout.addLayout(tag_layout, stretch=1)
         layout.addLayout(file_tags_layout, stretch=1)
         layout.addLayout(search_section, stretch=1)
-        
+
         self.refresh_tags()
         self.current_file_path = None
-        
+
     def refresh_tags(self):
+        # Update both tag lists
         self.tag_list.clear()
+        self.tag_filter_list.clear()
         tags = self.db_session.query(Tag).all()
         for tag in tags:
+            # Add to main tag list
             item = self.tag_list.addItem(tag.name)
             self.tag_list.item(self.tag_list.count() - 1).setBackground(QColor(tag.color))
+            # Add to filter list
+            item = self.tag_filter_list.addItem(tag.name)
+            self.tag_filter_list.item(self.tag_filter_list.count() - 1).setBackground(QColor(tag.color))
+
+    def search_by_content(self):
+        """Perform RAG-based search with optional tag filtering."""
+        query = self.query_input.text().strip()
+        if not query:
+            QMessageBox.warning(self, "Error", "Please enter a search query!")
+            return
             
-    def refresh_file_tags(self):
-        self.file_tags_list.clear()
-        if self.current_file_path:
-            file_obj = self.db_session.query(File).filter_by(path=self.current_file_path).first()
-            if file_obj:
-                for tag in file_obj.tags:
-                    item = self.file_tags_list.addItem(tag.name)
-                    self.file_tags_list.item(self.file_tags_list.count() - 1).setBackground(QColor(tag.color))
-                    
-    def on_file_selected(self):
-        indexes = self.tree.selectedIndexes()
-        if indexes:
-            self.current_file_path = self.model.filePath(indexes[0])
-            self.refresh_file_tags()
+        # Debug: Check Shadowdark file specifically
+        self.vector_search.debug_check_file("E:/Google Drive/RPG Stuff/Arcane Library/Shadowdark/Shadowdark_RPG_-_V1.pdf")
             
-    def on_item_double_clicked(self, index):
-        path = self.model.filePath(index)
-        if os.path.isdir(path):
-            self.tree.setRootIndex(index)
-            self.path_display.setText(path)
-            
-    def on_tag_selected(self):
-        pass  # For future feature implementation
+        # Get selected tags for filtering
+        selected_tags = [item.text() for item in self.tag_filter_list.selectedItems()]
+        use_and = self.rag_and_radio.isChecked()
         
+        # Perform search
+        results = self.vector_search.search(
+            query=query,
+            tag_filter=selected_tags if selected_tags else None,
+            use_and=use_and
+        )
+        
+        # Display results
+        self.rag_search_results.clear()
+        
+        if not results:
+            self.rag_search_results.addItem("No matching files found")
+            return
+            
+        for result in results:
+            # Create result text with score and tags
+            score_percent = int(result['score'] * 100)
+            tags_text = f" [Tags: {', '.join(result.get('tags', []))}]"
+            display_text = (
+                f"{os.path.basename(result['path'])} "
+                f"(Match: {score_percent}%) "
+                f"{tags_text}"
+            )
+            
+            item = self.rag_search_results.addItem(display_text)
+            # Store full path in tooltip
+            self.rag_search_results.item(self.rag_search_results.count() - 1).setToolTip(result['path'])
+            
+            # Color code based on match score
+            color = self._get_score_color(result['score'])
+            self.rag_search_results.item(self.rag_search_results.count() - 1).setBackground(color)
+    
+    def _get_score_color(self, score: float) -> QColor:
+        """Get a color representing the match score (red to green)."""
+        if score >= 0.8:
+            return QColor(200, 255, 200)  # Light green
+        elif score >= 0.6:
+            return QColor(255, 255, 200)  # Light yellow
+        elif score >= 0.4:
+            return QColor(255, 230, 200)  # Light orange
+        else:
+            return QColor(255, 200, 200)  # Light red
+            
+    def reindex_files(self):
+        """Reindex all files in the database."""
+        progress = QProgressDialog("Reindexing files...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        
+        def update_progress(status: str, value: int):
+            if progress.wasCanceled():
+                return False
+            progress.setLabelText(status)
+            progress.setValue(value)
+            QApplication.processEvents()
+            return True
+            
+        try:
+            self.vector_search.reindex_all_files(progress_callback=update_progress)
+            if not progress.wasCanceled():
+                # Fix metadata after reindexing
+                progress.setLabelText("Fixing metadata...")
+                self.vector_search.fix_all_metadata()
+                QMessageBox.information(self, "Success", "File reindexing complete!")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error during reindexing: {str(e)}")
+        finally:
+            progress.close()
+            
     def add_tag(self):
         name, ok = QInputDialog.getText(self, 'Add Tag', 'Enter tag name:')
         if ok and name:
@@ -310,7 +427,12 @@ class FileTagManager(QMainWindow):
         
         self.db_session.commit()
         self.refresh_file_tags()
-            
+        # Update vector search index for the file
+        if self.current_file_path and os.path.exists(self.current_file_path):
+            content = self.vector_search._extract_file_content(self.current_file_path)
+            if content:
+                self.vector_search.index_file(self.current_file_path, content)
+                
     def remove_tag_from_file(self):
         if not self.current_file_path:
             return
@@ -325,7 +447,30 @@ class FileTagManager(QMainWindow):
                         file_obj.tags.remove(tag)
                 self.db_session.commit()
                 self.refresh_file_tags()
-                
+                # Update vector search index for the file
+                if self.current_file_path and os.path.exists(self.current_file_path):
+                    content = self.vector_search._extract_file_content(self.current_file_path)
+                    if content:
+                        self.vector_search.index_file(self.current_file_path, content)
+
+    def on_file_selected(self, current, previous):
+        """Handle file selection changes in the tree view."""
+        if current.indexes():
+            self.current_file_path = self.model.filePath(current.indexes()[0])
+            self.refresh_file_tags()
+            
+    def refresh_file_tags(self):
+        """Update the file tags list for the currently selected file."""
+        self.file_tags_list.clear()
+        if not self.current_file_path:
+            return
+            
+        file_obj = self.db_session.query(File).filter_by(path=self.current_file_path).first()
+        if file_obj:
+            for tag in file_obj.tags:
+                item = self.file_tags_list.addItem(tag.name)
+                self.file_tags_list.item(self.file_tags_list.count() - 1).setBackground(QColor(tag.color))
+
     def update_drive_list(self):
         self.drive_combo.clear()
         # Get all available drives
@@ -397,24 +542,31 @@ class FileTagManager(QMainWindow):
         else:
             # OR logic: files must have any of the selected tags
             files_query = files_query.filter(File.tags.any(Tag.id.in_([t.id for t in tags])))
-            
+
         # Get results and display them
         self.search_results.clear()
         files = files_query.all()
-        
+
         for file in files:
             item = self.search_results.addItem(os.path.basename(file.path))
             # Store full path as item data
             self.search_results.item(self.search_results.count() - 1).setToolTip(file.path)
-            
+
             # Add tag information to the item display
             tag_text = " [Tags: " + ", ".join(tag.name for tag in file.tags) + "]"
             self.search_results.item(self.search_results.count() - 1).setText(
                 os.path.basename(file.path) + tag_text
             )
-            
+
         if not files:
             self.search_results.addItem("No files found with the selected tags")
+
+    def on_tag_selected(self):
+        """Handle tag selection changes."""
+        # This method is triggered when tag selection changes
+        # Currently used just for enabling/disabling tag operations
+        selected_items = self.tag_list.selectedItems()
+        # Could add additional functionality here if needed
 
     def on_search_result_double_clicked(self, item):
         file_path = item.toolTip()  # Get the full path from tooltip
@@ -434,6 +586,13 @@ class FileTagManager(QMainWindow):
             # Select the file in the tree view
             self.tree.setCurrentIndex(self.model.index(file_path))
             self.tree.scrollTo(self.model.index(file_path))
+
+    def on_item_double_clicked(self, index):
+        """Handle double-click on tree view items."""
+        path = self.model.filePath(index)
+        if os.path.isdir(path):
+            self.tree.setRootIndex(index)
+            self.path_display.setText(path)
 
     def show_api_settings(self):
         dialog = APISettingsDialog(self.config, self)
