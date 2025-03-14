@@ -355,19 +355,38 @@ class FileTagManager(QMainWindow):
             # Create result text with score and tags
             score_percent = int(result['score'] * 100)
             tags_text = f" [Tags: {', '.join(result.get('tags', []))}]"
-            display_text = (
-                f"{os.path.basename(result['path'])} "
-                f"(Match: {score_percent}%) "
-                f"{tags_text}"
-            )
+            
+            # Create the main result item with filename and score
+            display_text = f"{os.path.basename(result['path'])} (Match: {score_percent}%){tags_text}"
             
             item = self.rag_search_results.addItem(display_text)
+            list_item = self.rag_search_results.item(self.rag_search_results.count() - 1)
+            
             # Store full path in tooltip
-            self.rag_search_results.item(self.rag_search_results.count() - 1).setToolTip(result['path'])
+            list_item.setToolTip(result['path'])
             
             # Color code based on match score
             color = self._get_score_color(result['score'])
-            self.rag_search_results.item(self.rag_search_results.count() - 1).setBackground(color)
+            list_item.setBackground(color)
+            
+            # Add snippets as separate items below the main result, indented
+            if 'snippets' in result and result['snippets']:
+                for i, snippet in enumerate(result['snippets']):
+                    # Clean up the snippet for display
+                    clean_snippet = snippet.replace('\n', ' ').strip()
+                    if len(clean_snippet) > 200:
+                        clean_snippet = f"{clean_snippet[:200]}..."
+                    
+                    # Add snippet with indentation
+                    snippet_item = self.rag_search_results.addItem(f"    ↪ {clean_snippet}")
+                    
+                    # Use a lighter shade of the same color for snippets
+                    snippet_color = QColor(color)
+                    snippet_color.setAlpha(100)  # Make it more transparent
+                    self.rag_search_results.item(self.rag_search_results.count() - 1).setBackground(snippet_color)
+                    
+                    # Allow selecting the main item when clicking on a snippet
+                    self.rag_search_results.item(self.rag_search_results.count() - 1).setToolTip(result['path'])
     
     def _get_score_color(self, score: float) -> QColor:
         """Get a color representing the match score (red to green)."""
@@ -616,6 +635,17 @@ class FileTagManager(QMainWindow):
     def on_search_result_double_clicked(self, item):
         file_path = item.toolTip()  # Get the full path from tooltip
         if os.path.exists(file_path):
+            # If it's a file, open it with the default application
+            if os.path.isfile(file_path):
+                # Use the operating system's default program to open the file
+                import subprocess
+                try:
+                    os.startfile(file_path) if sys.platform == 'win32' else subprocess.call(('open' if sys.platform == 'darwin' else 'xdg-open', file_path))
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Could not open file: {str(e)}")
+                return
+                
+            # For directories, navigate to them in the tree view
             # Get the drive path and select it in the combo box
             drive = os.path.splitdrive(file_path)[0] + os.path.sep
             for i in range(self.drive_combo.count()):
@@ -624,7 +654,7 @@ class FileTagManager(QMainWindow):
                     break
                     
             # Navigate to the directory containing the file
-            dir_path = os.path.dirname(file_path)
+            dir_path = os.path.dirname(file_path) if os.path.isfile(file_path) else file_path
             self.tree.setRootIndex(self.model.index(dir_path))
             self.path_display.setText(dir_path)
             
@@ -638,6 +668,13 @@ class FileTagManager(QMainWindow):
         if os.path.isdir(path):
             self.tree.setRootIndex(index)
             self.path_display.setText(path)
+        else:
+            # If it's a file, open it with the default application
+            import subprocess
+            try:
+                os.startfile(path) if sys.platform == 'win32' else subprocess.call(('open' if sys.platform == 'darwin' else 'xdg-open', path))
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open file: {str(e)}")
 
     def show_api_settings(self):
         dialog = APISettingsDialog(self.config, self)
