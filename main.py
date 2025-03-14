@@ -59,7 +59,22 @@ class FileTagManager(QMainWindow):
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QHBoxLayout(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Create the main tab widget that will contain tagging and search tabs
+        self.main_tabs = QTabWidget()
+        main_layout.addWidget(self.main_tabs)
+        
+        # Create widgets for both tabs
+        tagging_tab = QWidget()
+        search_tab = QWidget()
+        
+        # Add the tabs to the main tab widget
+        self.main_tabs.addTab(tagging_tab, "Tagging Interface")
+        self.main_tabs.addTab(search_tab, "Search Interface")
+        
+        # === TAGGING TAB ===
+        tagging_layout = QHBoxLayout(tagging_tab)
         
         # File explorer section
         explorer_layout = QVBoxLayout()
@@ -115,27 +130,6 @@ class FileTagManager(QMainWindow):
         self.tree.doubleClicked.connect(self.on_item_double_clicked)
         explorer_layout.addWidget(self.tree)
         
-        # Set initial directory from config
-        initial_path = self.config.get_home_directory()
-        self.tree.setRootIndex(self.model.index(initial_path))
-        
-        # Update initial path display
-        self.path_display.setText(initial_path)
-        
-        # First populate the drive list
-        self.update_drive_list()
-        
-        # Now set the correct drive based on initial path
-        drive = os.path.splitdrive(initial_path)[0] + os.path.sep
-        for i in range(self.drive_combo.count()):
-            if self.drive_combo.itemData(i).startswith(drive):
-                self.drive_combo.setCurrentIndex(i)
-                break
-        
-        # Connect drive combo change event after setting the initial value
-        # to avoid triggering it during initialization
-        self.drive_combo.currentIndexChanged.connect(self.on_drive_changed)
-        
         # Tag management section
         tag_layout = QVBoxLayout()
         tag_label = QLabel("Tags")
@@ -181,8 +175,13 @@ class FileTagManager(QMainWindow):
         file_tag_buttons.addWidget(suggest_tags_btn)
         file_tags_layout.addLayout(file_tag_buttons)
         
-        # Search section
-        search_section = QVBoxLayout()
+        # Add the layouts to the tagging tab
+        tagging_layout.addLayout(explorer_layout, stretch=2)
+        tagging_layout.addLayout(tag_layout, stretch=1)
+        tagging_layout.addLayout(file_tags_layout, stretch=1)
+        
+        # === SEARCH TAB ===
+        search_layout = QVBoxLayout(search_tab)
         
         # Create tab widget for different search types
         search_tabs = QTabWidget()
@@ -190,15 +189,17 @@ class FileTagManager(QMainWindow):
         # Tag search tab
         tag_search_tab = QWidget()
         tag_search_layout = QVBoxLayout(tag_search_tab)
-        tag_search_label = QLabel("Search by Tags")
-        tag_search_layout.addWidget(tag_search_label)
         
-        # Move existing search results widget to tag search tab
-        self.search_results = QListWidget()
-        self.search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
-        tag_search_layout.addWidget(self.search_results)
+        # Tag selection section for search
+        tag_select_layout = QVBoxLayout()
+        tag_select_label = QLabel("Select Tags to Search:")
+        tag_select_layout.addWidget(tag_select_label)
         
-        # Move existing search controls to tag search tab
+        self.search_tag_list = QListWidget()
+        self.search_tag_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        tag_select_layout.addWidget(self.search_tag_list)
+        
+        # Search controls
         search_controls = QHBoxLayout()
         self.and_radio = QRadioButton("AND")
         self.or_radio = QRadioButton("OR")
@@ -208,7 +209,20 @@ class FileTagManager(QMainWindow):
         search_btn = QPushButton("Search")
         search_btn.clicked.connect(self.search_by_tags)
         search_controls.addWidget(search_btn)
-        tag_search_layout.addLayout(search_controls)
+        tag_select_layout.addLayout(search_controls)
+        
+        # Tag search results section
+        results_layout = QVBoxLayout()
+        results_label = QLabel("Search Results:")
+        results_layout.addWidget(results_label)
+        
+        self.search_results = QListWidget()
+        self.search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
+        results_layout.addWidget(self.search_results)
+        
+        # Add layouts to tag search tab
+        tag_search_layout.addLayout(tag_select_layout)
+        tag_search_layout.addLayout(results_layout)
         
         # RAG search tab
         rag_search_tab = QWidget()
@@ -216,6 +230,7 @@ class FileTagManager(QMainWindow):
         
         # Query input
         query_layout = QHBoxLayout()
+        query_layout.addWidget(QLabel("Query:"))
         self.query_input = QLineEdit()
         self.query_input.setPlaceholderText("Enter your search query...")
         query_layout.addWidget(self.query_input)
@@ -227,56 +242,86 @@ class FileTagManager(QMainWindow):
         rag_search_layout.addLayout(query_layout)
         
         # Tag filter section
-        filter_layout = QHBoxLayout()
+        filter_layout = QVBoxLayout()
         filter_layout.addWidget(QLabel("Filter by tags:"))
+        
+        filter_controls = QHBoxLayout()
         self.rag_and_radio = QRadioButton("AND")
         self.rag_or_radio = QRadioButton("OR")
         self.rag_and_radio.setChecked(True)
-        filter_layout.addWidget(self.rag_and_radio)
-        filter_layout.addWidget(self.rag_or_radio)
-        rag_search_layout.addLayout(filter_layout)
+        filter_controls.addWidget(self.rag_and_radio)
+        filter_controls.addWidget(self.rag_or_radio)
+        filter_layout.addLayout(filter_controls)
         
         # Tag filter list
         self.tag_filter_list = QListWidget()
         self.tag_filter_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        rag_search_layout.addWidget(self.tag_filter_list)
+        filter_layout.addWidget(self.tag_filter_list)
         
         # RAG search results
+        rag_results_layout = QVBoxLayout()
+        rag_results_layout.addWidget(QLabel("Search Results:"))
+        
         self.rag_search_results = QListWidget()
         self.rag_search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
-        rag_search_layout.addWidget(self.rag_search_results)
+        rag_results_layout.addWidget(self.rag_search_results)
         
         # Index management button
         reindex_btn = QPushButton("Reindex Files")
         reindex_btn.clicked.connect(self.reindex_files)
-        rag_search_layout.addWidget(reindex_btn)
+        rag_results_layout.addWidget(reindex_btn)
+        
+        # Add layouts to RAG search tab
+        rag_search_layout.addLayout(filter_layout)
+        rag_search_layout.addLayout(rag_results_layout)
         
         # Add tabs
         search_tabs.addTab(tag_search_tab, "Tag Search")
         search_tabs.addTab(rag_search_tab, "Content Search")
-        search_section.addWidget(search_tabs)
+        search_layout.addWidget(search_tabs)
         
-        # Add all sections to main layout
-        layout.addLayout(explorer_layout, stretch=2)
-        layout.addLayout(tag_layout, stretch=1)
-        layout.addLayout(file_tags_layout, stretch=1)
-        layout.addLayout(search_section, stretch=1)
+        # Set initial directory from config
+        initial_path = self.config.get_home_directory()
+        self.tree.setRootIndex(self.model.index(initial_path))
+        
+        # Update initial path display
+        self.path_display.setText(initial_path)
+        
+        # First populate the drive list
+        self.update_drive_list()
+        
+        # Now set the correct drive based on initial path
+        drive = os.path.splitdrive(initial_path)[0] + os.path.sep
+        for i in range(self.drive_combo.count()):
+            if self.drive_combo.itemData(i).startswith(drive):
+                self.drive_combo.setCurrentIndex(i)
+                break
+        
+        # Connect drive combo change event after setting the initial value
+        # to avoid triggering it during initialization
+        self.drive_combo.currentIndexChanged.connect(self.on_drive_changed)
 
         self.refresh_tags()
         self.current_file_path = None
 
     def refresh_tags(self):
-        # Update both tag lists
+        # Update all tag lists
         self.tag_list.clear()
         self.tag_filter_list.clear()
+        self.search_tag_list.clear()
         tags = self.db_session.query(Tag).all()
         for tag in tags:
-            # Add to main tag list
+            # Add to main tag list in tagging tab
             item = self.tag_list.addItem(tag.name)
             self.tag_list.item(self.tag_list.count() - 1).setBackground(QColor(tag.color))
-            # Add to filter list
+            
+            # Add to filter list in RAG search
             item = self.tag_filter_list.addItem(tag.name)
             self.tag_filter_list.item(self.tag_filter_list.count() - 1).setBackground(QColor(tag.color))
+            
+            # Add to search tag list in tag search
+            item = self.search_tag_list.addItem(tag.name)
+            self.search_tag_list.item(self.search_tag_list.count() - 1).setBackground(QColor(tag.color))
 
     def search_by_content(self):
         """Perform RAG-based search with optional tag filtering."""
@@ -519,7 +564,7 @@ class FileTagManager(QMainWindow):
             self.path_display.setText(parent_path)
 
     def search_by_tags(self):
-        selected_items = self.tag_list.selectedItems()
+        selected_items = self.search_tag_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "Error", "Please select at least one tag to search!")
             return
