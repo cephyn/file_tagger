@@ -6,6 +6,7 @@ from datetime import datetime
 from models import File, Tag
 import json
 import traceback
+import re  # Added for regex pattern matching in chunking
 
 class VectorSearch:
     def __init__(self, db_session, collection_name: str = "file_contents"):
@@ -16,7 +17,10 @@ class VectorSearch:
         try:
             # Initialize ChromaDB client
             self.client = chromadb.PersistentClient(path=".chroma")
-            self.embedding_function = SentenceTransformerEmbeddingFunction()
+            
+            # Use a more advanced embedding model with higher dimensionality for better semantic matching
+            # Options: 'all-mpnet-base-v2' (768d), 'multi-qa-mpnet-base-dot-v1' (768d), or 'all-MiniLM-L12-v2' (384d)
+            self.embedding_function = SentenceTransformerEmbeddingFunction(model_name="all-mpnet-base-v2")
             
             # Log ChromaDB version for debugging
             print(f"ChromaDB version: {chromadb.__version__}")
@@ -43,8 +47,132 @@ class VectorSearch:
             # Create a placeholder collection to prevent errors
             self.collection = None
 
+    def chunk_document(self, text: str, min_chunk_size: int = 200, max_chunk_size: int = 1000, overlap: int = 50) -> List[str]:
+        """
+        Chunk document into semantic units by analyzing content structure.
+        Uses paragraph breaks, headings, and other document structure cues.
+        
+        Args:
+            text (str): The document text to chunk
+            min_chunk_size (int): Minimum chunk size in characters
+            max_chunk_size (int): Maximum chunk size in characters
+            overlap (int): Number of characters to overlap between chunks
+            
+        Returns:
+            List[str]: List of text chunks
+        """
+        if not text or len(text) <= max_chunk_size:
+            return [text] if text else []
+        
+        # Check if we have a structured document (like markdown with headers)
+        has_headers = bool(re.search(r'^#+\s+\w+', text, re.MULTILINE))
+        
+        # For documents with clear headers, split on headers
+        if has_headers:
+            return self._chunk_by_headers(text, min_chunk_size, max_chunk_size, overlap)
+        else:
+            # Otherwise split on paragraph boundaries
+            return self._chunk_by_paragraphs(text, min_chunk_size, max_chunk_size, overlap)
+    
+    def _chunk_by_headers(self, text: str, min_chunk_size: int, max_chunk_size: int, overlap: int) -> List[str]:
+        """Split document on header boundaries for more semantic chunks."""
+        # Find all headers (markdown style)
+        header_pattern = r'^(#+)\s+(.+)$'
+        header_matches = list(re.finditer(header_pattern, text, re.MULTILINE))
+        
+        chunks = []
+        if not header_matches:
+            # Fallback to paragraph chunking if no headers found
+            return self._chunk_by_paragraphs(text, min_chunk_size, max_chunk_size, overlap)
+        
+        # Process chunks between headers
+        for i in range(len(header_matches)):
+            start_pos = header_matches[i].start()
+            
+            # Find end position (next header or end of text)
+            if i < len(header_matches) - 1:
+                end_pos = header_matches[i+1].start()
+            else:
+                end_pos = len(text)
+            
+            header = header_matches[i].group(0)
+            content = text[start_pos:end_pos]
+            
+            # If content is too large, sub-chunk it
+            if len(content) > max_chunk_size:
+                # Add the header to each sub-chunk for context
+                sub_chunks = self._chunk_by_paragraphs(content, min_chunk_size, max_chunk_size - len(header), overlap)
+                for sub_chunk in sub_chunks:
+                    # Only add header if it's not already there
+                    if not sub_chunk.startswith(header):
+                        chunks.append(f"{header}\n{sub_chunk}")
+                    else:
+                        chunks.append(sub_chunk)
+            else:
+                chunks.append(content)
+        
+        # Handle the case where there's text before the first header
+        if header_matches[0].start() > 0:
+            prefix_text = text[:header_matches[0].start()]
+            if len(prefix_text.strip()) > min_chunk_size:
+                chunks.insert(0, prefix_text)
+        
+        return chunks
+    
+    def _chunk_by_paragraphs(self, text: str, min_chunk_size: int, max_chunk_size: int, overlap: int) -> List[str]:
+        """Split document on paragraph boundaries."""
+        # Split text on paragraph boundaries (empty lines)
+        paragraphs = re.split(r'\n\s*\n', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        
+        chunks = []
+        current_chunk = ""
+        
+        for paragraph in paragraphs:
+            # If adding this paragraph would exceed max size and we have content,
+            # store the current chunk and start a new one with overlap
+            if len(current_chunk) + len(paragraph) + 2 > max_chunk_size and len(current_chunk) >= min_chunk_size:
+                chunks.append(current_chunk)
+                
+                # Start new chunk with overlap from end of previous chunk
+                if overlap > 0 and len(current_chunk) > overlap:
+                    # Get last few sentences for overlap
+                    last_sentences = re.findall(r'[^.!?]+[.!?]', current_chunk[-overlap*2:])
+                    current_chunk = "".join(last_sentences[-2:]) if last_sentences else ""
+                else:
+                    current_chunk = ""
+            
+            # Add paragraph to current chunk
+            if current_chunk and not current_chunk.endswith("\n"):
+                current_chunk += "\n\n"
+            current_chunk += paragraph
+        
+        # Don't forget the last chunk
+        if current_chunk and len(current_chunk) >= min_chunk_size:
+            chunks.append(current_chunk)
+        
+        return chunks
+    
+    def _extract_chunk_title(self, chunk: str) -> str:
+        """Extract a representative title for the chunk from its content."""
+        # Look for header patterns
+        header_match = re.search(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
+        if header_match:
+            return header_match.group(2).strip()
+        
+        # If no header found, use first non-empty line
+        lines = chunk.split('\n')
+        for line in lines:
+            if line.strip():
+                # Truncate to a reasonable title length
+                title = line.strip()
+                return title[:50] + '...' if len(title) > 50 else title
+        
+        # Fallback option
+        return "Untitled chunk"
+
     def index_file(self, file_path: str, content: str, metadata: Optional[Dict] = None):
-        """Index a file's content in the vector database."""
+        """Index a file's content in the vector database using chunking strategy."""
         if self.collection is None:
             print("Vector database not initialized properly")
             return
@@ -74,38 +202,84 @@ class VectorSearch:
         else:
             metadata["tags"] = "[]"  # Empty JSON array as string
 
-        # Use file path as ID to avoid duplicates
+        # Check if we already have this file indexed
         try:
-            print(f"Adding to collection with content length: {len(content)}")
-
-            # Use get method to check if document exists
-            try:
-                existing_docs = self.collection.get(
-                    ids=[file_path], include=["metadatas"]
-                )
-
-                if existing_docs and existing_docs["ids"] and len(existing_docs["ids"]) > 0:
-                    # Update existing document
-                    self.collection.update(
-                        ids=[file_path], metadatas=[metadata], documents=[content]
-                    )
-                    print("Successfully updated existing document")
-                else:
-                    # Add new document
-                    self.collection.add(
-                        ids=[file_path], metadatas=[metadata], documents=[content]
-                    )
-                    print("Successfully added new document")
-            except Exception as e:
-                print(f"Error checking document existence: {str(e)}")
-                # Try adding as new
-                self.collection.add(
-                    ids=[file_path], metadatas=[metadata], documents=[content]
-                )
-                print("Added as new document after error")
-
+            existing_docs = self.collection.get(
+                ids=[file_path], include=["metadatas"]
+            )
+            
+            if existing_docs and existing_docs["ids"] and len(existing_docs["ids"]) > 0:
+                # Delete existing document and its chunks
+                self.remove_file(file_path)
         except Exception as e:
-            print(f"Error indexing {file_path}: {str(e)}")
+            print(f"Error checking document existence: {str(e)}")
+
+        # Chunk the document for better semantic search
+        chunks = self.chunk_document(content)
+        num_chunks = len(chunks)
+        
+        print(f"Document split into {num_chunks} chunks")
+        
+        # If document is small, just index as a single chunk
+        if num_chunks <= 1:
+            try:
+                # Add as a single document
+                self.collection.add(
+                    ids=[file_path],
+                    metadatas=[metadata],
+                    documents=[content]
+                )
+                print("Indexed as single document")
+            except Exception as e:
+                print(f"Error indexing {file_path}: {str(e)}")
+                traceback.print_exc()
+            return
+            
+        # For chunked documents, add each chunk with chunk-specific metadata
+        try:
+            for i, chunk in enumerate(chunks):
+                # Create chunk-specific metadata and ID
+                chunk_metadata = metadata.copy()
+                chunk_metadata.update({
+                    "chunk_id": i,
+                    "chunk_total": num_chunks,
+                    "chunk_title": self._extract_chunk_title(chunk),
+                    "is_chunk": True
+                })
+                
+                # Create a compound ID to allow retrieving specific chunks
+                chunk_id = f"{file_path}#chunk{i}"
+                
+                # Index this chunk
+                self.collection.add(
+                    ids=[chunk_id],
+                    metadatas=[chunk_metadata],
+                    documents=[chunk]
+                )
+            
+            # Also add the full document as a single entry for simple retrieval
+            # and to ensure we can find it by file path ID
+            full_metadata = metadata.copy()
+            full_metadata.update({
+                "has_chunks": True,
+                "num_chunks": num_chunks,
+                "is_chunk": False
+            })
+            
+            # Add a shortened version of the full content
+            summary_length = min(1500, len(content))
+            summary = content[:summary_length] + ("..." if len(content) > summary_length else "")
+            
+            self.collection.add(
+                ids=[file_path],
+                metadatas=[full_metadata],
+                documents=[summary]  # Store a summarized version of the full content
+            )
+            
+            print(f"Successfully indexed {num_chunks} chunks for {file_path}")
+            
+        except Exception as e:
+            print(f"Error indexing chunks for {file_path}: {str(e)}")
             traceback.print_exc()
 
     def update_metadata(self, file_path: str):
@@ -237,23 +411,27 @@ class VectorSearch:
         except Exception as e:
             print(f"Error checking collection health: {str(e)}")
 
-        # Since ChromaDB doesn't support complex string matching within metadata,
-        # we'll retrieve all documents first, then filter them manually
-        if tag_filter:
-            print(f"Using tag filter: {tag_filter} (Will be applied post-query)")
-            # Print tag filter in uppercase and lowercase for debugging
-            print(f"Tag filter (lowercase): {[tag.lower() for tag in tag_filter]}")
-
         try:
             print(f"Executing query: '{query}' with limit={limit}")
 
-            # Get all potentially matching documents - include document contents for snippet extraction
+            # Enhance query by using query expansion and improved parameters
+            expanded_queries = self._expand_query(query)
+            
+            # Get potentially matching chunks - include document contents for snippet extraction
             try:
-                results = self.collection.query(
-                    query_texts=[query],
-                    n_results=100 if tag_filter else limit,  # Get more results if we need to filter
-                    include=["metadatas", "documents", "distances"]
-                )
+                # Use multiple queries for better recall if we have expansions
+                if expanded_queries:
+                    results = self.collection.query(
+                        query_texts=expanded_queries,
+                        n_results=100 if tag_filter else limit * 3,  # Get more results for filtering and chunked docs
+                        include=["metadatas", "documents", "distances"]
+                    )
+                else:
+                    results = self.collection.query(
+                        query_texts=[query],
+                        n_results=100 if tag_filter else limit * 3,  # Get more results for filtering and chunked docs
+                        include=["metadatas", "documents", "distances"]
+                    )
             except Exception as query_err:
                 print(f"Error during query: {str(query_err)}")
                 traceback.print_exc()
@@ -273,39 +451,27 @@ class VectorSearch:
             initial_count = len(results['metadatas'][0])
             print(f"Initial results found: {initial_count}")
             
-            # Format results and apply tag filtering manually
-            filtered_results = []
-
-            # Check if the results structure is as expected
-            if (not results['distances'] or len(results['distances']) == 0 or not results['metadatas'] or len(results['metadatas']) == 0 or len(results['distances'][0]) != len(results['metadatas'][0])):
-                print("Warning: Unexpected results structure")
-                return []
-
-            # Loop through results and extract snippets
+            # Group results by file path to combine chunks from the same document
+            grouped_results = {}
+            
+            # Process and filter results
             for i, (distance, metadata, document) in enumerate(zip(results['distances'][0], results['metadatas'][0], results['documents'][0])):
-                result = metadata.copy()
+                # Extract file path (remove chunk identifier if present)
+                doc_id = results['ids'][0][i]
+                file_path = doc_id.split('#')[0]  # Remove chunk identifier
                 
                 # Parse tags from JSON string
                 tags = []
-                if "tags" in result:
+                if "tags" in metadata:
                     try:
-                        # Debug: print raw tag string for this result
-                        print(f"\nResult {i}: Tag string: {result['tags']}")
-                        
-                        tags = json.loads(result["tags"])
-                        # Normalize tags to lowercase for case-insensitive comparison
+                        tags = json.loads(metadata["tags"])
                         tags_lower = [t.lower() for t in tags]
-                        result["tags"] = tags
-                        
-                        # Debug: print parsed tags
-                        print(f"  Parsed tags: {tags}")
                     except json.JSONDecodeError:
-                        print(f"  Failed to parse tags: {result.get('tags')}")
-                        result["tags"] = []
+                        print(f"  Failed to parse tags: {metadata.get('tags')}")
+                        tags = []
                         tags_lower = []
                 else:
-                    print(f"  No tags found in result {i}")
-                    result["tags"] = []
+                    tags = []
                     tags_lower = []
 
                 # Apply tag filtering if specified
@@ -318,106 +484,177 @@ class VectorSearch:
                         # AND logic: all filter tags must be in document tags
                         matched = all(filter_tag in tags_lower for filter_tag in tag_filter_lower)
                         if not matched:
-                            # Debug: Show which tags are missing
-                            missing_tags = [tag for tag in tag_filter if tag.lower() not in tags_lower]
-                            print(f"  Skipping result {i} (missing tags: {missing_tags})")
                             continue  # Skip this document
                     else:
                         # OR logic: at least one filter tag must be in document tags
                         matched = any(filter_tag in tags_lower for filter_tag in tag_filter_lower)
                         if not matched:
-                            print(f"  Skipping result {i} (no matching tags)")
                             continue  # Skip this document
-                    
-                    print(f"  Result {i} matched filter: {matched}")
 
-                # ChromaDB returns cosine distance (0-2 where 0 is identical)
-                # Convert to similarity score (0-1 where 1 is identical)
-                # For cosine distance: similarity = 1 - (distance / 2)
+                # Calculate similarity score
                 if distance is not None:
-                    similarity = 1.0 - (float(distance) / 2.0)
+                    # Base similarity calculation
+                    raw_similarity = 1.0 - (float(distance) / 2.0)
+                    
+                    # Apply scaling to increase contrast in scores
+                    boost_power = 0.65
+                    similarity = raw_similarity ** boost_power
+                    
+                    # Scale the final result
+                    similarity = 0.2 + (similarity * 0.8)
+                    
                     # Ensure it's between 0 and 1
                     similarity = max(0.0, min(1.0, similarity))
-                    result['score'] = similarity
-
-                    # Add 0.01 to avoid showing 0.0 scores (for UX purposes) if non-zero
-                    if 0 < similarity < 0.01:
-                        result['score'] = 0.01
                 else:
-                    result['score'] = 0.0
+                    similarity = 0.0
 
-                # Extract relevant snippets from the document
-                if document:
-                    # Extract snippets containing the query terms
-                    snippets = self._extract_relevant_snippets(document, query)
-                    if snippets:
-                        result['snippets'] = snippets
-                    else:
-                        # If no specific snippets found, get the beginning of the document
-                        preview_length = min(150, len(document))
-                        result['snippets'] = [f"{document[:preview_length]}..."]
+                # Extract snippet from the document
+                snippets = self._extract_relevant_snippets(document, query)
+                if not snippets:
+                    # If no specific snippets found, get the beginning of the document
+                    preview_length = min(150, len(document))
+                    snippets = [f"{document[:preview_length]}..."]
 
-                # Debug individual result
-                print(f"  Path: {result.get('path', 'N/A')}")
-                print(f"  Score: {result['score']:.4f}")
+                # Get chunk information
+                is_chunk = metadata.get('is_chunk', False)
+                chunk_id = metadata.get('chunk_id', 0) if is_chunk else 0
+                chunk_total = metadata.get('chunk_total', 1) if is_chunk else 1
+                chunk_title = metadata.get('chunk_title', '') if is_chunk else ''
+
+                # If this file is not in the grouped results yet, add it
+                if file_path not in grouped_results:
+                    grouped_results[file_path] = {
+                        'path': file_path,
+                        'filename': metadata.get('filename', os.path.basename(file_path)),
+                        'tags': tags,
+                        'score': similarity,  # Will be updated as we find better chunks
+                        'snippets': [],
+                        'chunks_found': 0,
+                        'chunk_titles': {},
+                    }
                 
-                filtered_results.append(result)
+                # Update existing result with this chunk's info
+                current_result = grouped_results[file_path]
+                
+                # Update score (take max of all chunks)
+                current_result['score'] = max(current_result['score'], similarity)
+                
+                # Increment chunks found
+                current_result['chunks_found'] += 1
+                
+                # Add snippet if it's good quality (has a high score)
+                if similarity > 0.4:  # Only add high quality snippets
+                    # Add context from chunk title if available
+                    context = f"[{chunk_title}] " if chunk_title else ""
+                    
+                    # Only add a limited number of snippets per file
+                    if len(current_result['snippets']) < 3:
+                        for snippet in snippets[:1]:  # Limit to 1 snippet per chunk
+                            decorated_snippet = f"{context}{snippet}"
+                            current_result['snippets'].append(decorated_snippet)
+                    
+                # Keep track of chunk titles for showing document structure
+                if chunk_title:
+                    current_result['chunk_titles'][chunk_id] = chunk_title
+
+            # Create final result list from the grouped results
+            filtered_results = list(grouped_results.values())
             
+            # If we have no results but had initial results with tag filter, something went wrong with filtering
             filtered_count = len(filtered_results)
             print(f"Final results after filtering: {filtered_count}")
             if filtered_count == 0 and initial_count > 0 and tag_filter:
                 print("WARNING: All results filtered out! Check if tag names match exactly.")
                 
-                # Try a relaxed version with partial tag matching as a fallback
-                print("\nTrying relaxed tag matching as fallback...")
-                
+                # If we have a large mismatch, try a more relaxed approach by using the raw results
                 filtered_results = []
                 for i, (distance, metadata, document) in enumerate(zip(results['distances'][0], results['metadatas'][0], results['documents'][0])):
-                    result = metadata.copy()
+                    # Extract file path
+                    doc_id = results['ids'][0][i]
+                    file_path = doc_id.split('#')[0]  # Remove chunk identifier
                     
-                    # Parse tags from JSON string
-                    tags = []
-                    if "tags" in result:
+                    # Basic result with minimal filtering
+                    result = {
+                        'path': file_path,
+                        'filename': metadata.get('filename', os.path.basename(file_path)),
+                        'score': 1.0 - (float(distance) / 2.0) if distance is not None else 0.0,
+                        'snippets': self._extract_relevant_snippets(document, query) or [document[:150] + "..."]
+                    }
+                    
+                    # Parse tags if available
+                    if "tags" in metadata:
                         try:
-                            tags = json.loads(result["tags"])
-                            # Store normalized tags for matching
-                            result["tags"] = tags
-                        except json.JSONDecodeError:
-                            result["tags"] = []
+                            result['tags'] = json.loads(metadata["tags"])
+                        except:
+                            result['tags'] = []
                     else:
-                        result["tags"] = []
+                        result['tags'] = []
                         
-                    # Calculate similarity score
-                    if distance is not None:
-                        similarity = 1.0 - (float(distance) / 2.0)
-                        result['score'] = max(0.0, min(1.0, similarity))
-                        if 0 < similarity < 0.01:
-                            result['score'] = 0.01
-                    else:
-                        result['score'] = 0.0
-                        
-                    # Extract relevant snippets from the document
-                    if document:
-                        snippets = self._extract_relevant_snippets(document, query)
-                        if snippets:
-                            result['snippets'] = snippets
-                        else:
-                            preview_length = min(150, len(document))
-                            result['snippets'] = [f"{document[:preview_length]}..."]
-                        
-                    # No tag filtering in the fallback mode
                     filtered_results.append(result)
-                
-                print(f"Fallback returning all {len(filtered_results)} results without tag filtering")
-
+            
             # Sort by score and limit results
             filtered_results.sort(key=lambda x: x['score'], reverse=True)
-            return filtered_results[:limit]
+            
+            # Remove duplicates (keeping the first/highest scored occurrence)
+            seen_paths = set()
+            unique_results = []
+            
+            for result in filtered_results:
+                if result['path'] not in seen_paths:
+                    seen_paths.add(result['path'])
+                    unique_results.append(result)
+            
+            return unique_results[:limit]
 
         except Exception as e:
             print(f"Search error: {str(e)}")
             traceback.print_exc()
             return []
+    
+    def _expand_query(self, query: str) -> List[str]:
+        """
+        Expand the query with synonyms or related terms to improve recall.
+        Returns list of expanded queries to use.
+        
+        Example: "document text" -> ["document text", "document content", "file text"]
+        
+        The original query is always included as the first item.
+        """
+        expanded = [query]
+        
+        # For short queries (1-2 words), add some common synonyms
+        words = query.lower().split()
+        if len(words) <= 3:
+            # Common synonym mappings for document search
+            synonyms = {
+                'document': ['file', 'content', 'text', 'doc'],
+                'text': ['content', 'document', 'writing', 'words'],
+                'image': ['picture', 'photo', 'jpg', 'jpeg', 'png'],
+                'video': ['movie', 'mp4', 'film', 'clip'],
+                'pdf': ['document', 'acrobat', 'paper'],
+                'presentation': ['slides', 'powerpoint', 'ppt', 'slideshow'],
+                'spreadsheet': ['excel', 'xls', 'xlsx', 'table', 'worksheet'],
+                'code': ['source', 'programming', 'script', 'py', 'js'],
+                'email': ['mail', 'message', 'correspondence'],
+                'music': ['audio', 'song', 'mp3', 'sound'],
+                'important': ['critical', 'essential', 'key', 'urgent'],
+                'report': ['analysis', 'summary', 'document', 'results'],
+                'search': ['find', 'query', 'lookup', 'locate'],
+                'folder': ['directory', 'collection', 'group'],
+                'old': ['archive', 'outdated', 'previous'],
+                'new': ['recent', 'latest', 'current', 'updated']
+            }
+            
+            # Create expanded queries by replacing one word at a time
+            for i, word in enumerate(words):
+                if word in synonyms:
+                    for synonym in synonyms[word][:2]:  # Limit to 2 synonyms per word to avoid explosion
+                        # Create a new query with this word replaced by synonym
+                        new_query = words.copy()
+                        new_query[i] = synonym
+                        expanded.append(" ".join(new_query))
+        
+        return expanded[:3]  # Limit to 3 total queries including original
             
     def _extract_relevant_snippets(self, text: str, query: str, max_snippets: int = 3, snippet_length: int = 150) -> List[str]:
         """
@@ -750,19 +987,33 @@ class VectorSearch:
             return False
             
         try:
-            # Check if the document exists
+            # First, check for any chunks associated with this file
+            try:
+                # Use a "where" filter to find all chunks (prefix match would be better but not supported)
+                all_ids = self.collection.get(include=["ids"])["ids"]
+                chunk_ids = [doc_id for doc_id in all_ids if doc_id.startswith(file_path + "#")]
+                
+                # Delete all chunks for this file
+                if chunk_ids:
+                    print(f"Removing {len(chunk_ids)} chunks for {file_path}")
+                    self.collection.delete(ids=chunk_ids)
+            except Exception as e:
+                print(f"Error removing chunks: {str(e)}")
+                
+            # Now remove the main document entry
             existing_docs = self.collection.get(
                 ids=[file_path], include=["metadatas"]
             )
             
-            if not existing_docs or not existing_docs['ids'] or len(existing_docs['ids']) == 0:
+            if existing_docs and existing_docs['ids'] and len(existing_docs['ids']) > 0:
+                # Remove the document
+                self.collection.delete(ids=[file_path])
+                print(f"Successfully removed {file_path} from vector database")
+                return True
+            else:
                 print(f"File {file_path} not found in vector database")
-                return False
-                
-            # Remove the document
-            self.collection.delete(ids=[file_path])
-            print(f"Successfully removed {file_path} from vector database")
-            return True
+                # If we at least removed some chunks, consider it a partial success
+                return bool(chunk_ids)
             
         except Exception as e:
             print(f"Error removing {file_path} from vector database: {str(e)}")

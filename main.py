@@ -1,13 +1,14 @@
 import sys
 import os
+import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QTreeView, QListWidget, QPushButton, 
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
                            QComboBox, QHeaderView, QMenuBar, QMenu, QDialog, QFileDialog,
-                           QTabWidget, QProgressDialog)
-from PySide6.QtCore import Qt, QDir, QStorageInfo
-from PySide6.QtGui import QColor
+                           QTabWidget, QProgressDialog, QSplashScreen, QProgressBar)
+from PySide6.QtCore import Qt, QDir, QStorageInfo, QThread, Signal
+from PySide6.QtGui import QColor, QPixmap, QFont
 from sqlalchemy import and_, or_
 from models import init_db, File, Tag
 from config import Config
@@ -16,14 +17,129 @@ from api_settings import APISettingsDialog
 from password_management import PasswordManagementDialog
 from tag_suggestion import TagSuggestionDialog
 
-class FileTagManager(QMainWindow):
-    def __init__(self):
+# Worker thread to handle initialization tasks
+class InitializationWorker(QThread):
+    progress_signal = Signal(str, int)
+    finished_signal = Signal(tuple)
+    
+    def __init__(self, password):
         super().__init__()
-        self.db_session = init_db()
-        # Initialize config with a password dialog
-        self.init_config()
-        # Initialize vector search
-        self.vector_search = VectorSearch(self.db_session)
+        self.password = password
+        
+    def run(self):
+        try:
+            # Initialize database
+            self.progress_signal.emit("Initializing database...", 10)
+            db_session = init_db()
+            
+            # Initialize config
+            self.progress_signal.emit("Loading configuration...", 30)
+            config = Config(self.password)
+            
+            # Initialize vector search
+            self.progress_signal.emit("Setting up search engine...", 50)
+            vector_search = VectorSearch(db_session)
+            
+            # Loading existing files and tags
+            self.progress_signal.emit("Loading files and tags...", 70)
+            time.sleep(0.5)  # Small delay to make the progress visible
+            
+            # Finalizing initialization
+            self.progress_signal.emit("Finalizing...", 90)
+            time.sleep(0.5)  # Small delay to make the progress visible
+            
+            # Send the results back to the main thread
+            self.finished_signal.emit((db_session, config, vector_search))
+            
+        except Exception as e:
+            self.progress_signal.emit(f"Error: {str(e)}", 100)
+            self.finished_signal.emit((None, None, None))
+
+class SplashScreen(QSplashScreen):
+    def __init__(self):
+        # Create a pixmap for the splash screen background
+        # Using a simple colored background if no image is available
+        splash_pixmap = QPixmap(400, 250)
+        splash_pixmap.fill(QColor(45, 45, 48))  # Dark background color
+        
+        super().__init__(splash_pixmap)
+        
+        # Set up the layout
+        layout = QVBoxLayout()
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Add title
+        title_label = QLabel("File Tagger")
+        title_label.setStyleSheet("color: white; font-size: 24px; font-weight: bold;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Add subtitle
+        subtitle_label = QLabel("Loading application...")
+        subtitle_label.setStyleSheet("color: #cccccc; font-size: 14px;")
+        subtitle_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(subtitle_label)
+        
+        # Add spacer
+        layout.addSpacing(20)
+        
+        # Add progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 5px;
+                background-color: #2d2d30;
+                color: white;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #007acc;
+                width: 10px;
+                margin: 0px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+        
+        # Add status label
+        self.status_label = QLabel("Starting up...")
+        self.status_label.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+        
+        # Create a central widget for the layout
+        central_widget = QWidget(self)
+        central_widget.setLayout(layout)
+        central_widget.setGeometry(0, 0, 400, 250)
+        
+        # Set window flags
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        
+    def update_progress(self, message, value):
+        self.status_label.setText(message)
+        self.progress_bar.setValue(value)
+        self.repaint()  # Force an update of the splash screen
+
+class FileTagManager(QMainWindow):
+    def __init__(self, db_session=None, config=None, vector_search=None):
+        super().__init__()
+        
+        if db_session and config and vector_search:
+            # If these are provided, use them directly (from the initialization worker)
+            self.db_session = db_session
+            self.config = config
+            self.vector_search = vector_search
+        else:
+            # Otherwise initialize normally (for backward compatibility)
+            self.db_session = init_db()
+            # Initialize config with a password dialog
+            self.init_config()
+            # Initialize vector search
+            self.vector_search = VectorSearch(self.db_session)
+            
         self.initUI()
 
     def init_config(self):
@@ -358,9 +474,10 @@ class FileTagManager(QMainWindow):
             use_and=use_and
         )
         
-        # Display results
+        # Clear previous results
         self.rag_search_results.clear()
         
+        # Check if results are empty
         if not results:
             self.rag_search_results.addItem("No matching files found")
             return
@@ -500,7 +617,7 @@ class FileTagManager(QMainWindow):
             self.db_session.add(file_obj)
             
         for selected_item in selected_items:
-            tag = self.db_session.query(Tag).filter_by(name=selected_item.text()).first()
+            tag = self.db_session.query(Tag).filter_by(name(selected_item.text())).first()
             if tag and tag not in file_obj.tags:
                 file_obj.tags.append(tag)
         
@@ -893,8 +1010,42 @@ class FileTagManager(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    window = FileTagManager()
-    window.show()
+    
+    # Create and show the splash screen
+    splash = SplashScreen()
+    splash.show()
+    
+    # Get the password for configuration
+    password, ok = QInputDialog.getText(
+        None, 'Configuration Password', 
+        'Enter password to encrypt/decrypt settings:',
+        QLineEdit.Password
+    )
+    if not ok:
+        sys.exit(0)
+    
+    # Create and start the initialization worker
+    worker = InitializationWorker(password)
+    
+    # Connect signals to update splash screen
+    worker.progress_signal.connect(splash.update_progress)
+    
+    def on_initialization_finished(result):
+        db_session, config, vector_search = result
+        if db_session and config and vector_search:
+            # Close the splash screen
+            splash.close()
+            
+            # Create and show the main window
+            window = FileTagManager(db_session, config, vector_search)
+            window.show()
+        else:
+            QMessageBox.critical(None, "Error", "Failed to initialize the application.")
+            sys.exit(1)
+    
+    worker.finished_signal.connect(on_initialization_finished)
+    worker.start()
+    
     sys.exit(app.exec())
 
 if __name__ == '__main__':
