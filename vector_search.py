@@ -630,6 +630,7 @@ class VectorSearch:
 
         try:
             if mime_type and mime_type.startswith("text/"):
+                # Handle text files including markdown
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
             elif mime_type == "application/pdf":
@@ -641,6 +642,36 @@ class VectorSearch:
                     print(f"Error extracting PDF text: {str(pdf_error)}")
                     # Return a basic placeholder if PDF extraction fails
                     content = f"PDF document: {os.path.basename(file_path)}"
+            elif file_path.lower().endswith('.md'):
+                # Handle markdown files explicitly
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            elif file_path.lower().endswith(('.doc', '.docx')):
+                # Handle Microsoft Word documents
+                try:
+                    import docx2txt
+                    try:
+                        # For .docx files
+                        content = docx2txt.process(file_path)
+                    except Exception as docx_error:
+                        print(f"Error with docx2txt: {str(docx_error)}")
+                        
+                        # Fallback for .doc files or if docx2txt fails
+                        try:
+                            # Correct import for win32com
+                            import win32com.client
+                            word = win32com.client.Dispatch("Word.Application")
+                            word.visible = False
+                            doc = word.Documents.Open(file_path)
+                            content = doc.Content.Text
+                            doc.Close()
+                            word.Quit()
+                        except Exception as doc_error:
+                            print(f"Error extracting Word document text: {str(doc_error)}")
+                            content = f"Word document: {os.path.basename(file_path)}"
+                except ImportError:
+                    print("docx2txt module not installed")
+                    content = f"Word document (extraction not available): {os.path.basename(file_path)}"
             else:
                 # For other file types, just use the filename for indexing
                 content = f"File: {os.path.basename(file_path)}"
@@ -703,3 +734,37 @@ class VectorSearch:
         except Exception as e:
             print(f"\nError checking vector collection: {str(e)}")
             traceback.print_exc()
+
+    def remove_file(self, file_path: str) -> bool:
+        """
+        Remove a specific file from the vector database.
+        
+        Args:
+            file_path: The path of the file to remove
+            
+        Returns:
+            bool: True if removed successfully, False otherwise
+        """
+        if self.collection is None:
+            print("Vector database not initialized properly")
+            return False
+            
+        try:
+            # Check if the document exists
+            existing_docs = self.collection.get(
+                ids=[file_path], include=["metadatas"]
+            )
+            
+            if not existing_docs or not existing_docs['ids'] or len(existing_docs['ids']) == 0:
+                print(f"File {file_path} not found in vector database")
+                return False
+                
+            # Remove the document
+            self.collection.delete(ids=[file_path])
+            print(f"Successfully removed {file_path} from vector database")
+            return True
+            
+        except Exception as e:
+            print(f"Error removing {file_path} from vector database: {str(e)}")
+            traceback.print_exc()
+            return False

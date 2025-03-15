@@ -7,6 +7,7 @@ anthropic>=0.8.0
 pypdf>=5.3.1
 chromadb>=0.4.0
 sentence-transformers>=2.2.0
+docx2txt>=0.8
 # Optional packages for local AI models
 llama-cpp-python>=0.2.0;python_version>"3.8"
 ctransformers>=0.2.0;python_version>"3.8"

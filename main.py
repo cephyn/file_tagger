@@ -218,6 +218,8 @@ class FileTagManager(QMainWindow):
         
         self.search_results = QListWidget()
         self.search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
+        self.search_results.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.search_results.customContextMenuRequested.connect(self.on_search_result_right_clicked)
         results_layout.addWidget(self.search_results)
         
         # Add layouts to tag search tab
@@ -264,6 +266,8 @@ class FileTagManager(QMainWindow):
         
         self.rag_search_results = QListWidget()
         self.rag_search_results.itemDoubleClicked.connect(self.on_search_result_double_clicked)
+        self.rag_search_results.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.rag_search_results.customContextMenuRequested.connect(self.on_search_result_right_clicked)
         rag_results_layout.addWidget(self.rag_search_results)
         
         # Index management button
@@ -311,18 +315,28 @@ class FileTagManager(QMainWindow):
         self.search_tag_list.clear()
         tags = self.db_session.query(Tag).all()
         for tag in tags:
+            # Get tag color and determine appropriate text color
+            tag_color = QColor(tag.color)
+            text_color = Qt.white if self._is_dark_color(tag_color) else Qt.black
+            
             # Add to main tag list in tagging tab
-            item = self.tag_list.addItem(tag.name)
-            self.tag_list.item(self.tag_list.count() - 1).setBackground(QColor(tag.color))
+            self.tag_list.addItem(tag.name)
+            item = self.tag_list.item(self.tag_list.count() - 1)
+            item.setBackground(tag_color)
+            item.setForeground(text_color)
             
             # Add to filter list in RAG search
-            item = self.tag_filter_list.addItem(tag.name)
-            self.tag_filter_list.item(self.tag_filter_list.count() - 1).setBackground(QColor(tag.color))
+            self.tag_filter_list.addItem(tag.name)
+            item = self.tag_filter_list.item(self.tag_filter_list.count() - 1)
+            item.setBackground(tag_color)
+            item.setForeground(text_color)
             
             # Add to search tag list in tag search
-            item = self.search_tag_list.addItem(tag.name)
-            self.search_tag_list.item(self.search_tag_list.count() - 1).setBackground(QColor(tag.color))
-
+            self.search_tag_list.addItem(tag.name)
+            item = self.search_tag_list.item(self.search_tag_list.count() - 1)
+            item.setBackground(tag_color)
+            item.setForeground(text_color)
+            
     def search_by_content(self):
         """Perform RAG-based search with optional tag filtering."""
         query = self.query_input.text().strip()
@@ -462,6 +476,7 @@ class FileTagManager(QMainWindow):
     def delete_tag(self):
         current_item = self.tag_list.currentItem()
         if current_item:
+            # tag = self.db_session.query(Tag).filter_by(name=current_item.text()).first()
             tag = self.db_session.query(Tag).filter_by(name=current_item.text()).first()
             if tag:
                 self.db_session.delete(tag)
@@ -532,8 +547,14 @@ class FileTagManager(QMainWindow):
         file_obj = self.db_session.query(File).filter_by(path=self.current_file_path).first()
         if file_obj:
             for tag in file_obj.tags:
-                item = self.file_tags_list.addItem(tag.name)
-                self.file_tags_list.item(self.file_tags_list.count() - 1).setBackground(QColor(tag.color))
+                # Get tag color and determine appropriate text color
+                tag_color = QColor(tag.color)
+                text_color = Qt.white if self._is_dark_color(tag_color) else Qt.black
+                
+                self.file_tags_list.addItem(tag.name)
+                item = self.file_tags_list.item(self.file_tags_list.count() - 1)
+                item.setBackground(tag_color)
+                item.setForeground(text_color)
 
     def update_drive_list(self):
         self.drive_combo.clear()
@@ -722,6 +743,152 @@ class FileTagManager(QMainWindow):
                     "Error",
                     "Failed to set home directory. Please ensure the selected directory exists and is accessible."
                 )
+
+    def on_search_result_right_clicked(self, position):
+        """Handle right-click on search results items to show context menu."""
+        # Get the item that was clicked
+        item = self.sender().itemAt(position)
+        if not item:
+            return
+            
+        # Create context menu
+        context_menu = QMenu(self)
+        
+        # Get file path from item tooltip
+        file_path = item.toolTip()
+        if not file_path or not os.path.exists(file_path):
+            return
+            
+        # Add open action
+        open_action = context_menu.addAction("Open File")
+        open_in_folder_action = context_menu.addAction("Open Containing Folder")
+        
+        # Add remove from vector DB action
+        remove_action = context_menu.addAction("Remove from Search Index")
+        
+        # Show the context menu
+        action = context_menu.exec_(self.sender().mapToGlobal(position))
+        
+        # Handle menu actions
+        if action == open_action:
+            # Open the file with default application
+            self._open_file(file_path)
+        elif action == open_in_folder_action:
+            # Open the containing folder and select the file
+            self._open_containing_folder(file_path)
+        elif action == remove_action:
+            # Remove the file from vector database
+            self._remove_from_vector_db(file_path)
+            
+    def _open_file(self, file_path):
+        """Open a file with the system's default application."""
+        if os.path.isfile(file_path):
+            import subprocess
+            try:
+                os.startfile(file_path) if sys.platform == 'win32' else subprocess.call(('open' if sys.platform == 'darwin' else 'xdg-open', file_path))
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open file: {str(e)}")
+                
+    def _open_containing_folder(self, file_path):
+        """Open the folder containing the file and select it."""
+        if os.path.exists(file_path):
+            dir_path = os.path.dirname(file_path) if os.path.isfile(file_path) else file_path
+            import subprocess
+            try:
+                if sys.platform == 'win32':
+                    # On Windows, open Explorer and select the file
+                    subprocess.Popen(f'explorer /select,"{file_path}"')
+                elif sys.platform == 'darwin':
+                    # On macOS, open Finder and select the file
+                    subprocess.call(['open', '-R', file_path])
+                else:
+                    # On Linux, just open the containing directory
+                    subprocess.call(['xdg-open', dir_path])
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open containing folder: {str(e)}")
+                
+    def _remove_from_vector_db(self, file_path):
+        """Remove a file from the vector database."""
+        # Ask for confirmation
+        reply = QMessageBox.question(
+            self, 
+            "Remove from Search Index",
+            f"Are you sure you want to remove\n{file_path}\nfrom the search index?\n\nNote: This only removes the file from the search index, not from your computer or the tag database.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            # Remove from vector database
+            success = self.vector_search.remove_file(file_path)
+            
+            if success:
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"File removed from search index successfully.\n\nThe file is still on your computer and in the tag database."
+                )
+                
+                # If the item is in the current search results, remove it
+                self._remove_item_from_results(file_path)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "Could not remove file from search index. See console for details."
+                )
+                
+    def _remove_item_from_results(self, file_path):
+        """Remove items with the given file path from search results lists."""
+        # Check which tab is active and remove from appropriate list
+        current_tab = self.main_tabs.currentIndex()
+        
+        if current_tab == 1:  # Search tab
+            search_tabs = self.main_tabs.widget(1).layout().itemAt(0).widget()
+            current_search_tab = search_tabs.currentIndex()
+            
+            if current_search_tab == 0:  # Tag search tab
+                # Remove from tag search results
+                for i in range(self.search_results.count()):
+                    item = self.search_results.item(i)
+                    if item and item.toolTip() == file_path:
+                        self.search_results.takeItem(i)
+                        break
+            elif current_search_tab == 1:  # RAG search tab
+                # Remove from RAG search results
+                for i in range(self.rag_search_results.count()):
+                    item = self.rag_search_results.item(i)
+                    if item and item.toolTip() == file_path:
+                        self.rag_search_results.takeItem(i)
+                        # Also remove any snippet items that follow
+                        j = i + 1
+                        while j < self.rag_search_results.count():
+                            next_item = self.rag_search_results.item(j)
+                            if next_item and next_item.text().startswith("    ↪"):
+                                self.rag_search_results.takeItem(j)
+                            else:
+                                break
+                        break
+
+    def _is_dark_color(self, color):
+        """
+        Determines if a color is dark (needs white text) or light (needs dark text).
+        Uses the luminance formula: 0.299*R + 0.587*G + 0.114*B
+        
+        Args:
+            color (QColor): The color to check
+            
+        Returns:
+            bool: True if the color is dark, False if it's light
+        """
+        if isinstance(color, str):
+            color = QColor(color)
+            
+        # Calculate luminance (perceived brightness)
+        luminance = (0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()) / 255
+        
+        # If luminance is less than 0.5, color is dark
+        return luminance < 0.5
 
 def main():
     app = QApplication(sys.argv)
