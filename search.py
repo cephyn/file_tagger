@@ -2,16 +2,39 @@ import os
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTextEdit, QPushButton, QMessageBox, QApplication)
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QTextCursor  # Added QTextCursor
 
 class ChatWithResultsDialog(QDialog):
     """Dialog for chatting with top search results using AI."""
     def __init__(self, parent, ai_service, top_results, query):
         super().__init__(parent)
+        if ai_service is None:
+            raise ValueError("AI service not initialized. Please check your API settings and try again.")
+            
         self.ai_service = ai_service
         self.top_results = top_results[:3] if len(top_results) >= 3 else top_results
         self.initial_query = query
         self.chat_history = []
+        
+        # Verify AI service is properly configured
+        try:
+            # Test if provider is set
+            _ = self.ai_service.provider
+            
+            # For cloud providers, verify API key
+            if self.ai_service.provider in ['openai', 'anthropic', 'gemini']:
+                if not self.ai_service.api_key:
+                    raise ValueError(f"No API key configured for {self.ai_service.provider}")
+                    
+            # For local provider, verify model path
+            elif self.ai_service.provider == 'local':
+                if not hasattr(self.ai_service, 'model'):
+                    raise ValueError("Local AI model not properly initialized")
+            else:
+                raise ValueError(f"Unsupported AI provider: {self.ai_service.provider}")
+                
+        except Exception as e:
+            raise ValueError(f"AI service configuration error: {str(e)}")
         
         self.setWindowTitle("Chat with Search Results")
         self.resize(800, 600)
@@ -104,31 +127,44 @@ class ChatWithResultsDialog(QDialog):
         self.chat_input.clear()
         
         # Show typing indicator
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)  # Using QTextCursor enum
+        self.chat_display.setTextCursor(cursor)
         self.chat_display.append("<b>AI Assistant:</b> <i>Thinking...</i>")
         QApplication.processEvents()
         
         # Get AI response
         try:
+            # Debug info
+            print(f"Using AI provider: {self.ai_service.provider}")
+            
             # Prepare prompt from chat history
             prompt = self.prepare_prompt()
             
             # Call the AI service
             response = self.get_ai_response(prompt)
             
-            # Update the last "typing" message with the actual response
-            current_html = self.chat_display.toHtml()
-            current_html = current_html.replace("<b>AI Assistant:</b> <i>Thinking...</i>", f"<b>AI Assistant:</b> {response}")
-            self.chat_display.setHtml(current_html)
+            # Remove the "Thinking..." message and add the actual response
+            cursor = self.chat_display.textCursor()
+            cursor.movePosition(QTextCursor.End)  # Using QTextCursor enum
+            cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)  # Using QTextCursor enums
+            cursor.removeSelectedText()
+            cursor.deletePreviousChar()  # Remove the newline
+            self.chat_display.append(f"<b>AI Assistant:</b> {response}")
             
             # Add to chat history
             self.chat_history.append({"role": "assistant", "content": response})
             
         except Exception as e:
-            # Update the "typing" message with error
-            current_html = self.chat_display.toHtml()
-            current_html = current_html.replace("<b>AI Assistant:</b> <i>Thinking...</i>", 
-                                             f"<b>AI Assistant:</b> Sorry, I encountered an error: {str(e)}")
-            self.chat_display.setHtml(current_html)
+            # Remove the "Thinking..." message and show the error
+            cursor = self.chat_display.textCursor()
+            cursor.movePosition(QTextCursor.End)  # Using QTextCursor enum
+            cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)  # Using QTextCursor enums
+            cursor.removeSelectedText()
+            cursor.deletePreviousChar()  # Remove the newline
+            error_message = f"Error: {str(e)}\nType: {type(e).__name__}"
+            print(f"AI Response Error: {error_message}")  # Debug print
+            self.chat_display.append(f"<b>AI Assistant:</b> Sorry, I encountered an error: {error_message}")
     
     def prepare_prompt(self) -> str:
         """Prepare the prompt from chat history."""
@@ -152,88 +188,134 @@ class ChatWithResultsDialog(QDialog):
     
     def get_ai_response(self, prompt: str) -> str:
         """Get a response from the AI service."""
-        # Get the AI provider name from the AI service
-        provider = self.ai_service.provider
-        
-        if provider == 'openai':
-            return self.get_openai_response(prompt)
-        elif provider == 'anthropic':
-            return self.get_claude_response(prompt)
-        elif provider == 'gemini':
-            return self.get_gemini_response(prompt)
-        elif provider == 'local':
-            return self.get_local_response(prompt)
-        else:
-            return f"Error: Unsupported AI provider '{provider}'"
+        try:
+            # Get the AI provider name from the AI service
+            provider = self.ai_service.provider
+            print(f"Provider: {provider}")  # Debug print
+            
+            if provider == 'openai':
+                return self.get_openai_response(prompt)
+            elif provider == 'anthropic':
+                return self.get_claude_response(prompt)
+            elif provider == 'gemini':
+                return self.get_gemini_response(prompt)
+            elif provider == 'local':
+                if not hasattr(self.ai_service, 'model'):
+                    raise ValueError("Local model not properly initialized")
+                return self.get_local_response(prompt)
+            else:
+                return f"Error: Unsupported AI provider '{provider}'"
+        except AttributeError as e:
+            print(f"AI Service Error: Missing attribute - {str(e)}")
+            raise ValueError(f"AI service not properly configured: {str(e)}")
+        except Exception as e:
+            print(f"AI Response Error: {type(e).__name__} - {str(e)}")
+            raise
     
     def get_openai_response(self, prompt: str) -> str:
         """Get a response from OpenAI."""
-        response = self.ai_service.modules['openai'].ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": self.chat_history[0]["content"]},
-                {"role": "system", "content": self.chat_history[1]["content"]},
-                *[{"role": msg["role"], "content": msg["content"]} 
-                  for msg in self.chat_history[2:] if msg["role"] != "system"]
-            ],
-            temperature=0.7
-        )
-        return response.choices[0].message.content
+        try:
+            print("Getting OpenAI response...")  # Debug print
+            if 'openai' not in self.ai_service.modules:
+                raise ValueError("OpenAI module not properly initialized")
+                
+            response = self.ai_service.modules['openai'].ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": self.chat_history[0]["content"]},
+                    {"role": "system", "content": self.chat_history[1]["content"]},
+                    *[{"role": msg["role"], "content": msg["content"]} 
+                      for msg in self.chat_history[2:] if msg["role"] != "system"]
+                ],
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"OpenAI error: {type(e).__name__} - {str(e)}")
+            raise
     
     def get_claude_response(self, prompt: str) -> str:
         """Get a response from Anthropic Claude."""
-        messages = []
-        for msg in self.chat_history:
-            if msg["role"] != "system":
-                messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        response = self.ai_service.client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=1000,
-            system=self.chat_history[0]["content"] + "\n\n" + self.chat_history[1]["content"],
-            messages=messages
-        )
-        return response.content[0].text
+        try:
+            print("Getting Claude response...")  # Debug print
+            if not hasattr(self.ai_service, 'client'):
+                raise ValueError("Claude client not properly initialized")
+                
+            messages = []
+            for msg in self.chat_history:
+                if msg["role"] != "system":
+                    messages.append({"role": msg["role"], "content": msg["content"]})
+            
+            response = self.ai_service.client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=1000,
+                system=self.chat_history[0]["content"] + "\n\n" + self.chat_history[1]["content"],
+                messages=messages
+            )
+            return response.content[0].text
+        except Exception as e:
+            print(f"Claude error: {type(e).__name__} - {str(e)}")
+            raise
     
     def get_gemini_response(self, prompt: str) -> str:
         """Get a response from Google Gemini."""
-        messages = []
-        for msg in self.chat_history:
-            if msg["role"] != "system":
+        try:
+            print("Getting Gemini response...")  # Debug print
+            if not hasattr(self.ai_service, 'model'):
+                raise ValueError("Gemini model not properly initialized")
+                
+            # Convert chat history to Gemini format
+            messages = []
+            
+            # Start with system messages
+            system_content = self.chat_history[0]["content"] + "\n\n" + self.chat_history[1]["content"]
+            messages.append({"role": "user", "parts": [{"text": f"System instructions: {system_content}"}]})
+            messages.append({"role": "model", "parts": [{"text": "I understand and will follow these instructions."}]})
+            
+            # Add conversation history
+            for msg in self.chat_history[2:]:  # Skip system messages
                 role = "user" if msg["role"] == "user" else "model"
                 messages.append({"role": role, "parts": [{"text": msg["content"]}]})
-        
-        chat = self.ai_service.model.start_chat(
-            history=[],
-            system_instruction=self.chat_history[0]["content"] + "\n\n" + self.chat_history[1]["content"],
-        )
-        
-        for msg in messages:
-            if msg["role"] == "user":
-                chat.send_message(msg["parts"][0]["text"])
-        
-        response = chat.send_message(messages[-1]["parts"][0]["text"] if messages[-1]["role"] == "user" else "")
-        return response.text
+            
+            # Create a new chat
+            chat = self.ai_service.model.start_chat(history=messages)
+            
+            # Send the last user message
+            response = chat.send_message(messages[-1]["parts"][0]["text"] if messages[-1]["role"] == "user" else "")
+            return response.text
+        except Exception as e:
+            print(f"Gemini error: {type(e).__name__} - {str(e)}")
+            raise
     
     def get_local_response(self, prompt: str) -> str:
         """Get a response from the local model."""
-        if self.ai_service.local_model_type == 'llama':
-            # For LlamaCpp
-            full_prompt = f"System: {self.chat_history[0]['content']}\n\n{self.chat_history[1]['content']}\n\n" + prompt
-            output = self.ai_service.model(
-                full_prompt,
-                max_tokens=1000,
-                temperature=0.7,
-                stop=["</s>", "User:", "user:"]
-            )
-            return output['choices'][0]['text']
-        else:
-            # For CTransformers
-            full_prompt = f"System: {self.chat_history[0]['content']}\n\n{self.chat_history[1]['content']}\n\n" + prompt
-            response = self.ai_service.model(
-                full_prompt,
-                max_new_tokens=1000,
-                temperature=0.7,
-                stop_sequences=["</s>", "User:", "user:"]
-            )
-            return response
+        try:
+            print("Getting local model response...")  # Debug print
+            print(f"Local model type: {self.ai_service.local_model_type}")  # Debug print
+            
+            if not hasattr(self.ai_service, 'model'):
+                raise ValueError("Local model not properly initialized")
+
+            if self.ai_service.local_model_type == 'llama':
+                # For LlamaCpp
+                full_prompt = f"System: {self.chat_history[0]['content']}\n\n{self.chat_history[1]['content']}\n\n" + prompt
+                output = self.ai_service.model(
+                    full_prompt,
+                    max_tokens=1000,
+                    temperature=0.7,
+                    stop=["</s>", "User:", "user:"]
+                )
+                return output['choices'][0]['text']
+            else:
+                # For CTransformers
+                full_prompt = f"System: {self.chat_history[0]['content']}\n\n{self.chat_history[1]['content']}\n\n" + prompt
+                response = self.ai_service.model(
+                    full_prompt,
+                    max_new_tokens=1000,
+                    temperature=0.7,
+                    stop_sequences=["</s>", "User:", "user:"]
+                )
+                return response
+        except Exception as e:
+            print(f"Local model error: {type(e).__name__} - {str(e)}")
+            raise

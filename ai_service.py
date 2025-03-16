@@ -39,9 +39,9 @@ class AIService:
                 self.modules['google'].configure(api_key=self.api_key)
                 # Include system message in the model initialization
                 self.model = self.modules['google'].GenerativeModel(
-                    'gemini-2.0-flash-lite',
+'gemini-2.0-flash-lite',
                     system_instruction=self.system_message
-                )
+)
             elif self.provider == 'local':
                 # Check which local model type to use
                 if self.local_model_type == 'llama':

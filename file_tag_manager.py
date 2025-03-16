@@ -761,8 +761,24 @@ class FileTagManager(QMainWindow):
                 )
                 
                 if reply == QMessageBox.Yes:
-                    dialog = ChatWithResultsDialog(self, self.config.get_ai_service(), results, query)
-                    dialog.exec()
+                    try:
+                        ai_service = self.config.get_ai_service()
+                        if ai_service is None:
+                            QMessageBox.warning(
+                                self,
+                                "Error",
+                                "Could not initialize AI service. Please check your API settings and try again."
+                            )
+                            return
+                            
+                        dialog = ChatWithResultsDialog(self, ai_service, results, query)
+                        dialog.exec()
+                    except Exception as e:
+                        QMessageBox.warning(
+                            self,
+                            "Error",
+                            f"Could not start chat: {str(e)}\nPlease check your API settings and try again."
+                        )
         
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Search failed: {str(e)}")
