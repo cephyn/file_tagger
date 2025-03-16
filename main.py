@@ -6,7 +6,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QInputDialog, QColorDialog, QLabel, QFileSystemModel,
                            QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
                            QComboBox, QHeaderView, QMenuBar, QMenu, QDialog, QFileDialog,
-                           QTabWidget, QProgressDialog, QSplashScreen, QProgressBar)
+                           QTabWidget, QProgressDialog, QSplashScreen, QProgressBar,
+                           QTextEdit, QListWidgetItem, QScrollArea, QFrame)
 from PySide6.QtCore import Qt, QDir, QStorageInfo, QThread, Signal
 from PySide6.QtGui import QColor, QPixmap, QFont
 from sqlalchemy import and_, or_
@@ -16,6 +17,7 @@ from vector_search import VectorSearch
 from api_settings import APISettingsDialog
 from password_management import PasswordManagementDialog
 from tag_suggestion import TagSuggestionDialog
+from ai_service import AIService
 
 # Worker thread to handle initialization tasks
 class InitializationWorker(QThread):
@@ -54,6 +56,188 @@ class InitializationWorker(QThread):
         except Exception as e:
             self.progress_signal.emit(f"Error: {str(e)}", 100)
             self.finished_signal.emit((None, None, None))
+
+class LoginScreen(QWidget):
+    """A combined login and splash screen that handles password input and shows loading progress."""
+    login_successful_signal = Signal(str)  # Signal to emit when login is successful
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.setWindowTitle("File Tagger - Login")
+        self.setFixedSize(450, 400)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint)  # Keep window on top but allow interaction
+        
+        # Store reference to the worker thread to prevent premature destruction
+        self.worker = None
+        
+        # Set up the main layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(30, 30, 30, 30)
+        main_layout.setSpacing(20)
+        
+        # App title
+        title_label = QLabel("File Tagger")
+        title_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+        title_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title_label)
+        
+        # App subtitle
+        subtitle_label = QLabel("File Management & Tagging System")
+        subtitle_label.setStyleSheet("font-size: 14px; color: #666666;")
+        subtitle_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(subtitle_label)
+        
+        # Add spacer
+        main_layout.addSpacing(20)
+        
+        # Add a separator line
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("background-color: #cccccc;")
+        main_layout.addWidget(separator)
+        
+        # Password section
+        password_layout = QVBoxLayout()
+        password_label = QLabel("Please enter your configuration password:")
+        password_label.setStyleSheet("font-size: 12px;")
+        password_layout.addWidget(password_label)
+        
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Enter password")
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.returnPressed.connect(self.submit_password)
+        password_layout.addWidget(self.password_input)
+        
+        self.login_button = QPushButton("Login")
+        self.login_button.setStyleSheet("padding: 8px;")
+        self.login_button.clicked.connect(self.submit_password)
+        password_layout.addWidget(self.login_button)
+        
+        # Error message label (initially hidden)
+        self.error_label = QLabel()
+        self.error_label.setStyleSheet("color: #ff0000; font-size: 12px;")
+        self.error_label.setAlignment(Qt.AlignCenter)
+        self.error_label.setVisible(False)
+        password_layout.addWidget(self.error_label)
+        
+        main_layout.addLayout(password_layout)
+        
+        # Progress section (initially hidden)
+        self.progress_frame = QFrame()
+        progress_layout = QVBoxLayout(self.progress_frame)
+        
+        self.status_label = QLabel("Initializing...")
+        self.status_label.setStyleSheet("font-size: 12px;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        progress_layout.addWidget(self.status_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #cccccc;
+                border-radius: 5px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #007acc;
+                width: 10px;
+                margin: 0px;
+            }
+        """)
+        progress_layout.addWidget(self.progress_bar)
+        
+        main_layout.addWidget(self.progress_frame)
+        self.progress_frame.setVisible(False)
+        
+        # Footer
+        footer_label = QLabel("© 2023 File Tagger")
+        footer_label.setStyleSheet("font-size: 10px; color: #999999;")
+        footer_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(footer_label)
+        
+        # Set focus to password input
+        self.password_input.setFocus()
+    
+    def submit_password(self):
+        """Handle password submission."""
+        password = self.password_input.text()
+        
+        if not password:
+            self.show_error("Please enter a password")
+            return
+        
+        # Hide password section and show progress
+        self.password_input.setEnabled(False)
+        self.login_button.setEnabled(False)
+        self.error_label.setVisible(False)
+        self.progress_frame.setVisible(True)
+        
+        # Create and start the initialization worker
+        self.worker = InitializationWorker(password)
+        
+        # Connect signals to update login screen
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.finished_signal.connect(self.on_initialization_finished)
+        
+        # Start the worker
+        self.worker.start()
+    
+    def on_initialization_finished(self, result):
+        """Handle completion of the initialization process."""
+        db_session, config, vector_search = result
+        if db_session and config and vector_search:
+            # Signal that login was successful, worker will be cleaned up in closeEvent
+            self.hide()
+            
+            # Create and show the main window
+            window = FileTagManager(db_session, config, vector_search)
+            window.show()
+            
+            # Close the login screen after showing the main window
+            self.close()
+        else:
+            self.show_error("Failed to initialize the application. Incorrect password or corrupted configuration.")
+            # Clean up worker
+            self.cleanup_worker()
+    
+    def cleanup_worker(self):
+        """Clean up the worker thread safely."""
+        if self.worker:
+            # Disconnect signals to prevent potential issues
+            self.worker.progress_signal.disconnect()
+            self.worker.finished_signal.disconnect()
+            
+            # Wait for the thread to finish if it's still running
+            if self.worker.isRunning():
+                self.worker.wait()
+            
+            # Delete the worker
+            self.worker = None
+    
+    def closeEvent(self, event):
+        """Handle window close event to properly clean up thread resources."""
+        self.cleanup_worker()
+        event.accept()
+    
+    def show_error(self, message):
+        """Display error message."""
+        self.error_label.setText(message)
+        self.error_label.setVisible(True)
+        self.password_input.setEnabled(True)
+        self.login_button.setEnabled(True)
+        self.password_input.selectAll()
+        self.password_input.setFocus()
+    
+    def update_progress(self, message, value):
+        """Update progress bar and status message."""
+        self.status_label.setText(message)
+        self.progress_bar.setValue(value)
+        QApplication.processEvents()  # Ensure UI updates
 
 class SplashScreen(QSplashScreen):
     def __init__(self):
@@ -123,11 +307,245 @@ class SplashScreen(QSplashScreen):
         self.progress_bar.setValue(value)
         self.repaint()  # Force an update of the splash screen
 
+class ChatWithResultsDialog(QDialog):
+    """Dialog for chatting with top search results using AI."""
+    def __init__(self, parent, ai_service, top_results, query):
+        super().__init__(parent)
+        self.ai_service = ai_service
+        self.top_results = top_results[:3] if len(top_results) >= 3 else top_results  # Limit to top 3 results
+        self.initial_query = query
+        self.chat_history = []
+        
+        self.setWindowTitle("Chat with Search Results")
+        self.resize(800, 600)
+        self.setup_ui()
+        
+        # Initialize chat with the search query
+        self.start_chat()
+    
+    def setup_ui(self):
+        """Set up the chat interface."""
+        layout = QVBoxLayout()
+        
+        # Result files section
+        results_layout = QHBoxLayout()
+        results_layout.addWidget(QLabel("Chatting with:"))
+        
+        # Files being used
+        for result in self.top_results:
+            file_label = QLabel(os.path.basename(result['path']))
+            file_label.setToolTip(result['path'])
+            file_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border-radius: 3px;")
+            results_layout.addWidget(file_label)
+        
+        layout.addLayout(results_layout)
+        
+        # Chat history area
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        layout.addWidget(self.chat_display)
+        
+        # Input area
+        input_layout = QHBoxLayout()
+        self.chat_input = QTextEdit()
+        self.chat_input.setPlaceholderText("Type your message...")
+        self.chat_input.setMaximumHeight(80)
+        self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self.send_message)
+        input_layout.addWidget(self.chat_input)
+        input_layout.addWidget(self.send_button)
+        layout.addLayout(input_layout)
+        
+        self.setLayout(layout)
+    
+    def start_chat(self):
+        """Initialize the chat with the AI."""
+        # Prepare context from the top results
+        context = "I'm going to ask questions about the following documents:\n\n"
+        
+        for i, result in enumerate(self.top_results):
+            context += f"Document {i+1}: {os.path.basename(result['path'])}\n"
+            context += f"Content snippets:\n"
+            for snippet in result.get('snippets', []):
+                context += f"- {snippet}\n"
+            context += "\n"
+        
+        # Add the initial query as system message
+        system_message = (
+            f"You are an assistant helping with questions about documents. "
+            f"Base your answers only on the document content snippets provided. "
+            f"If the answer is not in the documents, say that you don't know based on the available information."
+        )
+        
+        # Display a welcome message
+        self.chat_display.append("<b>AI Assistant:</b> Hello! I can answer questions about the top search results. What would you like to know?")
+        
+        # Store context and system message in chat history
+        self.chat_history = [
+            {"role": "system", "content": system_message},
+            {"role": "system", "content": context}
+        ]
+        
+        # Process the initial query if there is one
+        if self.initial_query:
+            self.chat_input.setPlainText(self.initial_query)
+            self.send_message()
+    
+    def send_message(self):
+        """Send the user message and get AI response."""
+        user_message = self.chat_input.toPlainText().strip()
+        if not user_message:
+            return
+        
+        # Display user message
+        self.chat_display.append(f"<b>You:</b> {user_message}")
+        
+        # Add to chat history
+        self.chat_history.append({"role": "user", "content": user_message})
+        
+        # Clear input
+        self.chat_input.clear()
+        
+        # Show typing indicator
+        self.chat_display.append("<b>AI Assistant:</b> <i>Thinking...</i>")
+        QApplication.processEvents()
+        
+        # Get AI response
+        try:
+            # Prepare prompt from chat history
+            prompt = self.prepare_prompt()
+            
+            # Call the AI service
+            response = self.get_ai_response(prompt)
+            
+            # Update the last "typing" message with the actual response
+            current_html = self.chat_display.toHtml()
+            current_html = current_html.replace("<b>AI Assistant:</b> <i>Thinking...</i>", f"<b>AI Assistant:</b> {response}")
+            self.chat_display.setHtml(current_html)
+            
+            # Add to chat history
+            self.chat_history.append({"role": "assistant", "content": response})
+            
+        except Exception as e:
+            # Update the "typing" message with error
+            current_html = self.chat_display.toHtml()
+            current_html = current_html.replace("<b>AI Assistant:</b> <i>Thinking...</i>", 
+                                             f"<b>AI Assistant:</b> Sorry, I encountered an error: {str(e)}")
+            self.chat_display.setHtml(current_html)
+    
+    def prepare_prompt(self) -> str:
+        """Prepare the prompt from chat history."""
+        prompt = ""
+        
+        # Add system and context messages first
+        for message in self.chat_history:
+            if message["role"] == "system":
+                prompt += f"{message['content']}\n\n"
+        
+        # Add conversation history (excluding system messages)
+        for message in self.chat_history:
+            if message["role"] != "system":
+                role_name = "User" if message["role"] == "user" else "Assistant"
+                prompt += f"{role_name}: {message['content']}\n\n"
+        
+        # Add final prompt for the assistant to respond
+        prompt += "Assistant: "
+        
+        return prompt
+    
+    def get_ai_response(self, prompt: str) -> str:
+        """Get a response from the AI service."""
+        # Get the AI provider name from the AI service
+        provider = self.ai_service.provider
+        
+        if provider == 'openai':
+            return self.get_openai_response(prompt)
+        elif provider == 'anthropic':
+            return self.get_claude_response(prompt)
+        elif provider == 'gemini':
+            return self.get_gemini_response(prompt)
+        elif provider == 'local':
+            return self.get_local_response(prompt)
+        else:
+            return f"Error: Unsupported AI provider '{provider}'"
+    
+    def get_openai_response(self, prompt: str) -> str:
+        """Get a response from OpenAI."""
+        response = self.ai_service.modules['openai'].ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": self.chat_history[0]["content"]},
+                {"role": "system", "content": self.chat_history[1]["content"]},
+                *[{"role": msg["role"], "content": msg["content"]} 
+                  for msg in self.chat_history[2:] if msg["role"] != "system"]
+            ],
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    
+    def get_claude_response(self, prompt: str) -> str:
+        """Get a response from Anthropic Claude."""
+        messages = []
+        for msg in self.chat_history:
+            if msg["role"] != "system":
+                messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        response = self.ai_service.client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=1000,
+            system=self.chat_history[0]["content"] + "\n\n" + self.chat_history[1]["content"],
+            messages=messages
+        )
+        return response.content[0].text
+    
+    def get_gemini_response(self, prompt: str) -> str:
+        """Get a response from Google Gemini."""
+        messages = []
+        for msg in self.chat_history:
+            if msg["role"] != "system":
+                role = "user" if msg["role"] == "user" else "model"
+                messages.append({"role": role, "parts": [{"text": msg["content"]}]})
+        
+        chat = self.ai_service.model.start_chat(
+            history=[],
+            system_instruction=self.chat_history[0]["content"] + "\n\n" + self.chat_history[1]["content"],
+        )
+        
+        for msg in messages:
+            if msg["role"] == "user":
+                chat.send_message(msg["parts"][0]["text"])
+        
+        response = chat.send_message(messages[-1]["parts"][0]["text"] if messages[-1]["role"] == "user" else "")
+        return response.text
+    
+    def get_local_response(self, prompt: str) -> str:
+        """Get a response from the local model."""
+        if self.ai_service.local_model_type == 'llama':
+            # For LlamaCpp
+            full_prompt = f"System: {self.chat_history[0]['content']}\n\n{self.chat_history[1]['content']}\n\n" + prompt
+            output = self.ai_service.model(
+                full_prompt,
+                max_tokens=1000,
+                temperature=0.7,
+                stop=["</s>", "User:", "user:"]
+            )
+            return output['choices'][0]['text']
+        else:
+            # For CTransformers
+            full_prompt = f"System: {self.chat_history[0]['content']}\n\n{self.chat_history[1]['content']}\n\n" + prompt
+            response = self.ai_service.model(
+                full_prompt,
+                max_new_tokens=1000,
+                temperature=0.7,
+                stop_sequences=["</s>", "User:", "user:"]
+            )
+            return response
+
 class FileTagManager(QMainWindow):
     def __init__(self, db_session=None, config=None, vector_search=None):
         super().__init__()
         
-        if db_session and config and vector_search:
+        if (db_session and config and vector_search):
             # If these are provided, use them directly (from the initialization worker)
             self.db_session = db_session
             self.config = config
@@ -482,6 +900,17 @@ class FileTagManager(QMainWindow):
             self.rag_search_results.addItem("No matching files found")
             return
             
+        # Store results for the chat feature
+        self._last_search_results = results
+        self._last_search_query = query
+        
+        # Add a "Chat with Results" button at the top of results if we have at least one result
+        chat_item = QListWidgetItem("💬 Chat with top results using AI")
+        chat_item.setBackground(QColor(230, 240, 255))  # Light blue background
+        chat_item.setFont(QFont("Arial", 10, QFont.Bold))
+        chat_item.setData(Qt.UserRole, "chat_action")  # Special data to identify this item
+        self.rag_search_results.addItem(chat_item)
+        
         for result in results:
             # Create result text with score and tags
             score_percent = int(result['score'] * 100)
@@ -490,7 +919,7 @@ class FileTagManager(QMainWindow):
             # Create the main result item with filename and score
             display_text = f"{os.path.basename(result['path'])} (Match: {score_percent}%){tags_text}"
             
-            item = self.rag_search_results.addItem(display_text)
+            self.rag_search_results.addItem(display_text)
             list_item = self.rag_search_results.item(self.rag_search_results.count() - 1)
             
             # Store full path in tooltip
@@ -509,15 +938,19 @@ class FileTagManager(QMainWindow):
                         clean_snippet = f"{clean_snippet[:200]}..."
                     
                     # Add snippet with indentation
-                    snippet_item = self.rag_search_results.addItem(f"    ↪ {clean_snippet}")
+                    self.rag_search_results.addItem(f"    ↪ {clean_snippet}")
+                    snippet_item = self.rag_search_results.item(self.rag_search_results.count() - 1)
                     
                     # Use a lighter shade of the same color for snippets
                     snippet_color = QColor(color)
                     snippet_color.setAlpha(100)  # Make it more transparent
-                    self.rag_search_results.item(self.rag_search_results.count() - 1).setBackground(snippet_color)
+                    snippet_item.setBackground(snippet_color)
                     
                     # Allow selecting the main item when clicking on a snippet
-                    self.rag_search_results.item(self.rag_search_results.count() - 1).setToolTip(result['path'])
+                    snippet_item.setToolTip(result['path'])
+        
+        # Connect item click signal for the chat action
+        self.rag_search_results.itemClicked.connect(self.on_rag_result_clicked)
     
     def _get_score_color(self, score: float) -> QColor:
         """Get a color representing the match score (red to green)."""
@@ -617,7 +1050,7 @@ class FileTagManager(QMainWindow):
             self.db_session.add(file_obj)
             
         for selected_item in selected_items:
-            tag = self.db_session.query(Tag).filter_by(name(selected_item.text())).first()
+            tag = self.db_session.query(Tag).filter_by(name=selected_item.text()).first()
             if tag and tag not in file_obj.tags:
                 file_obj.tags.append(tag)
         
@@ -1007,44 +1440,59 @@ class FileTagManager(QMainWindow):
         # If luminance is less than 0.5, color is dark
         return luminance < 0.5
 
+    def on_rag_result_clicked(self, item):
+        """Handle click events on RAG search results."""
+        # Check if this is the "Chat with Results" button
+        if item.data(Qt.UserRole) == "chat_action":
+            # Check if we have search results and an AI service available
+            if not hasattr(self, '_last_search_results') or not self._last_search_results:
+                QMessageBox.warning(self, "Error", "No search results available to chat with.")
+                return
+                
+            # Get the API config
+            provider = self.config.get_selected_provider()
+            api_key = self.config.get_api_key(provider)  # Now correctly passing the provider
+            local_model_path = self.config.get_local_model_path()
+            local_model_type = self.config.get_local_model_type()
+            
+            if not api_key and provider != 'local':
+                QMessageBox.warning(self, "Error", "AI service not configured. Please set up API credentials in Settings.")
+                return
+            
+            if provider == 'local' and not local_model_path:
+                QMessageBox.warning(self, "Error", "Local model not configured. Please set up the model path in Settings.")
+                return
+            
+            # Initialize AI service
+            try:
+                ai_service = AIService(
+                    provider=provider,
+                    api_key=api_key,
+                    db_session=self.db_session,
+                    local_model_path=local_model_path,
+                    local_model_type=local_model_type
+                )
+                
+                # Open chat dialog with top results
+                chat_dialog = ChatWithResultsDialog(
+                    self,
+                    ai_service=ai_service,
+                    top_results=self._last_search_results[:3],  # Use top 3 results
+                    query=self._last_search_query
+                )
+                chat_dialog.exec()
+                
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to initialize AI service: {str(e)}")
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    # Create and show the splash screen
-    splash = SplashScreen()
-    splash.show()
-    
-    # Get the password for configuration
-    password, ok = QInputDialog.getText(
-        None, 'Configuration Password', 
-        'Enter password to encrypt/decrypt settings:',
-        QLineEdit.Password
-    )
-    if not ok:
-        sys.exit(0)
-    
-    # Create and start the initialization worker
-    worker = InitializationWorker(password)
-    
-    # Connect signals to update splash screen
-    worker.progress_signal.connect(splash.update_progress)
-    
-    def on_initialization_finished(result):
-        db_session, config, vector_search = result
-        if db_session and config and vector_search:
-            # Close the splash screen
-            splash.close()
-            
-            # Create and show the main window
-            window = FileTagManager(db_session, config, vector_search)
-            window.show()
-        else:
-            QMessageBox.critical(None, "Error", "Failed to initialize the application.")
-            sys.exit(1)
-    
-    worker.finished_signal.connect(on_initialization_finished)
-    worker.start()
+    # Create and show the login screen
+    # The login screen now handles all thread management internally
+    login_screen = LoginScreen()
+    login_screen.show()
     
     sys.exit(app.exec())
 
