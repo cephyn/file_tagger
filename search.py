@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QTextEdit, QPushButton, QMessageBox, QApplication)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QTextCursor  # Added QTextCursor
+from vector_search.content_extractor import ContentExtractor
 
 class ChatWithResultsDialog(QDialog):
     """Dialog for chatting with top search results using AI."""
@@ -80,20 +81,36 @@ class ChatWithResultsDialog(QDialog):
     
     def start_chat(self):
         """Initialize the chat with the AI."""
-        # Prepare context from the top results
+        # Prepare context from the top results with full document content
         context = "I'm going to ask questions about the following documents:\n\n"
         
         for i, result in enumerate(self.top_results):
-            context += f"Document {i+1}: {os.path.basename(result['path'])}\n"
-            context += f"Content snippets:\n"
-            for snippet in result.get('snippets', []):
-                context += f"- {snippet}\n"
-            context += "\n"
+            file_path = result['path']
+            context += f"Document {i+1}: {os.path.basename(file_path)}\n"
+            
+            # Get full document content instead of just snippets
+            try:
+                full_content = ContentExtractor.extract_file_content(file_path)
+                if full_content:
+                    # Add the full content but include structural markers
+                    context += f"Content:\n```\n{full_content}\n```\n\n"
+                else:
+                    # Fallback to snippets if full extraction fails
+                    context += f"Content snippets (full extraction failed):\n"
+                    for snippet in result.get('snippets', []):
+                        context += f"- {snippet}\n"
+                    context += "\n"
+            except Exception as e:
+                # Fallback to snippets if error
+                context += f"Content snippets (extraction error: {str(e)}):\n"
+                for snippet in result.get('snippets', []):
+                    context += f"- {snippet}\n"
+                context += "\n"
         
         # Add the initial query as system message
         system_message = (
             f"You are an assistant helping with questions about documents. "
-            f"Base your answers only on the document content snippets provided. "
+            f"Base your answers only on the document content provided. "
             f"If the answer is not in the documents, say that you don't know based on the available information."
         )
         

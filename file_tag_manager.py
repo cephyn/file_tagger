@@ -26,6 +26,7 @@ class FileTagManager(QMainWindow):
         self.config = config
         self.vector_search = vector_search
         self.current_file_path = None
+        self.current_search_results = []  # Initialize search results storage
         
         self.init_ui()
         
@@ -312,10 +313,22 @@ class FileTagManager(QMainWindow):
         self.rag_search_results.customContextMenuRequested.connect(self.on_search_result_right_clicked)
         results_layout.addWidget(self.rag_search_results)
         
-        # Add reindex button
+        # Add buttons layout
+        buttons_layout = QHBoxLayout()
+        
+        # Reindex button
         reindex_btn = QPushButton("Reindex Files")
         reindex_btn.clicked.connect(self.reindex_files)
-        results_layout.addWidget(reindex_btn)
+        buttons_layout.addWidget(reindex_btn)
+        
+        # Chat with results button
+        chat_btn = QPushButton("Chat with Results")
+        chat_btn.clicked.connect(self.chat_with_results)
+        chat_btn.setEnabled(False)  # Disabled until results are available
+        self.chat_results_btn = chat_btn  # Store reference to enable/disable
+        buttons_layout.addWidget(chat_btn)
+        
+        results_layout.addLayout(buttons_layout)
         
         layout.addLayout(results_layout)
         
@@ -728,21 +741,38 @@ class FileTagManager(QMainWindow):
         try:
             results = self.vector_search.search(
                 query,
-                tag_filter=tag_filters,  # Changed from tag_filters to tag_filter
-                use_and=self.rag_and_radio.isChecked(),  # Changed from filter_mode='and' to use_and parameter
+                tag_filter=tag_filters,
+                use_and=self.rag_and_radio.isChecked(),
                 limit=20
             )
             
             # Display results
             self.rag_search_results.clear()
+            
+            if not results or len(results) == 0:
+                self.chat_results_btn.setEnabled(False)
+                self.current_search_results = []
+                return
+            
+            # Store all results for reference
+            self.current_search_results = results
+            
+            # Keep track of which list items correspond to documents (not snippets)
+            self.result_document_items = {}
+            
             for result in results:
                 if os.path.exists(result['path']):
-                    # Add file item
+                    # Add file item with checkbox
                     score = result.get('score', 0)
                     file_item = QListWidgetItem(f"{os.path.basename(result['path'])} ({score:.2f})")
                     file_item.setToolTip(result['path'])
                     file_item.setBackground(get_score_color(score))
+                    file_item.setFlags(file_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    file_item.setCheckState(Qt.CheckState.Unchecked)
                     self.rag_search_results.addItem(file_item)
+                    
+                    # Store reference to this item for selection tracking
+                    self.result_document_items[result['path']] = file_item
                     
                     # Add snippet items if available
                     for snippet in result.get('snippets', []):
@@ -750,38 +780,14 @@ class FileTagManager(QMainWindow):
                         snippet_item.setToolTip(result['path'])
                         self.rag_search_results.addItem(snippet_item)
             
-            # Offer to chat with results if any are found
-            if results and len(results) > 0:
-                reply = QMessageBox.question(
-                    self,
-                    "Chat with Results",
-                    "Would you like to chat about these search results?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-                
-                if reply == QMessageBox.Yes:
-                    try:
-                        ai_service = self.config.get_ai_service()
-                        if ai_service is None:
-                            QMessageBox.warning(
-                                self,
-                                "Error",
-                                "Could not initialize AI service. Please check your API settings and try again."
-                            )
-                            return
-                            
-                        dialog = ChatWithResultsDialog(self, ai_service, results, query)
-                        dialog.exec()
-                    except Exception as e:
-                        QMessageBox.warning(
-                            self,
-                            "Error",
-                            f"Could not start chat: {str(e)}\nPlease check your API settings and try again."
-                        )
-        
+            # Enable chat button if results are available
+            self.chat_results_btn.setEnabled(True)
+            
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Search failed: {str(e)}")
+            self.chat_results_btn.setEnabled(False)
+            self.current_search_results = []
+            self.result_document_items = {}
     
     def reindex_files(self):
         """Reindex all files in the vector database."""
@@ -808,6 +814,70 @@ class FileTagManager(QMainWindow):
                 QMessageBox.warning(self, "Error", f"Reindexing failed: {str(e)}")
             finally:
                 progress.close()
+    
+    def chat_with_results(self):
+        """Open the chat dialog with selected documents (up to 3)."""
+        try:
+            # Get selected documents
+            selected_docs = []
+            checked_count = 0
+            
+            # Check if we have document items and search results
+            if hasattr(self, 'result_document_items') and hasattr(self, 'current_search_results'):
+                # Count number of checked items and get their corresponding results
+                for file_path, item in self.result_document_items.items():
+                    if item.checkState() == Qt.CheckState.Checked:
+                        checked_count += 1
+                        # Find the matching result in current_search_results
+                        for result in self.current_search_results:
+                            if result['path'] == file_path:
+                                selected_docs.append(result)
+                                break
+            
+            # If no documents are specifically selected, use the first 3 from search results
+            if not selected_docs and hasattr(self, 'current_search_results') and self.current_search_results:
+                # Limit to first 3 documents if none are selected
+                selected_docs = self.current_search_results[:min(3, len(self.current_search_results))]
+                message = "No documents selected. Using top search results."
+                QMessageBox.information(self, "Information", message)
+            
+            if not selected_docs:
+                QMessageBox.warning(
+                    self,
+                    "No Results",
+                    "No search results available. Please perform a search first."
+                )
+                return
+                
+            # Check if more than 3 documents are selected
+            if checked_count > 3:
+                QMessageBox.warning(
+                    self,
+                    "Too Many Documents",
+                    "You can select up to 3 documents. Please uncheck some documents."
+                )
+                return
+                
+            # Get AI service
+            ai_service = self.config.get_ai_service()
+            if ai_service is None:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "Could not initialize AI service. Please check your API settings and try again."
+                )
+                return
+            
+            # Open the chat dialog with selected documents
+            dialog = ChatWithResultsDialog(self, ai_service, selected_docs, self.query_input.text().strip())
+            dialog.exec()
+                
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Error",
+                f"Could not start chat: {str(e)}\nPlease check your API settings and try again."
+            )
     
     def show_api_settings(self):
         """Show the API settings dialog."""
