@@ -5,9 +5,10 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QColorDialog, QLabel, QFileSystemModel, QMessageBox,
                              QLineEdit, QRadioButton, QComboBox, QHeaderView,
                              QMenuBar, QMenu, QFileDialog, QTabWidget, QProgressDialog,
-                             QFrame, QListWidgetItem)
+                             QFrame, QListWidgetItem, QDialog)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QDesktopServices
+from PySide6.QtCore import QUrl
 from sqlalchemy import and_, or_
 from models import File, Tag
 from config import Config
@@ -17,6 +18,69 @@ from password_management import PasswordManagementDialog
 from tag_suggestion import TagSuggestionDialog
 from search import ChatWithResultsDialog
 from utils import is_dark_color, get_score_color, open_file, open_containing_folder
+
+class AboutDialog(QDialog):
+    """Dialog showing information about the application."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle("About File Tagger")
+        self.setFixedSize(400, 300)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        
+        # App title
+        title = QLabel("File Tagger")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Version
+        version = QLabel("Version 0.0.1")
+        version.setAlignment(Qt.AlignCenter)
+        layout.addWidget(version)
+        
+        # Description
+        desc = QLabel("A feature-rich file management and tagging system with AI-powered search capabilities.")
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignCenter)
+        layout.addWidget(desc)
+        
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Author info
+        author = QLabel("Developed by: Busy Wyvern")
+        author.setAlignment(Qt.AlignCenter)
+        layout.addWidget(author)
+        
+        # Website link (clickable)
+        website_label = QLabel("<a href='https://www.busywyvern.com'>Busy Wyvern</a>")
+        website_label.setOpenExternalLinks(True)
+        website_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(website_label)
+        
+        # Technologies used
+        tech_label = QLabel("Built with Python, PySide6, SQLAlchemy, and Vector Search")
+        tech_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(tech_label)
+        
+        # Copyright
+        copyright_label = QLabel("© 2025 All Rights Reserved")
+        copyright_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(copyright_label)
+        
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
 
 class FileTagManager(QMainWindow):
     """Main window for the File Tagger application."""
@@ -76,8 +140,9 @@ class FileTagManager(QMainWindow):
         """Set up the application menus."""
         menubar = self.menuBar()
         settings_menu = menubar.addMenu('Settings')
+        help_menu = menubar.addMenu('Help')
         
-        # Add menu actions
+        # Add settings menu actions
         api_settings_action = settings_menu.addAction('API Settings')
         api_settings_action.triggered.connect(self.show_api_settings)
         
@@ -86,6 +151,15 @@ class FileTagManager(QMainWindow):
         
         password_action = settings_menu.addAction('Password Management')
         password_action.triggered.connect(self.show_password_management)
+        
+        # Add help menu actions
+        about_action = help_menu.addAction('About')
+        about_action.triggered.connect(self.show_about_dialog)
+        
+    def show_about_dialog(self):
+        """Show the About dialog."""
+        dialog = AboutDialog(self)
+        dialog.exec()
 
     def create_tagging_tab(self):
         """Create and return the tagging interface tab."""

@@ -1,8 +1,71 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                            QLineEdit, QPushButton, QFrame, QProgressBar)
+                            QLineEdit, QPushButton, QFrame, QProgressBar, QDialog)
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from initialization import InitializationWorker
+
+class AboutDialog(QDialog):
+    """Dialog showing information about the application."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle("About File Tagger")
+        self.setFixedSize(400, 300)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        
+        # App title
+        title = QLabel("File Tagger")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Version
+        version = QLabel("Version 1.0.0")
+        version.setAlignment(Qt.AlignCenter)
+        layout.addWidget(version)
+        
+        # Description
+        desc = QLabel("A feature-rich file management and tagging system with AI-powered search capabilities.")
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignCenter)
+        layout.addWidget(desc)
+        
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Author info
+        author = QLabel("Developed by: YourName")
+        author.setAlignment(Qt.AlignCenter)
+        layout.addWidget(author)
+        
+        # Website link (clickable)
+        website_label = QLabel("<a href='https://yourwebsite.com'>Visit Website</a>")
+        website_label.setOpenExternalLinks(True)
+        website_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(website_label)
+        
+        # Technologies used
+        tech_label = QLabel("Built with Python, PySide6, SQLAlchemy, and Vector Search")
+        tech_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(tech_label)
+        
+        # Copyright
+        copyright_label = QLabel("© 2023 All Rights Reserved")
+        copyright_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(copyright_label)
+        
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
 
 class LoginScreen(QWidget):
     """A combined login and splash screen that handles password input and shows loading progress."""
@@ -117,10 +180,26 @@ class LoginScreen(QWidget):
         self.progress_frame.setVisible(False)
     
     def _setup_footer(self, layout):
+        footer_layout = QHBoxLayout()
+        
+        # About button
+        about_button = QPushButton("About")
+        about_button.setStyleSheet("padding: 5px 10px;")
+        about_button.clicked.connect(self.show_about_dialog)
+        footer_layout.addWidget(about_button)
+        
+        # Copyright label
         footer_label = QLabel("© 2023 File Tagger")
         footer_label.setStyleSheet("font-size: 10px; color: #999999;")
-        footer_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(footer_label)
+        footer_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        footer_layout.addWidget(footer_label)
+        
+        layout.addLayout(footer_layout)
+    
+    def show_about_dialog(self):
+        """Show the About dialog."""
+        dialog = AboutDialog(self)
+        dialog.exec()
     
     def submit_password(self):
         """Handle password submission."""
