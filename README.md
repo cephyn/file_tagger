@@ -17,6 +17,16 @@ A Windows file management application that allows users to add custom tags to fi
 - Search files using AND/OR boolean logic
 - Organize files with a flexible tagging system
 
+### Vector Search
+- Semantic search through file contents
+- Find files based on meaning, not just keywords
+- Document chunking for improved search of large files
+- Relevant text snippets in search results
+- Query expansion to find related terms
+- Semantic ranking of search results
+- Content-based file searching across multiple formats
+- Tag filtering with semantic search
+
 ### AI Integration
 - AI-powered automatic tag suggestions:
   - Analyzes files using selected AI provider
@@ -61,6 +71,12 @@ A Windows file management application that allows users to add custom tags to fi
    pip install ctransformers
    ```
 
+5. Optional: For vector search functionality
+   ```
+   # For semantic search capabilities
+   pip install chromadb sentence-transformers
+   ```
+
 ## Running the Application
 
 ```
@@ -100,6 +116,16 @@ On first run, you'll be prompted to set a password for encrypting your settings.
 
 Note: Tag suggestions are cached for 7 days to improve performance. Use the "Force Refresh" button to re-analyze a file.
 
+### Using Vector Search
+1. Navigate to the search tab
+2. Enter your search query in the semantic search field
+3. Optionally filter by tags using the tag selector
+4. Click "Search" to find files based on their content
+5. View results with relevant text snippets highlighting matches
+6. Double-click results to open files
+
+Note: Files are automatically indexed when first accessed. You can reindex all files from the settings menu.
+
 ### Password Management
 - Change password: Settings > Password Management > Change Password
 - Reset password: Use recovery key if you forget your password
@@ -115,6 +141,7 @@ file_tagger/
 ├── models.py           # Database models
 ├── ai_service.py       # AI provider integration
 ├── tag_suggestion.py   # AI tag suggestion dialog
+├── vector_search/      # Semantic search functionality
 ├── requirements.txt    # Python dependencies
 ├── .gitignore         # Git ignore rules
 └── README.md          # This file
@@ -130,6 +157,8 @@ Main Dependencies:
 - google-generativeai - Google Gemini API client
 - anthropic - Claude API client
 - pypdf - PDF text extraction
+- chromadb - Vector database for semantic search
+- sentence-transformers - Text embedding models for semantic search
 
 Optional Dependencies:
 - llama-cpp-python - Local LlamaCPP model support
