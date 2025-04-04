@@ -11,6 +11,93 @@ from models import Tag, File, TagSuggestionCache
 from ai_service import AIService
 from config import Config
 
+# Add TagSuggester class for batch processing of files
+class TagSuggester:
+    """Helper class to suggest tags for multiple files."""
+    
+    def __init__(self, config: Config):
+        """
+        Initialize the tag suggester with configuration.
+        
+        Args:
+            config: Application configuration
+        """
+        self.config = config
+        
+    def suggest_tags_for_file(self, file_path: str) -> dict:
+        """
+        Get AI tag suggestions for a single file.
+        
+        Args:
+            file_path: Path to the file to analyze
+            
+        Returns:
+            Dictionary mapping tag names to confidence scores
+        """
+        try:
+            # Create a session for the database operations
+            from models import init_db
+            db_session = init_db()
+            
+            # Get all existing tags
+            existing_tags = [tag.name for tag in db_session.query(Tag).all()]
+            
+            # Get provider and API key
+            provider = self.config.get_selected_provider()
+            api_key = self.config.get_api_key(provider)
+            
+            # Get custom system message
+            system_message = self.config.get_system_message()
+            
+            # Configure AI service based on provider
+            if provider == 'local':
+                local_model_path = self.config.get_local_model_path()
+                local_model_type = self.config.get_local_model_type()
+                
+                if not local_model_path:
+                    raise ValueError("No local model path configured")
+                
+                service = AIService(
+                    provider, 
+                    api_key="", 
+                    db_session=db_session,
+                    local_model_path=local_model_path,
+                    local_model_type=local_model_type,
+                    system_message=system_message
+                )
+            else:
+                if not api_key:
+                    raise ValueError(f"No API key configured for {provider}")
+                
+                service = AIService(
+                    provider, 
+                    api_key, 
+                    db_session=db_session,
+                    system_message=system_message
+                )
+            
+            # Analyze file
+            existing_matches, new_suggestions, _ = service.analyze_file(
+                file_path, 
+                existing_tags
+            )
+            
+            # Combine suggestions into a single dictionary
+            suggestions = {}
+            
+            for tag, confidence in existing_matches:
+                suggestions[tag] = confidence
+                
+            for tag, confidence in new_suggestions:
+                suggestions[tag] = confidence
+                
+            return suggestions
+            
+        except Exception as e:
+            print(f"Error suggesting tags for {file_path}: {str(e)}")
+            return {}
+        
+# Rest of the file remains unchanged
 class TagExplanationDialog(QDialog):
     """Dialog to display explanations for tag suggestions."""
     def __init__(self, tag_name, confidence, explanation, parent=None):

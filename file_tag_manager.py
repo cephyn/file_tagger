@@ -152,10 +152,14 @@ class FileTagManager(QMainWindow):
         password_action = settings_menu.addAction('Password Management')
         password_action.triggered.connect(self.show_password_management)
         
+        # Add scan directory action
+        scan_action = menubar.addAction('Scan Directory')
+        scan_action.triggered.connect(self.scan_directory_for_untagged)
+        
         # Add help menu actions
         about_action = help_menu.addAction('About')
         about_action.triggered.connect(self.show_about_dialog)
-        
+
     def show_about_dialog(self):
         """Show the About dialog."""
         dialog = AboutDialog(self)
@@ -975,3 +979,377 @@ class FileTagManager(QMainWindow):
         if dir_path:
             self.config.set_home_directory(dir_path)
             self.go_home()
+    
+    def scan_directory_for_untagged(self):
+        """Scan a directory for untagged files."""
+        # Use the current directory from the file explorer
+        dir_path = self.path_display.text()
+        
+        if not dir_path or not os.path.isdir(dir_path):
+            QMessageBox.warning(self, "Error", "Please navigate to a valid directory first!")
+            return
+        
+        # Import threading here to avoid circular imports
+        from PySide6.QtCore import QThread, Signal
+        
+        class ScanThread(QThread):
+            """Thread to scan directory for untagged files without blocking UI."""
+            scan_progress = Signal(int, int)  # files_processed, total_files
+            scan_finished = Signal(dict)  # dictionary mapping file paths to tag suggestions
+            scan_error = Signal(str)  # error message
+            
+            def __init__(self, directory, db_session, config):
+                super().__init__()
+                self.directory = directory
+                self.db_session = db_session
+                self.config = config
+                self.stop_requested = False
+            
+            def run(self):
+                try:
+                    # List all files in directory (not subdirectories)
+                    files = []
+                    with os.scandir(self.directory) as entries:
+                        for entry in entries:
+                            if entry.is_file() and not entry.name.startswith('.'):
+                                files.append(entry.path)
+                    
+                    # Initialize progress
+                    total_files = len(files)
+                    if total_files == 0:
+                        self.scan_finished.emit({})
+                        return
+                    
+                    # Check which files are not in database or have no tags
+                    # and generate suggestions for each file
+                    from tag_suggestion import TagSuggester
+                    tag_suggester = TagSuggester(self.config)
+                    
+                    untagged_files = {}
+                    for idx, file_path in enumerate(files):
+                        if self.stop_requested:
+                            return
+                        
+                        file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+                        if not file_obj or not file_obj.tags:
+                            # Get tag suggestions for this specific file
+                            suggestions = tag_suggester.suggest_tags_for_file(file_path)
+                            untagged_files[file_path] = suggestions
+                        
+                        # Emit progress
+                        self.scan_progress.emit(idx + 1, total_files)
+                    
+                    # Emit result with file-specific suggestions
+                    self.scan_finished.emit(untagged_files)
+                    
+                except Exception as e:
+                    self.scan_error.emit(str(e))
+        
+        # Create progress dialog
+        progress = QProgressDialog("Scanning directory for untagged files...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        
+        # Create and configure scan thread
+        self.scan_thread = ScanThread(dir_path, self.db_session, self.config)
+        
+        # Connect signals
+        self.scan_thread.scan_progress.connect(
+            lambda current, total: progress.setValue(int(current / total * 100))
+        )
+        self.scan_thread.scan_finished.connect(lambda files: self.show_untagged_files_dialog(files, dir_path))
+        self.scan_thread.scan_error.connect(
+            lambda error: QMessageBox.critical(self, "Scan Error", f"Error scanning directory: {error}")
+        )
+        progress.canceled.connect(lambda: setattr(self.scan_thread, 'stop_requested', True))
+        
+        # Start the scan
+        self.scan_thread.start()
+    
+    def show_untagged_files_dialog(self, untagged_files, directory_path):
+        """Show dialog with untagged files and provide options to tag them."""
+        if not untagged_files:
+            QMessageBox.information(
+                self, 
+                "Scan Complete", 
+                f"No untagged files found in directory:\n{directory_path}"
+            )
+            return
+        
+        # Create the dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Untagged Files")
+        dialog.setMinimumWidth(900)
+        dialog.setMinimumHeight(600)
+        layout = QVBoxLayout(dialog)
+        
+        # Add header information
+        header_label = QLabel(f"Found {len(untagged_files)} untagged files in:\n{directory_path}")
+        header_label.setWordWrap(True)
+        layout.addWidget(header_label)
+        
+        # Create main splitter for files and tags
+        main_layout = QVBoxLayout()
+        
+        # File list section (top section)
+        file_layout = QVBoxLayout()
+        file_label = QLabel("Select a file to view its suggestions:")
+        file_layout.addWidget(file_label)
+        
+        self.untagged_files_list = QListWidget()
+        # Store file paths and their suggestions
+        self.file_suggestions_map = untagged_files
+        
+        for file_path in untagged_files.keys():
+            item = QListWidgetItem(os.path.basename(file_path))
+            item.setToolTip(file_path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.untagged_files_list.addItem(item)
+        
+        file_layout.addWidget(self.untagged_files_list)
+        
+        # Selection buttons
+        selection_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        selection_layout.addWidget(select_all_btn)
+        selection_layout.addWidget(select_none_btn)
+        file_layout.addLayout(selection_layout)
+        
+        # Connect selection buttons
+        select_all_btn.clicked.connect(
+            lambda: [self.untagged_files_list.item(i).setCheckState(Qt.CheckState.Checked) 
+                    for i in range(self.untagged_files_list.count())]
+        )
+        select_none_btn.clicked.connect(
+            lambda: [self.untagged_files_list.item(i).setCheckState(Qt.CheckState.Unchecked) 
+                    for i in range(self.untagged_files_list.count())]
+        )
+        
+        main_layout.addLayout(file_layout)
+        
+        # Create a horizontal layout for the file-specific suggestions and general tag selection
+        tags_container_layout = QHBoxLayout()
+        
+        # Tag suggestions section (left side)
+        suggestions_layout = QVBoxLayout()
+        suggestions_label = QLabel("File-Specific Tag Suggestions:")
+        suggestions_layout.addWidget(suggestions_label)
+        
+        self.file_suggestions_list = QListWidget()
+        self.file_suggestions_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        suggestions_layout.addWidget(self.file_suggestions_list)
+        
+        # Connect file list selection to update suggestions
+        self.untagged_files_list.currentItemChanged.connect(self.update_file_specific_suggestions)
+        
+        tags_container_layout.addLayout(suggestions_layout)
+        
+        # General tag selection section (right side)
+        tag_layout = QVBoxLayout()
+        tag_layout.addWidget(QLabel("Available Tags:"))
+        
+        tag_list = QListWidget()
+        tag_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        
+        # Add existing tags to the list
+        tags = self.db_session.query(Tag).all()
+        for tag in tags:
+            tag_color = QColor(tag.color)
+            text_color = Qt.white if is_dark_color(tag_color) else Qt.black
+            
+            tag_list.addItem(tag.name)
+            item = tag_list.item(tag_list.count() - 1)
+            item.setBackground(tag_color)
+            item.setForeground(text_color)
+        
+        tag_layout.addWidget(tag_list)
+        
+        # Add new tag button
+        add_tag_btn = QPushButton("Create New Tag")
+        add_tag_btn.clicked.connect(lambda: self.add_tag_from_dialog(tag_list))
+        tag_layout.addWidget(add_tag_btn)
+        
+        tags_container_layout.addLayout(tag_layout)
+        main_layout.addLayout(tags_container_layout)
+        
+        layout.addLayout(main_layout)
+        
+        # Add buttons at the bottom
+        btn_layout = QHBoxLayout()
+        apply_selected_btn = QPushButton("Apply Selected Tags to Selected Files")
+        apply_all_suggestions_btn = QPushButton("Apply All Suggestions to Selected Files")
+        cancel_btn = QPushButton("Close")
+        btn_layout.addWidget(apply_selected_btn)
+        btn_layout.addWidget(apply_all_suggestions_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        # Connect buttons
+        apply_selected_btn.clicked.connect(lambda: self.apply_tags_to_files(
+            self.get_selected_files_from_list(self.untagged_files_list),
+            [item.text() for item in tag_list.selectedItems()] +
+            [self.get_tag_from_suggestion_item(item) for item in self.file_suggestions_list.selectedItems()]
+        ))
+        
+        apply_all_suggestions_btn.clicked.connect(lambda: self.apply_all_suggestions_to_files(
+            self.get_selected_files_from_list(self.untagged_files_list)
+        ))
+        
+        cancel_btn.clicked.connect(dialog.accept)
+        
+        # Show dialog
+        if self.untagged_files_list.count() > 0:
+            self.untagged_files_list.setCurrentRow(0)
+            
+        dialog.exec()
+        
+    def get_tag_from_suggestion_item(self, item):
+        """Extract the tag name from a suggestion list item."""
+        text = item.text()
+        # Remove the confidence score part if present, e.g., "tag (0.95)" -> "tag"
+        if "(" in text:
+            return text.split("(")[0].strip()
+        return text
+        
+    def update_file_specific_suggestions(self, current, previous):
+        """Update the file-specific suggestions list based on the selected file."""
+        if not current:
+            return
+            
+        self.file_suggestions_list.clear()
+        file_path = current.toolTip()
+        
+        if file_path in self.file_suggestions_map:
+            suggestions = self.file_suggestions_map[file_path]
+            
+            # Sort suggestions by confidence score
+            sorted_suggestions = dict(sorted(
+                suggestions.items(), 
+                key=lambda item: item[1], 
+                reverse=True
+            ))
+            
+            # Add suggestions to the list
+            for tag_name, confidence in sorted_suggestions.items():
+                # Format item text with confidence
+                text = f"{tag_name} ({confidence:.2f})"
+                
+                # Create the item
+                item = QListWidgetItem(text)
+                item.setData(Qt.UserRole, tag_name)  # Store actual tag name
+                
+                # Set background color based on confidence
+                item.setBackground(get_score_color(confidence))
+                
+                # Add to list
+                self.file_suggestions_list.addItem(item)
+                
+    def apply_all_suggestions_to_files(self, file_paths):
+        """Apply all AI suggestions to the selected files."""
+        if not file_paths:
+            QMessageBox.warning(self, "Error", "Please select files to tag!")
+            return
+        
+        applied_count = 0
+        total_files = len(file_paths)
+        
+        for file_path in file_paths:
+            if file_path in self.file_suggestions_map:
+                suggestions = self.file_suggestions_map[file_path]
+                
+                if suggestions:
+                    # Filter suggestions with good confidence (above 0.7)
+                    good_suggestions = {tag: score for tag, score in suggestions.items() if score > 0.7}
+                    
+                    if good_suggestions:
+                        # Apply these tags
+                        self.apply_tags_to_file(file_path, good_suggestions.keys())
+                        applied_count += 1
+        
+        # Show success message
+        if applied_count > 0:
+            QMessageBox.information(
+                self,
+                "Tags Applied",
+                f"Applied high-confidence suggestions to {applied_count} of {total_files} selected files."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "No Tags Applied",
+                "No high-confidence suggestions were found for the selected files."
+            )
+            
+    def apply_tags_to_file(self, file_path, tag_names):
+        """Apply tags to a single file."""
+        if not tag_names:
+            return
+            
+        # Get or create file record
+        file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+        if not file_obj:
+            file_obj = File(path=file_path)
+            self.db_session.add(file_obj)
+        
+        # Add tags (create them if they don't exist)
+        for tag_name in tag_names:
+            tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
+            if not tag:
+                # Create a new tag with a random color
+                import random
+                hue = random.randint(0, 359)
+                saturation = random.randint(128, 255)  # Medium to high saturation
+                value = random.randint(180, 255)  # Medium to high brightness
+                random_color = QColor.fromHsv(hue, saturation, value).name()
+                
+                tag = Tag(name=tag_name, color=random_color)
+                self.db_session.add(tag)
+                self.db_session.flush()  # Generate ID without committing transaction
+                
+            if tag not in file_obj.tags:
+                file_obj.tags.append(tag)
+        
+        # Don't commit here - we commit in the calling function
+
+    def apply_tags_to_files(self, file_paths, tag_names):
+        """Apply selected tags to multiple files."""
+        if not file_paths:
+            QMessageBox.warning(self, "Error", "Please select files to tag!")
+            return
+            
+        if not tag_names:
+            QMessageBox.warning(self, "Error", "Please select tags to apply!")
+            return
+        
+        # Apply tags to each file
+        for file_path in file_paths:
+            self.apply_tags_to_file(file_path, tag_names)
+        
+        # Commit all changes at once
+        self.db_session.commit()
+        
+        # Refresh tag lists
+        self.refresh_tags()
+        self.refresh_file_tags()
+        
+        # Show success message
+        QMessageBox.information(
+            self,
+            "Tags Applied",
+            f"Applied {len(tag_names)} tag(s) to {len(file_paths)} file(s)."
+        )
+        
+    def get_selected_files_from_list(self, list_widget):
+        """Get file paths from checked items in a list widget."""
+        selected_files = []
+        
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                file_path = item.toolTip()
+                selected_files.append(file_path)
+                
+        return selected_files
