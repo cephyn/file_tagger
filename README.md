@@ -10,12 +10,16 @@ A Windows file management application that allows users to add custom tags to fi
 - Navigate through directory structure with up/home buttons
 - Double-click search results to locate files
 - Sort files by name, size, type, and date modified
+- Quick navigation with drive selection dropdown
+- Right-click context menu for file operations
 
 ### Tag Management
 - Add, edit, and delete custom tags with colors
 - Apply multiple tags to files
 - Search files using AND/OR boolean logic
 - Organize files with a flexible tagging system
+- Batch tag multiple files at once
+- Remove tags from files
 
 ### Vector Search
 - Semantic search through file contents
@@ -26,6 +30,9 @@ A Windows file management application that allows users to add custom tags to fi
 - Semantic ranking of search results
 - Content-based file searching across multiple formats
 - Tag filtering with semantic search
+- Interactive chat with search results
+- Force reindex specific files when needed
+- Remove files from search index
 
 ### AI Integration
 - AI-powered automatic tag suggestions:
@@ -38,9 +45,12 @@ A Windows file management application that allows users to add custom tags to fi
   - Caches suggestions for 7 days
   - Interactive selection of suggested tags
   - Force refresh option to re-analyze files
+- Chat with search results (RAG functionality)
+- Batch processing of untagged files
+- Automatic suggestions for newly discovered files
 
 ### Supported AI Providers
-- OpenAI (GPT-3.5)
+- OpenAI (GPT-3.5/4)
 - Google Gemini
 - Anthropic Claude (Claude-3 Sonnet)
 - Local Models
@@ -113,6 +123,7 @@ On first run, you'll be prompted to set a password for encrypting your settings.
    - Numeric score from 0 to 1
 5. Select desired tags from both existing and new suggestions
 6. Click "Apply Selected Tags"
+7. View suggested explanations by clicking "Show Explanation"
 
 Note: Tag suggestions are cached for 7 days to improve performance. Use the "Force Refresh" button to re-analyze a file.
 
@@ -126,6 +137,22 @@ Note: Tag suggestions are cached for 7 days to improve performance. Use the "For
 
 Note: Files are automatically indexed when first accessed. You can reindex all files from the settings menu.
 
+### Batch Processing Untagged Files
+1. Click "Scan Directory" in the menu bar
+2. Wait for the scan to complete
+3. View untagged files and their AI-suggested tags
+4. Choose one of the options:
+   - Select specific tags for specific files
+   - Apply high-confidence suggestions to selected files
+5. Click "Apply Selected Tags to Selected Files" or "Apply All Suggestions to Selected Files"
+
+### Chat with Search Results
+1. Perform a vector search
+2. Select up to 3 files from the results (checkboxes)
+3. Click "Chat with Results"
+4. Ask questions about the selected documents
+5. The AI will respond based on the content of the selected files
+
 ### Password Management
 - Change password: Settings > Password Management > Change Password
 - Reset password: Use recovery key if you forget your password
@@ -137,14 +164,24 @@ Note: Files are automatically indexed when first accessed. You can reindex all f
 file_tagger/
 ├── main.py              # Main application entry point
 ├── api_settings.py      # API configuration dialog
-├── config.py           # Configuration and encryption utilities
-├── models.py           # Database models
-├── ai_service.py       # AI provider integration
-├── tag_suggestion.py   # AI tag suggestion dialog
-├── vector_search/      # Semantic search functionality
-├── requirements.txt    # Python dependencies
-├── .gitignore         # Git ignore rules
-└── README.md          # This file
+├── config.py            # Configuration and encryption utilities
+├── models.py            # Database models
+├── ai_service.py        # AI provider integration
+├── login.py             # Password verification interface
+├── file_tag_manager.py  # Main application interface
+├── tag_suggestion.py    # AI tag suggestion dialog
+├── search.py            # RAG/Chat interface for search results
+├── password_management.py # Security settings interface
+├── vector_search/       # Semantic search functionality
+│   ├── __init__.py
+│   ├── content_extractor.py
+│   ├── document_chunker.py
+│   ├── search_utils.py
+│   └── vector_search.py
+├── utils.py             # Utility functions
+├── requirements.txt     # Python dependencies
+├── .gitignore           # Git ignore rules
+└── README.md            # This file
 ```
 
 ## Dependencies
@@ -182,6 +219,18 @@ You can customize the system message used for AI interactions:
 2. Edit the system message in the provided text area
 3. Click Save to apply changes
 4. Use "Reset to Default" to restore the original message
+
+### Right-Click Actions
+Right-clicking on search results provides useful options:
+- Open File - Opens the selected file in its default application
+- Open Containing Folder - Shows the file in File Explorer
+- Force Reindex - Updates the vector search index for this file
+- Remove from Search Index - Removes the file from vector search
+
+## Version History
+
+- 1.0.0 (April 2025) - Initial release with core functionality
+- Current: Development version
 
 ## License
 

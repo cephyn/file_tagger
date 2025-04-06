@@ -443,9 +443,14 @@ class TagSuggestionDialog(QDialog):
             
             # Get or create file record
             file_obj = self.db_session.query(File).filter_by(path=self.file_path).first()
+            is_new_file = False
             if not file_obj:
                 file_obj = File(path=self.file_path)
                 self.db_session.add(file_obj)
+                is_new_file = True
+            
+            # Track if file had tags before this operation
+            had_tags_before = len(file_obj.tags) > 0
             
             # Add existing tags
             for tag_name in selected_existing:
@@ -467,7 +472,55 @@ class TagSuggestionDialog(QDialog):
                 if tag not in file_obj.tags:
                     file_obj.tags.append(tag)
             
+            # Commit changes to the database
             self.db_session.commit()
+            
+            # Check if this is the first time the file has been tagged
+            # If so, add it to the vector database for search
+            if is_new_file or not had_tags_before:
+                try:
+                    print(f"Indexing newly tagged file (via AI suggestions): {self.file_path}")
+                    # Get vector search from parent window if possible
+                    from vector_search.content_extractor import ContentExtractor
+                    from vector_search import VectorSearch
+                    
+                    # Get vector search instance (either from parent or create new)
+                    vector_search = None
+                    if hasattr(self.parent(), 'vector_search'):
+                        vector_search = self.parent().vector_search
+                    else:
+                        vector_search = VectorSearch(self.db_session)
+                    
+                    # Extract content from the file
+                    content = ContentExtractor.extract_file_content(self.file_path)
+                    if content:
+                        # Add file to vector database
+                        vector_search.index_file(self.file_path, content)
+                        print(f"Added newly tagged file to vector search index: {self.file_path}")
+                    else:
+                        print(f"Warning: No content could be extracted from file: {self.file_path}")
+                except Exception as e:
+                    import traceback
+                    print(f"Error adding file to vector search: {str(e)}")
+                    traceback.print_exc()
+            else:
+                # If the file was already tagged before, just update the tags metadata
+                try:
+                    # Get vector search from parent window if possible
+                    vector_search = None
+                    if hasattr(self.parent(), 'vector_search'):
+                        vector_search = self.parent().vector_search
+                    else:
+                        from vector_search import VectorSearch
+                        vector_search = VectorSearch(self.db_session)
+                    
+                    vector_search.update_metadata(self.file_path)
+                    print(f"Updated tags metadata for file in vector search: {self.file_path}")
+                except Exception as e:
+                    import traceback
+                    print(f"Error updating vector search metadata: {str(e)}")
+                    traceback.print_exc()
+                    
             self.accept()
             
         except Exception as e:

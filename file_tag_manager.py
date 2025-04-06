@@ -556,6 +556,7 @@ class FileTagManager(QMainWindow):
             
         open_action = context_menu.addAction("Open File")
         open_in_folder_action = context_menu.addAction("Open Containing Folder")
+        reindex_action = context_menu.addAction("Force Reindex")
         remove_action = context_menu.addAction("Remove from Search Index")
         
         action = context_menu.exec_(self.sender().mapToGlobal(position))
@@ -565,6 +566,8 @@ class FileTagManager(QMainWindow):
                 open_file(file_path)
             elif action == open_in_folder_action:
                 open_containing_folder(file_path)
+            elif action == reindex_action:
+                self.force_reindex_file(file_path)
             elif action == remove_action:
                 self._remove_from_vector_db(file_path)
         except Exception as e:
@@ -725,20 +728,96 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select tag(s) to add!")
             return
         
+        # DEBUGGING: Add console output to track what's happening
+        print(f"\n=== DEBUGGING: Adding tags to file: {self.current_file_path} ===")
+        
         # Get or create file record
         file_obj = self.db_session.query(File).filter_by(path=self.current_file_path).first()
+        is_new_file = False
         if not file_obj:
+            print("DEBUGGING: File not found in database, creating new record")
             file_obj = File(path=self.current_file_path)
             self.db_session.add(file_obj)
+            is_new_file = True
+        else:
+            print(f"DEBUGGING: File found in database with {len(file_obj.tags)} existing tags")
+        
+        # Track if file had tags before this operation
+        had_tags_before = len(file_obj.tags) > 0
+        print(f"DEBUGGING: had_tags_before = {had_tags_before}, is_new_file = {is_new_file}")
         
         # Add selected tags
+        tags_added = []
         for item in selected_items:
             tag = self.db_session.query(Tag).filter_by(name=item.text()).first()
             if tag and tag not in file_obj.tags:
                 file_obj.tags.append(tag)
+                tags_added.append(tag.name)
         
+        print(f"DEBUGGING: Added tags: {tags_added}")
+        
+        # Perform database commit - this will generate ID for new files
         self.db_session.commit()
+        print("DEBUGGING: Database commit completed")
+        
+        # IMPORTANT: Check if this triggers vector indexing
+        print("DEBUGGING: Checking if file should be indexed")
+        if is_new_file or not had_tags_before:
+            print("DEBUGGING: File should be indexed (new file or first tags)")
+            try:
+                from vector_search.content_extractor import ContentExtractor
+                # Extract content from the file
+                print(f"DEBUGGING: Extracting content from: {self.current_file_path}")
+                content = ContentExtractor.extract_file_content(self.current_file_path)
+                
+                if content:
+                    content_preview = content[:100] + "..." if len(content) > 100 else content
+                    print(f"DEBUGGING: Content extracted, length: {len(content)} characters")
+                    print(f"DEBUGGING: Content preview: {content_preview}")
+                    
+                    # Add file to vector database - this is the critical step!
+                    print(f"DEBUGGING: Calling vector_search.index_file for: {self.current_file_path}")
+                    try:
+                        self.vector_search.index_file(self.current_file_path, content)
+                        print(f"DEBUGGING: Successfully indexed file in vector search: {self.current_file_path}")
+                        
+                        # Verify the file was actually indexed
+                        try:
+                            results = self.vector_search.collection.get(
+                                ids=[self.current_file_path], include=['metadatas']
+                            )
+                            if results and results['ids'] and len(results['ids']) > 0:
+                                print(f"DEBUGGING: Verification successful - file found in vector store")
+                                print(f"DEBUGGING: File metadata: {results['metadatas'][0]}")
+                            else:
+                                print(f"DEBUGGING: VERIFICATION FAILED - file not found in vector store after indexing!")
+                        except Exception as verify_err:
+                            print(f"DEBUGGING: Error verifying file in vector store: {str(verify_err)}")
+                    except Exception as index_err:
+                        print(f"DEBUGGING: Error in index_file method: {str(index_err)}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"DEBUGGING: WARNING - No content could be extracted from file: {self.current_file_path}")
+            except Exception as e:
+                import traceback
+                print(f"DEBUGGING: Error adding file to vector search: {str(e)}")
+                print("DEBUGGING: Detailed error information:")
+                traceback.print_exc()
+        else:
+            # If the file was already tagged before, just update the tags metadata
+            print("DEBUGGING: File already had tags, updating metadata only")
+            try:
+                self.vector_search.update_metadata(self.current_file_path)
+                print(f"DEBUGGING: Updated tags metadata for file in vector search: {self.current_file_path}")
+            except Exception as e:
+                import traceback
+                print(f"DEBUGGING: Error updating vector search metadata: {str(e)}")
+                traceback.print_exc()
+        
+        # Refresh file tags display
         self.refresh_file_tags()
+        print("DEBUGGING: UI refreshed with updated tags")
     
     def remove_tag_from_file(self):
         """Remove selected tag(s) from the current file."""
@@ -885,7 +964,7 @@ class FileTagManager(QMainWindow):
             
             try:
                 self.vector_search.reindex_all(
-                    progress_callback=lambda p: progress.setValue(int(p * 100))
+                    progress_callback=lambda msg, p: progress.setValue(p)
                 )
                 QMessageBox.information(self, "Success", "Files reindexed successfully!")
             except Exception as e:
@@ -1290,9 +1369,15 @@ class FileTagManager(QMainWindow):
             
         # Get or create file record
         file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+        is_new_file = False
+        
         if not file_obj:
             file_obj = File(path=file_path)
             self.db_session.add(file_obj)
+            is_new_file = True
+        
+        # Check if file already had tags before
+        had_tags_before = len(file_obj.tags) > 0
         
         # Add tags (create them if they don't exist)
         for tag_name in tag_names:
@@ -1313,6 +1398,37 @@ class FileTagManager(QMainWindow):
                 file_obj.tags.append(tag)
         
         # Don't commit here - we commit in the calling function
+        
+        # If this is the first time the file has been tagged, add it to the vector database
+        if is_new_file or not had_tags_before:
+            try:
+                from vector_search.content_extractor import ContentExtractor
+                # Extract content from the file
+                print(f"Attempting to extract content from: {file_path}")
+                content = ContentExtractor.extract_file_content(file_path)
+                
+                if content:
+                    print(f"Content extracted, length: {len(content)} characters")
+                    # Add file to vector database
+                    print(f"Sending to vector search index: {file_path}")
+                    result = self.vector_search.index_file(file_path, content)
+                    print(f"Added newly tagged file to vector search index: {file_path}")
+                else:
+                    print(f"Warning: No content could be extracted from file: {file_path}")
+            except Exception as e:
+                import traceback
+                print(f"Error adding file to vector search: {str(e)}")
+                print("Detailed error information:")
+                traceback.print_exc()
+        else:
+            # If the file was already tagged before, just update the tags metadata
+            try:
+                self.vector_search.update_metadata(file_path)
+                print(f"Updated tags metadata for file in vector search: {file_path}")
+            except Exception as e:
+                import traceback
+                print(f"Error updating vector search metadata: {str(e)}")
+                traceback.print_exc()
 
     def apply_tags_to_files(self, file_paths, tag_names):
         """Apply selected tags to multiple files."""
@@ -1353,3 +1469,46 @@ class FileTagManager(QMainWindow):
                 selected_files.append(file_path)
                 
         return selected_files
+
+    def force_reindex_file(self, file_path):
+        """Force a file to be reindexed in the vector search database."""
+        if not file_path or not os.path.isfile(file_path):
+            QMessageBox.warning(self, "Error", f"The file {file_path} does not exist or is not a valid file.")
+            return False
+            
+        try:
+            # Get the file from database
+            file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+            if not file_obj:
+                QMessageBox.warning(self, "Error", f"The file {file_path} is not in the tag database.")
+                return False
+            
+            from vector_search.content_extractor import ContentExtractor
+            # Extract content from the file
+            content = ContentExtractor.extract_file_content(file_path)
+            if not content:
+                QMessageBox.warning(
+                    self, 
+                    "Error", 
+                    f"Could not extract content from {os.path.basename(file_path)}.\n\n"
+                    "This file type may not be supported for content extraction."
+                )
+                return False
+                
+            # Index the file with existing content
+            self.vector_search.index_file(file_path, content)
+            
+            QMessageBox.information(
+                self,
+                "Success",
+                f"The file {os.path.basename(file_path)} has been successfully reindexed."
+            )
+            return True
+            
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Error",
+                f"Failed to reindex file: {str(e)}"
+            )
+            return False

@@ -35,7 +35,7 @@ class VectorSearch:
             
             # Use a more advanced embedding model with higher dimensionality for better semantic matching
             # Options: 'all-mpnet-base-v2' (768d), 'multi-qa-mpnet-base-dot-v1' (768d), or 'all-MiniLM-L12-v2' (384d)
-            self.embedding_function = SentenceTransformerEmbeddingFunction(model_name="all-mpnet-base-v2")
+            self.embedding_function = SentenceTransformerEmbeddingFunction(model_name="intfloat/e5-base-v2")
             
             # Log ChromaDB version for debugging
             print(f"ChromaDB version: {chromadb.__version__}")
@@ -528,7 +528,7 @@ class VectorSearch:
             traceback.print_exc()
             return []
 
-    def reindex_all_files(self, progress_callback=None):
+    def reindex_all(self, progress_callback=None):
         """
         Reindex all files in the database.
         
