@@ -5,10 +5,11 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QColorDialog, QLabel, QFileSystemModel, QMessageBox,
                              QLineEdit, QRadioButton, QComboBox, QHeaderView,
                              QMenuBar, QMenu, QFileDialog, QTabWidget, QProgressDialog,
-                             QFrame, QListWidgetItem, QDialog)
+                             QFrame, QListWidgetItem, QDialog, QTextEdit, QStyledItemDelegate,
+                             QStyleOptionViewItem, QApplication, QStyle)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
-from PySide6.QtGui import QColor, QFont, QDesktopServices
-from PySide6.QtCore import QUrl
+from PySide6.QtGui import QColor, QFont, QDesktopServices, QTextDocument
+from PySide6.QtCore import QUrl, QSize
 from sqlalchemy import and_, or_
 from models import File, Tag
 from config import Config
@@ -18,6 +19,63 @@ from password_management import PasswordManagementDialog
 from tag_suggestion import TagSuggestionDialog
 from search import ChatWithResultsDialog
 from utils import is_dark_color, get_score_color, open_file, open_containing_folder
+
+class HTMLDelegate(QStyledItemDelegate):
+    """Custom delegate to render HTML in QListWidgetItems"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+    def paint(self, painter, option, index):
+        """Paint the item using HTML rendering"""
+        options = QStyleOptionViewItem(option)
+        self.initStyleOption(options, index)
+        
+        if options.widget is None:
+            style = QApplication.style()
+        else:
+            style = options.widget.style()
+            
+        # Get text and check if it has HTML content
+        text = index.data(Qt.DisplayRole)
+        if text and ('<b>' in text or '<i>' in text or '<u>' in text):
+            # Save painter state
+            painter.save()
+            
+            # Prepare document
+            doc = QTextDocument()
+            doc.setHtml(text)
+            doc.setTextWidth(options.rect.width())
+            
+            # Clear text to avoid default rendering
+            options.text = ""
+            style.drawControl(QStyle.CE_ItemViewItem, options, painter)
+            
+            # Set up the text position
+            textRect = style.subElementRect(QStyle.SE_ItemViewItemText, options)
+            painter.translate(textRect.topLeft())
+            
+            # Draw text with HTML formatting
+            doc.drawContents(painter)
+            
+            # Restore painter
+            painter.restore()
+        else:
+            # Default rendering for non-HTML text
+            style.drawControl(QStyle.CE_ItemViewItem, options, painter)
+            
+    def sizeHint(self, option, index):
+        """Calculate the size needed for the HTML content"""
+        options = QStyleOptionViewItem(option)
+        self.initStyleOption(options, index)
+        
+        text = index.data(Qt.DisplayRole)
+        if text and ('<b>' in text or '<i>' in text or '<u>' in text):
+            doc = QTextDocument()
+            doc.setHtml(text)
+            doc.setTextWidth(options.rect.width())
+            return QSize(doc.idealWidth(), doc.size().height())
+        
+        return super().sizeHint(option, index)
 
 class AboutDialog(QDialog):
     """Dialog showing information about the application."""
@@ -338,7 +396,9 @@ class FileTagManager(QMainWindow):
         self.search_results.customContextMenuRequested.connect(self.on_search_result_right_clicked)
         results_layout.addWidget(self.search_results)
         
-        # Add layouts to tab
+        # Set custom delegate for HTML rendering
+        self.search_results.setItemDelegate(HTMLDelegate(self.search_results))
+        
         layout.addLayout(tag_select_layout)
         layout.addLayout(results_layout)
         
@@ -390,6 +450,9 @@ class FileTagManager(QMainWindow):
         self.rag_search_results.setContextMenuPolicy(Qt.CustomContextMenu)
         self.rag_search_results.customContextMenuRequested.connect(self.on_search_result_right_clicked)
         results_layout.addWidget(self.rag_search_results)
+        
+        # Set custom delegate for HTML rendering
+        self.rag_search_results.setItemDelegate(HTMLDelegate(self.rag_search_results))
         
         # Add buttons layout
         buttons_layout = QHBoxLayout()
@@ -574,32 +637,61 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(self, "Error", str(e))
 
     def _remove_from_vector_db(self, file_path):
-        """Remove a file from the vector database."""
+        """Remove a file from the vector database and tag database."""
         reply = QMessageBox.question(
             self, 
-            "Remove from Search Index",
-            f"Are you sure you want to remove\n{file_path}\nfrom the search index?\n\n"
-            "Note: This only removes the file from the search index, not from your computer or the tag database.",
+            "Remove File",
+            f"Are you sure you want to remove\n{file_path}\nfrom the system?\n\n"
+            "This will remove the file from both the search index and the tag database.\n"
+            "Note: This will not delete the actual file from your computer.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            success = self.vector_search.remove_file(file_path)
+            # Remove from vector database
+            success_vector = self.vector_search.remove_file(file_path)
             
-            if success:
+            # Remove from tag database
+            success_tags = False
+            try:
+                file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+                if file_obj:
+                    self.db_session.delete(file_obj)
+                    self.db_session.commit()
+                    success_tags = True
+            except Exception as e:
+                print(f"Error removing file from tag database: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            
+            if success_vector and success_tags:
                 QMessageBox.information(
                     self,
                     "Success",
-                    "File removed from search index successfully.\n\n"
-                    "The file is still on your computer and in the tag database."
+                    "File removed from search index and tag database successfully.\n\n"
+                    "The file is still on your computer."
+                )
+                self._remove_item_from_results(file_path)
+            elif success_vector:
+                QMessageBox.warning(
+                    self,
+                    "Partial Success",
+                    "File was removed from search index but could not be removed from tag database."
+                )
+                self._remove_item_from_results(file_path)
+            elif success_tags:
+                QMessageBox.warning(
+                    self,
+                    "Partial Success",
+                    "File was removed from tag database but could not be removed from search index."
                 )
                 self._remove_item_from_results(file_path)
             else:
                 QMessageBox.warning(
                     self,
                     "Error",
-                    "Could not remove file from search index. See console for details."
+                    "Could not remove file from search index or tag database. See console for details."
                 )
 
     def _remove_item_from_results(self, file_path):
@@ -921,6 +1013,8 @@ class FileTagManager(QMainWindow):
                 if os.path.exists(result['path']):
                     # Add file item with checkbox
                     score = result.get('score', 0)
+                    
+                    # Create main file item
                     file_item = QListWidgetItem(f"{os.path.basename(result['path'])} ({score:.2f})")
                     file_item.setToolTip(result['path'])
                     file_item.setBackground(get_score_color(score))
@@ -931,10 +1025,90 @@ class FileTagManager(QMainWindow):
                     # Store reference to this item for selection tracking
                     self.result_document_items[result['path']] = file_item
                     
+                    # Display document summary if available
+                    summary = result.get('summary', '')
+                    if summary:
+                        summary_item = QListWidgetItem(f"    📝 {summary}")
+                        summary_item.setToolTip(result['path'])
+                        # Use lighter background to differentiate from main result
+                        bg_color = get_score_color(score)
+                        # Make the background slightly lighter for summary
+                        lighter_bg = QColor(
+                            min(bg_color.red() + 15, 255),
+                            min(bg_color.green() + 15, 255), 
+                            min(bg_color.blue() + 15, 255)
+                        )
+                        summary_item.setBackground(lighter_bg)
+                        self.rag_search_results.addItem(summary_item)
+                    
+                    # Display tags on a separate line with colored backgrounds for each tag
+                    tags = result.get('tags', [])
+                    if tags:
+                        tag_display = "    ⚑ Tags: "
+                        tags_item = QListWidgetItem(tag_display)
+                        tags_item.setToolTip(result['path'])
+                        # Use lighter background to differentiate from main result
+                        bg_color = get_score_color(score)
+                        # Make the background slightly lighter
+                        lighter_bg = QColor(
+                            min(bg_color.red() + 20, 255),
+                            min(bg_color.green() + 20, 255), 
+                            min(bg_color.blue() + 20, 255)
+                        )
+                        tags_item.setBackground(lighter_bg)
+                        self.rag_search_results.addItem(tags_item)
+                        
+                        # Add each tag with its proper color
+                        for tag_name in tags:
+                            # Look up the tag color from the database
+                            tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
+                            if tag:
+                                tag_color = QColor(tag.color)
+                                text_color = Qt.white if is_dark_color(tag_color) else Qt.black
+                                
+                                # Create a tag item with spacing for visual separation
+                                tag_item = QListWidgetItem(f"        • {tag_name}")
+                                tag_item.setToolTip(result['path'])
+                                tag_item.setBackground(tag_color)
+                                tag_item.setForeground(text_color)
+                                self.rag_search_results.addItem(tag_item)
+                    
                     # Add snippet items if available
                     for snippet in result.get('snippets', []):
-                        snippet_item = QListWidgetItem(f"    ↪ {snippet}")
+                        # Create a rich text item that can show bold formatting
+                        snippet_item = QListWidgetItem()
                         snippet_item.setToolTip(result['path'])
+                        
+                        # Check if this is already a formatted snippet with a context
+                        if isinstance(snippet, str) and snippet.startswith('[') and ']' in snippet:
+                            # Get context and text parts
+                            context_end = snippet.find(']')
+                            context = snippet[1:context_end]
+                            text = snippet[context_end+1:].strip()
+                            
+                            # Create formatted text with context prefix in italics
+                            formatted_text = f"    ↪ <i>{context}:</i> {text}"
+                        else:
+                            # Just use the snippet text as-is
+                            formatted_text = f"    ↪ {snippet}"
+                        
+                        # Set the text with HTML formatting that preserves bold highlighting
+                        # (the ** marks from markdown are converted to HTML <b> tags)
+                        formatted_text = formatted_text.replace('**', '<b>', 1)
+                        while '**' in formatted_text:
+                            formatted_text = formatted_text.replace('**', '</b>', 1)
+                        
+                        snippet_item.setText(formatted_text)
+                        
+                        # Apply lighter background color for snippet items
+                        lighter_bg = QColor(
+                            min(bg_color.red() + 40, 255),
+                            min(bg_color.green() + 40, 255), 
+                            min(bg_color.blue() + 40, 255)
+                        )
+                        snippet_item.setBackground(lighter_bg)
+                        
+                        # Add to results list
                         self.rag_search_results.addItem(snippet_item)
             
             # Enable chat button if results are available
@@ -1483,8 +1657,29 @@ class FileTagManager(QMainWindow):
                 QMessageBox.warning(self, "Error", f"The file {file_path} is not in the tag database.")
                 return False
             
+            print(f"\n=== Force reindexing file: {file_path} ===")
+            
+            # Check if AI is configured for summary generation
+            ai_configured = False
+            try:
+                if self.config.get_selected_provider() and self.config.get_api_key(self.config.get_selected_provider()):
+                    provider = self.config.get_selected_provider()
+                    print(f"AI provider configured: {provider}")
+                    ai_configured = True
+                    
+                    # Attach AI config information directly to db_session for use in VectorSearch
+                    self.db_session.provider = provider
+                    self.db_session.api_key = self.config.get_api_key(provider)
+                    self.db_session.local_model_path = self.config.get_local_model_path()
+                    self.db_session.local_model_type = self.config.get_local_model_type()
+                else:
+                    print("AI not configured - document summaries will not be generated")
+            except Exception as e:
+                print(f"Error checking AI configuration: {str(e)}")
+            
             from vector_search.content_extractor import ContentExtractor
             # Extract content from the file
+            print(f"Extracting content from: {file_path}")
             content = ContentExtractor.extract_file_content(file_path)
             if not content:
                 QMessageBox.warning(
@@ -1494,9 +1689,31 @@ class FileTagManager(QMainWindow):
                     "This file type may not be supported for content extraction."
                 )
                 return False
-                
+            
+            print(f"Content extracted, length: {len(content)} characters")
+            
+            # Remove existing entries before reindexing
+            print(f"Removing existing document entries for: {file_path}")
+            self.vector_search.remove_file(file_path)
+            
             # Index the file with existing content
+            print(f"Reindexing file: {file_path}")
             self.vector_search.index_file(file_path, content)
+            
+            # Verify that the file was indexed with a summary
+            try:
+                results = self.vector_search.collection.get(
+                    ids=[file_path], include=['metadatas']
+                )
+                if results and results['ids'] and len(results['ids']) > 0:
+                    metadata = results['metadatas'][0]
+                    print(f"Verification successful - file found in vector store")
+                    if 'summary' in metadata and metadata['summary']:
+                        print(f"Document summary generated: {metadata['summary']}")
+                    else:
+                        print("No document summary was generated")
+            except Exception as verify_err:
+                print(f"Error verifying file in vector store: {str(verify_err)}")
             
             QMessageBox.information(
                 self,
@@ -1506,6 +1723,9 @@ class FileTagManager(QMainWindow):
             return True
             
         except Exception as e:
+            print(f"Error during force reindex: {str(e)}")
+            import traceback
+            traceback.print_exc()
             QMessageBox.warning(
                 self,
                 "Error",

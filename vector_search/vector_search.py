@@ -89,6 +89,11 @@ class VectorSearch:
             }
         )
 
+        # Generate a summary of the document using AI
+        summary = self.generate_document_summary(file_path, content)
+        if summary:
+            metadata["summary"] = summary
+        
         # Add file's current tags
         from models import File
         file_obj = self.db_session.query(File).filter_by(path=file_path).first()
@@ -167,12 +172,12 @@ class VectorSearch:
             
             # Add a shortened version of the full content
             summary_length = min(1500, len(content))
-            summary = content[:summary_length] + ("..." if len(content) > summary_length else "")
+            summary_content = content[:summary_length] + ("..." if len(content) > summary_length else "")
             
             self.collection.add(
                 ids=[file_path],
                 metadatas=[full_metadata],
-                documents=[summary]  # Store a summarized version of the full content
+                documents=[summary_content]  # Store a summarized version of the full content
             )
             
             print(f"Successfully indexed {num_chunks} chunks for {file_path}")
@@ -211,12 +216,37 @@ class VectorSearch:
                 "tags": json.dumps([tag.name for tag in file_obj.tags]),  # Store as JSON string
             }
 
-            # Check if document exists
+            # Check if document exists and get existing metadata
             existing_docs = self.collection.get(
                 ids=[file_path], include=["metadatas"]
             )
 
+            # Preserve existing summary if available
+            existing_summary = None
+            if (existing_docs and existing_docs['ids'] and 
+                len(existing_docs['ids']) > 0 and 
+                existing_docs['metadatas'] and 
+                len(existing_docs['metadatas']) > 0):
+                
+                existing_metadata = existing_docs['metadatas'][0]
+                if 'summary' in existing_metadata and existing_metadata['summary']:
+                    print(f"Preserving existing summary for {file_path}")
+                    existing_summary = existing_metadata['summary']
+                    metadata['summary'] = existing_summary
+            
             if existing_docs and existing_docs['ids'] and len(existing_docs['ids']) > 0:
+                # If we don't have an existing summary, try to generate one
+                if not existing_summary and os.path.exists(file_path):
+                    try:
+                        from .content_extractor import ContentExtractor
+                        content = ContentExtractor.extract_file_content(file_path)
+                        if content:
+                            summary = self.generate_document_summary(file_path, content)
+                            if summary:
+                                metadata['summary'] = summary
+                    except Exception as e:
+                        print(f"Error generating summary during metadata update: {str(e)}")
+                
                 # Update document metadata
                 self.collection.update(
                     ids=[file_path], metadatas=[metadata]
@@ -283,7 +313,6 @@ class VectorSearch:
     ) -> List[Dict]:
         """
         Search for files using semantic search with optional tag filtering.
-        Returns results with relevant text snippets showing why files matched.
         
         Args:
             query: Search query text
@@ -334,20 +363,20 @@ class VectorSearch:
             # Enhance query by using query expansion and improved parameters
             expanded_queries = SearchUtils.expand_query(query)
             
-            # Get potentially matching chunks - include document contents for snippet extraction
+            # Get potentially matching chunks - include document contents for search
             try:
                 # Use multiple queries for better recall if we have expansions
                 if expanded_queries:
                     results = self.collection.query(
                         query_texts=expanded_queries,
                         n_results=100 if tag_filter else limit * 3,  # Get more results for filtering and chunked docs
-                        include=["metadatas", "documents", "distances"]
+                        include=["metadatas", "distances"]
                     )
                 else:
                     results = self.collection.query(
                         query_texts=[query],
                         n_results=100 if tag_filter else limit * 3,  # Get more results for filtering and chunked docs
-                        include=["metadatas", "documents", "distances"]
+                        include=["metadatas", "distances"]
                     )
             except Exception as query_err:
                 print(f"Error during query: {str(query_err)}")
@@ -372,7 +401,7 @@ class VectorSearch:
             grouped_results = {}
             
             # Process and filter results
-            for i, (distance, metadata, document) in enumerate(zip(results['distances'][0], results['metadatas'][0], results['documents'][0])):
+            for i, (distance, metadata) in enumerate(zip(results['distances'][0], results['metadatas'][0])):
                 # Extract file path (remove chunk identifier if present)
                 doc_id = results['ids'][0][i]
                 file_path = doc_id.split('#')[0]  # Remove chunk identifier
@@ -382,6 +411,9 @@ class VectorSearch:
                 if "tags" in metadata:
                     try:
                         tags = json.loads(metadata["tags"])
+                        # Ensure tags is a list, even if metadata format is unexpected
+                        if not isinstance(tags, list):
+                            tags = [str(tags)]
                         tags_lower = [t.lower() for t in tags]
                     except json.JSONDecodeError:
                         print(f"  Failed to parse tags: {metadata.get('tags')}")
@@ -425,29 +457,27 @@ class VectorSearch:
                 else:
                     similarity = 0.0
 
-                # Extract snippet from the document
-                snippets = SearchUtils.extract_relevant_snippets(document, query)
-                if not snippets:
-                    # If no specific snippets found, get the beginning of the document
-                    preview_length = min(150, len(document))
-                    snippets = [f"{document[:preview_length]}..."]
-
                 # Get chunk information
                 is_chunk = metadata.get('is_chunk', False)
                 chunk_id = metadata.get('chunk_id', 0) if is_chunk else 0
                 chunk_total = metadata.get('chunk_total', 1) if is_chunk else 1
                 chunk_title = metadata.get('chunk_title', '') if is_chunk else ''
+                file_type = os.path.splitext(file_path)[1][1:].lower() if os.path.splitext(file_path)[1] else ''
+                
+                # Get document summary if available
+                document_summary = metadata.get('summary', '')
 
                 # If this file is not in the grouped results yet, add it
                 if file_path not in grouped_results:
                     grouped_results[file_path] = {
                         'path': file_path,
                         'filename': metadata.get('filename', os.path.basename(file_path)),
+                        'file_type': file_type,
                         'tags': tags,
                         'score': similarity,  # Will be updated as we find better chunks
-                        'snippets': [],
                         'chunks_found': 0,
-                        'chunk_titles': {},
+                        'best_chunk_similarity': 0.0,
+                        'summary': document_summary  # Add summary to results
                     }
                 
                 # Update existing result with this chunk's info
@@ -456,67 +486,36 @@ class VectorSearch:
                 # Update score (take max of all chunks)
                 current_result['score'] = max(current_result['score'], similarity)
                 
+                # Track best chunk similarity for sorting results
+                current_result['best_chunk_similarity'] = max(current_result['best_chunk_similarity'], similarity)
+                
                 # Increment chunks found
                 current_result['chunks_found'] += 1
                 
-                # Add snippet if it's good quality (has a high score)
-                if similarity > 0.4:  # Only add high quality snippets
-                    # Add context from chunk title if available
-                    context = f"[{chunk_title}] " if chunk_title else ""
-                    
-                    # Only add a limited number of snippets per file
-                    if len(current_result['snippets']) < 3:
-                        for snippet in snippets[:1]:  # Limit to 1 snippet per chunk
-                            decorated_snippet = f"{context}{snippet}"
-                            current_result['snippets'].append(decorated_snippet)
-                    
-                # Keep track of chunk titles for showing document structure
-                if chunk_title:
-                    current_result['chunk_titles'][chunk_id] = chunk_title
+                # Keep the summary from highest-level document (not chunk)
+                if not is_chunk and document_summary and not current_result['summary']:
+                    current_result['summary'] = document_summary
 
-            # Create final result list from the grouped results
-            filtered_results = list(grouped_results.values())
-            
-            # If we have no results but had initial results with tag filter, something went wrong with filtering
-            filtered_count = len(filtered_results)
-            print(f"Final results after filtering: {filtered_count}")
-            if filtered_count == 0 and initial_count > 0 and tag_filter:
-                print("WARNING: All results filtered out! Check if tag names match exactly.")
+            # Post-process the grouped results
+            final_results = []
+            for file_path, result in grouped_results.items():
+                # Calculate a document relevance summary
+                chunks_text = f"({result['chunks_found']} matching sections)" if result['chunks_found'] > 1 else ""
+                result['relevance'] = f"Relevance: {result['score']:.1%} {chunks_text}"
                 
-                # If we have a large mismatch, try a more relaxed approach by using the raw results
-                filtered_results = []
-                for i, (distance, metadata, document) in enumerate(zip(results['distances'][0], results['metadatas'][0], results['documents'][0])):
-                    # Extract file path
-                    doc_id = results['ids'][0][i]
-                    file_path = doc_id.split('#')[0]  # Remove chunk identifier
-                    
-                    # Basic result with minimal filtering
-                    result = {
-                        'path': file_path,
-                        'filename': metadata.get('filename', os.path.basename(file_path)),
-                        'score': 1.0 - (float(distance) / 2.0) if distance is not None else 0.0,
-                        'snippets': SearchUtils.extract_relevant_snippets(document, query) or [document[:150] + "..."]
-                    }
-                    
-                    # Parse tags if available
-                    if "tags" in metadata:
-                        try:
-                            result['tags'] = json.loads(metadata["tags"])
-                        except:
-                            result['tags'] = []
-                    else:
-                        result['tags'] = []
-                        
-                    filtered_results.append(result)
-            
+                # Add document type context
+                result['document_type'] = SearchUtils.get_document_type_label(file_path)
+                
+                final_results.append(result)
+                
             # Sort by score and limit results
-            filtered_results.sort(key=lambda x: x['score'], reverse=True)
+            final_results.sort(key=lambda x: x['score'], reverse=True)
             
             # Remove duplicates (keeping the first/highest scored occurrence)
             seen_paths = set()
             unique_results = []
             
-            for result in filtered_results:
+            for result in final_results:
                 if result['path'] not in seen_paths:
                     seen_paths.add(result['path'])
                     unique_results.append(result)
@@ -707,3 +706,125 @@ class VectorSearch:
             print(f"Error removing {file_path} from vector database: {str(e)}")
             traceback.print_exc()
             return False
+
+    def generate_document_summary(self, file_path: str, content: str) -> Optional[str]:
+        """
+        Generate a brief summary of the document content using AI.
+        
+        Args:
+            file_path: Path to the file
+            content: Text content of the file
+            
+        Returns:
+            str: Generated summary or None if generation failed
+        """
+        # Import here to avoid circular imports
+        from ai_service import AIService
+        import config
+        
+        try:
+            print(f"\n==== Attempting to generate summary for: {os.path.basename(file_path)} ====")
+            
+            # Access config through self.db_session instead of trying to load it directly
+            # The config is passed to the vector_search instance when it's created
+            provider = self.db_session.provider if hasattr(self.db_session, 'provider') else None
+            api_key = self.db_session.api_key if hasattr(self.db_session, 'api_key') else None
+            local_model_path = self.db_session.local_model_path if hasattr(self.db_session, 'local_model_path') else None
+            local_model_type = self.db_session.local_model_type if hasattr(self.db_session, 'local_model_type') else None
+            
+            # Debug AI configuration
+            print(f"AI Provider: {provider or 'Not configured'}")
+            print(f"API Key configured: {'Yes' if api_key else 'No'}")
+            print(f"Local model path: {local_model_path or 'None'}")
+            
+            # Skip if AI is not configured
+            if not provider or not api_key:
+                print(f"AI not configured (provider or API key missing), skipping summary generation")
+                return None
+                
+            print(f"Generating summary for {file_path} using {provider} provider")
+            
+            # Take only a portion of content for summary generation to avoid token limits
+            max_content = 5000
+            content_for_summary = content[:max_content] + ("..." if len(content) > max_content else "")
+                
+            # Create a specialized prompt for summarization
+            file_name = os.path.basename(file_path)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            prompt = (
+                f"Please generate a brief summary (2-3 sentences) of the following document:\n\n"
+                f"Filename: {file_name}\n"
+                f"File extension: {file_ext}\n\n"
+                f"Content:\n{content_for_summary}\n\n"
+                f"Write a clear, concise summary that captures the main topic and purpose of this document. "
+                f"Keep the summary under 200 characters."
+            )
+            
+            # Create AI service with appropriate provider
+            ai_service = AIService(
+                provider=provider,
+                api_key=api_key,
+                db_session=self.db_session,
+                local_model_path=local_model_path,
+                local_model_type=local_model_type,
+                system_message="You are a document summarization assistant. Generate brief summaries of documents."
+            )
+            
+            print(f"AI service initialized, making API call to {provider}...")
+            
+            # Call the appropriate AI model based on provider
+            if provider == 'openai':
+                response = ai_service.modules['openai'].ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a document summarization assistant. Generate brief summaries of documents."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=200,
+                    temperature=0.5
+                )
+                summary = response.choices[0].message.content
+            elif provider == 'anthropic':
+                response = ai_service.client.messages.create(
+                    model="claude-3-haiku-20240307",
+                    max_tokens=200,
+                    system="You are a document summarization assistant. Generate brief summaries of documents.",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                summary = response.content[0].text
+            elif provider == 'gemini':
+                response = ai_service.model.generate_content(prompt)
+                summary = response.text
+            elif provider == 'local':
+                if local_model_type == 'llama':
+                    summary = ai_service._analyze_with_llama_cpp(prompt)
+                else:
+                    # For other local models just use basic extraction
+                    print("Local model type not supported for summarization, falling back to basic extraction")
+                    summary = self._extract_basic_summary(content)
+            else:
+                # Fallback to basic extraction
+                print(f"Provider '{provider}' not supported for summarization, falling back to basic extraction")
+                summary = self._extract_basic_summary(content)
+                
+            print(f"Generated summary: {summary[:50]}...")
+            return summary.strip()
+        except Exception as e:
+            print(f"Error generating summary for {file_path}: {str(e)}")
+            traceback.print_exc()
+            # Fallback to basic extraction
+            print("Falling back to basic extraction due to error")
+            return self._extract_basic_summary(content)
+
+    def _extract_basic_summary(self, content: str) -> str:
+        """Extract a basic summary from content when AI summarization fails."""
+        # Take first paragraph that's not empty and has reasonable length
+        paragraphs = content.split('\n\n')
+        for p in paragraphs:
+            clean_p = p.strip()
+            if len(clean_p) > 30 and len(clean_p) < 200:
+                return clean_p
+                
+        # If no suitable paragraph found, just take first 150 chars
+        return content[:150] + "..." if len(content) > 150 else content
