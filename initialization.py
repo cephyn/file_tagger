@@ -23,10 +23,9 @@ class InitializationWorker(QThread):
             # Initialize config
             self.progress_signal.emit("Loading configuration...", 30)
             config = Config(self.password)
-            
-            # Initialize vector search
+              # Initialize vector search
             self.progress_signal.emit("Setting up search engine...", 50)
-            vector_search = VectorSearch(db_session)
+            vector_search = VectorSearch(db_session, config)
             
             # Loading existing files and tags
             self.progress_signal.emit("Loading files and tags...", 70)

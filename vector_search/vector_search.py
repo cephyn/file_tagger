@@ -14,18 +14,22 @@ import traceback
 from .document_chunker import DocumentChunker
 from .content_extractor import ContentExtractor
 from .search_utils import SearchUtils
+from ai_service import AIService
+from config import Config
 
 
-class VectorSearch:
-    def __init__(self, db_session, collection_name: str = "file_contents"):
+class VectorSearch:    
+    def __init__(self, db_session, config: Config, collection_name: str = "file_contents"):
         """
         Initialize vector search with database session and collection name.
         
         Args:
             db_session: SQLAlchemy database session
+            config: Configuration object
             collection_name: Name for the ChromaDB collection
         """
         self.db_session = db_session
+        self.config = config  # Store the config object
         self.collection_name = collection_name
         print("\nInitializing vector search...")
         
@@ -689,8 +693,7 @@ class VectorSearch:
                 
             # Now remove the main document entry
             existing_docs = self.collection.get(
-                ids=[file_path], include=["metadatas"]
-            )
+                ids=[file_path], include=["metadatas"]            )
             
             if existing_docs and existing_docs['ids'] and len(existing_docs['ids']) > 0:
                 # Remove the document
@@ -698,15 +701,13 @@ class VectorSearch:
                 print(f"Successfully removed {file_path} from vector database")
                 return True
             else:
-                print(f"File {file_path} not found in vector database")
-                # If we at least removed some chunks, consider it a partial success
+                print(f"File {file_path} not found in vector database")                # If we at least removed some chunks, consider it a partial success
                 return bool(chunk_ids)
-            
         except Exception as e:
             print(f"Error removing {file_path} from vector database: {str(e)}")
-            traceback.print_exc()
+            traceback.print_exc()            
             return False
-
+            
     def generate_document_summary(self, file_path: str, content: str) -> Optional[str]:
         """
         Generate a brief summary of the document content using AI.
@@ -718,98 +719,22 @@ class VectorSearch:
         Returns:
             str: Generated summary or None if generation failed
         """
-        # Import here to avoid circular imports
-        from ai_service import AIService
-        import config
-        
         try:
-            print(f"\n==== Attempting to generate summary for: {os.path.basename(file_path)} ====")
+            # Create an AI service using the config
+            ai_service = self.config.get_ai_service(self.db_session)
             
-            # Access config through self.db_session instead of trying to load it directly
-            # The config is passed to the vector_search instance when it's created
-            provider = self.db_session.provider if hasattr(self.db_session, 'provider') else None
-            api_key = self.db_session.api_key if hasattr(self.db_session, 'api_key') else None
-            local_model_path = self.db_session.local_model_path if hasattr(self.db_session, 'local_model_path') else None
-            local_model_type = self.db_session.local_model_type if hasattr(self.db_session, 'local_model_type') else None
-            
-            # Debug AI configuration
-            print(f"AI Provider: {provider or 'Not configured'}")
-            print(f"API Key configured: {'Yes' if api_key else 'No'}")
-            print(f"Local model path: {local_model_path or 'None'}")
-            
-            # Skip if AI is not configured
-            if not provider or not api_key:
-                print(f"AI not configured (provider or API key missing), skipping summary generation")
+            if not ai_service:
+                print("Could not create AI service, skipping summary generation")
                 return None
                 
-            print(f"Generating summary for {file_path} using {provider} provider")
-            
-            # Take only a portion of content for summary generation to avoid token limits
-            max_content = 5000
-            content_for_summary = content[:max_content] + ("..." if len(content) > max_content else "")
+            # Use the AI service to generate the summary
+            return ai_service.generate_document_summary(file_path, content)
                 
-            # Create a specialized prompt for summarization
-            file_name = os.path.basename(file_path)
-            file_ext = os.path.splitext(file_path)[1].lower()
+        except Exception as e:
+            print(f"Error generating summary for {file_path}: {str(e)}")
+            traceback.print_exc()
+            return self._extract_basic_summary(content)
             
-            prompt = (
-                f"Please generate a brief summary (2-3 sentences) of the following document:\n\n"
-                f"Filename: {file_name}\n"
-                f"File extension: {file_ext}\n\n"
-                f"Content:\n{content_for_summary}\n\n"
-                f"Write a clear, concise summary that captures the main topic and purpose of this document. "
-                f"Keep the summary under 200 characters."
-            )
-            
-            # Create AI service with appropriate provider
-            ai_service = AIService(
-                provider=provider,
-                api_key=api_key,
-                db_session=self.db_session,
-                local_model_path=local_model_path,
-                local_model_type=local_model_type,
-                system_message="You are a document summarization assistant. Generate brief summaries of documents."
-            )
-            
-            print(f"AI service initialized, making API call to {provider}...")
-            
-            # Call the appropriate AI model based on provider
-            if provider == 'openai':
-                response = ai_service.modules['openai'].ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a document summarization assistant. Generate brief summaries of documents."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=200,
-                    temperature=0.5
-                )
-                summary = response.choices[0].message.content
-            elif provider == 'anthropic':
-                response = ai_service.client.messages.create(
-                    model="claude-3-haiku-20240307",
-                    max_tokens=200,
-                    system="You are a document summarization assistant. Generate brief summaries of documents.",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                summary = response.content[0].text
-            elif provider == 'gemini':
-                response = ai_service.model.generate_content(prompt)
-                summary = response.text
-            elif provider == 'local':
-                if local_model_type == 'llama':
-                    summary = ai_service._analyze_with_llama_cpp(prompt)
-                else:
-                    # For other local models just use basic extraction
-                    print("Local model type not supported for summarization, falling back to basic extraction")
-                    summary = self._extract_basic_summary(content)
-            else:
-                # Fallback to basic extraction
-                print(f"Provider '{provider}' not supported for summarization, falling back to basic extraction")
-                summary = self._extract_basic_summary(content)
-                
-            print(f"Generated summary: {summary[:50]}...")
-            return summary.strip()
         except Exception as e:
             print(f"Error generating summary for {file_path}: {str(e)}")
             traceback.print_exc()

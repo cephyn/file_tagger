@@ -444,3 +444,103 @@ class AIService:
         new_tags = [(t, float(c)) for t, c in cached_data['new_tags']]
         explanation = cached_data.get('explanation', "No explanation available")
         return existing_tags, new_tags, explanation
+
+    def generate_document_summary(self, file_path: str, content: str) -> Optional[str]:
+        """
+        Generate a brief summary of the document content using AI.
+        
+        Args:
+            file_path: Path to the file
+            content: Text content of the file
+            
+        Returns:
+            str: Generated summary or None if generation failed
+        """
+        try:
+            print(f"\n==== Attempting to generate summary for: {os.path.basename(file_path)} ====")
+            
+            # Debug AI configuration
+            print(f"AI Provider: {self.provider or 'Not configured'}")
+            print(f"API Key configured: {'Yes' if self.api_key else 'No'}")
+            print(f"Local model path: {self.local_model_path or 'None'}")
+            
+            # Skip if AI is not configured
+            if not self.provider or (self.provider != 'local' and not self.api_key):
+                print(f"AI not configured (provider or API key missing), skipping summary generation")
+                return None
+                
+            print(f"Generating summary for {file_path} using {self.provider} provider")
+            
+            # Take only a portion of content for summary generation to avoid token limits
+            max_content = 5000
+            content_for_summary = content[:max_content] + ("..." if len(content) > max_content else "")
+                
+            # Create a specialized prompt for summarization
+            file_name = os.path.basename(file_path)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            
+            prompt = (
+                f"Please generate a brief summary (2-3 sentences) of the following document:\n\n"
+                f"Filename: {file_name}\n"
+                f"File extension: {file_ext}\n\n"
+                f"Content:\n{content_for_summary}\n\n"
+                f"Write a clear, concise summary that captures the main topic and purpose of this document. "
+                f"Keep the summary under 200 characters."
+            )
+            
+            # Call the appropriate AI model based on provider
+            if self.provider == 'openai':
+                response = self.modules['openai'].ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a document summarization assistant. Generate brief summaries of documents."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=200,
+                    temperature=0.5
+                )
+                summary = response.choices[0].message.content
+            elif self.provider == 'anthropic':
+                response = self.client.messages.create(
+                    model="claude-3-haiku-20240307",
+                    max_tokens=200,
+                    system="You are a document summarization assistant. Generate brief summaries of documents.",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                summary = response.content[0].text
+            elif self.provider == 'gemini':
+                response = self.model.generate_content(prompt)
+                summary = response.text
+            elif self.provider == 'local':
+                if self.local_model_type == 'llama':
+                    summary = self._analyze_with_llama_cpp(prompt)
+                else:
+                    # For other local models just use basic extraction
+                    print("Local model type not supported for summarization, falling back to basic extraction")
+                    summary = self._extract_basic_summary(content)
+            else:
+                # Fallback to basic extraction
+                print(f"Provider '{self.provider}' not supported for summarization, falling back to basic extraction")
+                summary = self._extract_basic_summary(content)
+                
+            print(f"Generated summary: {summary[:50]}...")
+            return summary.strip()
+        except Exception as e:
+            print(f"Error generating summary for {file_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to basic extraction
+            print("Falling back to basic extraction due to error")
+            return self._extract_basic_summary(content)
+    
+    def _extract_basic_summary(self, content: str) -> str:
+        """Extract a basic summary from content when AI summarization fails."""
+        # Take first paragraph that's not empty and has reasonable length
+        paragraphs = content.split('\n\n')
+        for p in paragraphs:
+            clean_p = p.strip()
+            if len(clean_p) > 30 and len(clean_p) < 200:
+                return clean_p
+                
+        # If no suitable paragraph found, just take first 150 chars
+        return content[:150] + "..." if len(content) > 150 else content
