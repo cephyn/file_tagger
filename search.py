@@ -1,9 +1,90 @@
 import os
+import re
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTextEdit, QPushButton, QMessageBox, QApplication)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QTextCursor  # Added QTextCursor
 from vector_search.content_extractor import ContentExtractor
+
+def markdown_to_html(markdown_text):
+    """
+    Convert markdown text to HTML for proper rendering in the chat window.
+    Handles common markdown elements like headers, bold, italic, code blocks, etc.
+    
+    Args:
+        markdown_text: Text containing markdown formatting
+        
+    Returns:
+        str: HTML formatted text
+    """
+    if not markdown_text:
+        return ""
+    
+    html_text = markdown_text
+    
+    # Convert code blocks with syntax highlighting
+    # ```language\ncode\n``` -> <pre><code>code</code></pre>
+    html_text = re.sub(
+        r'```(?:\w+)?\n(.*?)\n```',
+        r'<pre style="background-color:#f6f8fa; padding:10px; border-radius:4px; overflow:auto;"><code>\1</code></pre>',
+        html_text, 
+        flags=re.DOTALL
+    )
+    
+    # Convert inline code - `code` -> <code>code</code>
+    html_text = re.sub(
+        r'`([^`]+)`', 
+        r'<code style="background-color:#f6f8fa; padding:2px 4px; border-radius:3px;">\1</code>', 
+        html_text
+    )
+    
+    # Convert headers
+    html_text = re.sub(r'^# (.*?)$', r'<h1>\1</h1>', html_text, flags=re.MULTILINE)
+    html_text = re.sub(r'^## (.*?)$', r'<h2>\1</h2>', html_text, flags=re.MULTILINE)
+    html_text = re.sub(r'^### (.*?)$', r'<h3>\1</h3>', html_text, flags=re.MULTILINE)
+    
+    # Convert bold - **text** -> <b>text</b>
+    html_text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_text)
+    
+    # Convert italic - *text* -> <i>text</i>
+    # Only convert * that aren't part of ** (already handled above)
+    html_text = re.sub(r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)', r'<i>\1</i>', html_text)
+    
+    # Convert bullet lists
+    # Match lines starting with - or * followed by a space
+    bullet_pattern = r'^([ \t]*)-[ \t]+(.*?)$'
+    if re.search(bullet_pattern, html_text, re.MULTILINE):
+        # Process line by line
+        lines = html_text.split('\n')
+        in_list = False
+        processed_lines = []
+        
+        for line in lines:
+            bullet_match = re.match(bullet_pattern, line, re.MULTILINE)
+            if bullet_match:
+                if not in_list:
+                    processed_lines.append('<ul style="margin-top:0; margin-bottom:0;">')
+                    in_list = True
+                indent, content = bullet_match.groups()
+                processed_lines.append(f'<li>{content}</li>')
+            else:
+                if in_list:
+                    processed_lines.append('</ul>')
+                    in_list = False
+                processed_lines.append(line)
+        
+        if in_list:
+            processed_lines.append('</ul>')
+        
+        html_text = '\n'.join(processed_lines)
+    
+    # Convert hyperlinks - [text](url) -> <a href="url">text</a>
+    html_text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', html_text)
+    
+    # Convert newlines to <br> tags
+    html_text = html_text.replace('\n', '<br>')
+    
+    return html_text
 
 class ChatWithResultsDialog(QDialog):
     """Dialog for chatting with top search results using AI."""
@@ -160,14 +241,16 @@ class ChatWithResultsDialog(QDialog):
             
             # Call the AI service
             response = self.get_ai_response(prompt)
-            
-            # Remove the "Thinking..." message and add the actual response
+              # Remove the "Thinking..." message and add the actual response
             cursor = self.chat_display.textCursor()
             cursor.movePosition(QTextCursor.End)  # Using QTextCursor enum
             cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)  # Using QTextCursor enums
             cursor.removeSelectedText()
             cursor.deletePreviousChar()  # Remove the newline
-            self.chat_display.append(f"<b>AI Assistant:</b> {response}")
+            
+            # Convert markdown to HTML before displaying
+            formatted_response = markdown_to_html(response)
+            self.chat_display.append(f"<b>AI Assistant:</b> {formatted_response}")
             
             # Add to chat history
             self.chat_history.append({"role": "assistant", "content": response})

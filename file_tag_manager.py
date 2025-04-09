@@ -21,9 +21,10 @@ from search import ChatWithResultsDialog
 from utils import is_dark_color, get_score_color, open_file, open_containing_folder
 
 class HTMLDelegate(QStyledItemDelegate):
-    """Custom delegate to render HTML in QListWidgetItems"""
+    """Custom delegate to render HTML in QListWidgetItems with text wrapping"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.doc = QTextDocument()
         
     def paint(self, painter, option, index):
         """Paint the item using HTML rendering"""
@@ -34,46 +35,55 @@ class HTMLDelegate(QStyledItemDelegate):
             style = QApplication.style()
         else:
             style = options.widget.style()
-            
-        # Get text and check if it has HTML content
+              # Get text and check if it has HTML content
         text = index.data(Qt.DisplayRole)
-        if text and ('<b>' in text or '<i>' in text or '<u>' in text):
+        if text and ('<' in text and '>' in text):  # Check for any HTML tags
             # Save painter state
             painter.save()
             
             # Prepare document
-            doc = QTextDocument()
-            doc.setHtml(text)
-            doc.setTextWidth(options.rect.width())
+            self.doc.setHtml(text)
+            
+            # Calculate available width - use full width minus margins
+            available_width = options.rect.width() - 10  # Subtract margins
+            self.doc.setTextWidth(available_width)
             
             # Clear text to avoid default rendering
             options.text = ""
             style.drawControl(QStyle.CE_ItemViewItem, options, painter)
             
-            # Set up the text position
+            # Set up the text position with a small margin
             textRect = style.subElementRect(QStyle.SE_ItemViewItemText, options)
             painter.translate(textRect.topLeft())
             
             # Draw text with HTML formatting
-            doc.drawContents(painter)
+            self.doc.drawContents(painter)
             
             # Restore painter
             painter.restore()
         else:
             # Default rendering for non-HTML text
             style.drawControl(QStyle.CE_ItemViewItem, options, painter)
-            
+    
     def sizeHint(self, option, index):
-        """Calculate the size needed for the HTML content"""
+        """Calculate the size needed for the HTML content with word wrapping"""
         options = QStyleOptionViewItem(option)
         self.initStyleOption(options, index)
-        
         text = index.data(Qt.DisplayRole)
-        if text and ('<b>' in text or '<i>' in text or '<u>' in text):
-            doc = QTextDocument()
-            doc.setHtml(text)
-            doc.setTextWidth(options.rect.width())
-            return QSize(doc.idealWidth(), doc.size().height())
+        if text and ('<' in text and '>' in text):  # Check for any HTML tags
+            self.doc.setHtml(text)
+            
+            # Set text width to the available width in the view
+            available_width = option.rect.width()
+            if available_width <= 0:
+                # If we don't have a valid width yet, use a reasonable default
+                # This happens during initial layout
+                available_width = 500
+                
+            self.doc.setTextWidth(available_width)
+            
+            # Return a size that accommodates the wrapped text
+            return QSize(available_width, self.doc.size().height())
         
         return super().sizeHint(option, index)
 
@@ -1024,11 +1034,13 @@ class FileTagManager(QMainWindow):
                     
                     # Store reference to this item for selection tracking
                     self.result_document_items[result['path']] = file_item
-                    
-                    # Display document summary if available
+                      # Display document summary if available
                     summary = result.get('summary', '')
                     if summary:
-                        summary_item = QListWidgetItem(f"    📝 {summary}")
+                        # Wrap summary in HTML div to ensure proper text wrapping
+                        formatted_summary = f"<div style='text-align:left; margin-left:4px; margin-right:4px;'>    📝 {summary}</div>"
+                        summary_item = QListWidgetItem()
+                        summary_item.setText(formatted_summary)
                         summary_item.setToolTip(result['path'])
                         # Use lighter background to differentiate from main result
                         bg_color = get_score_color(score)
@@ -1089,14 +1101,16 @@ class FileTagManager(QMainWindow):
                             # Create formatted text with context prefix in italics
                             formatted_text = f"    ↪ <i>{context}:</i> {text}"
                         else:
-                            # Just use the snippet text as-is
+                            # Just use the snippet text as-is                            
                             formatted_text = f"    ↪ {snippet}"
-                        
                         # Set the text with HTML formatting that preserves bold highlighting
                         # (the ** marks from markdown are converted to HTML <b> tags)
                         formatted_text = formatted_text.replace('**', '<b>', 1)
                         while '**' in formatted_text:
                             formatted_text = formatted_text.replace('**', '</b>', 1)
+                        
+                        # Add div with styling for better text wrapping
+                        formatted_text = f"<div style='text-align:left; margin-left:4px; margin-right:4px;'>{formatted_text}</div>"
                         
                         snippet_item.setText(formatted_text)
                         
