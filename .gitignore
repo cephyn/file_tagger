@@ -46,3 +46,18 @@ config.encrypted
 .salt
 .passhash
 .recovery
+
+# Vector search database
+.chroma/
+.vectordb/
+chroma_db/
+
+# Local model files
+models/
+*.gguf
+*.bin
+*.pt
+*.onnx
+
+# User-specific files
+file_tags.db-journal

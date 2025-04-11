@@ -12,6 +12,8 @@ A Windows file management application that allows users to add custom tags to fi
 - Sort files by name, size, type, and date modified
 - Quick navigation with drive selection dropdown
 - Right-click context menu for file operations
+- Open files directly from the application
+- Open containing folder for quick access to file locations
 
 ### Tag Management
 - Add, edit, and delete custom tags with colors
@@ -20,19 +22,26 @@ A Windows file management application that allows users to add custom tags to fi
 - Organize files with a flexible tagging system
 - Batch tag multiple files at once
 - Remove tags from files
+- Auto-generate random colors for new tags
+- Visual tag indicators with appropriate text contrast
+- Create new tags directly from the tag suggestion interface
 
 ### Vector Search
 - Semantic search through file contents
 - Find files based on meaning, not just keywords
 - Document chunking for improved search of large files
-- Relevant text snippets in search results
+- Relevant text snippets in search results with highlighted matches
 - Query expansion to find related terms
-- Semantic ranking of search results
+- Semantic ranking of search results with color-coded confidence scores
 - Content-based file searching across multiple formats
-- Tag filtering with semantic search
+- Tag filtering with semantic search (AND/OR logic)
 - Interactive chat with search results
 - Force reindex specific files when needed
 - Remove files from search index
+- Automatic metadata updates when tags change
+- Document summaries for quick content overview
+- Automatic indexing of newly tagged files
+- Bulk reindexing operation for all files
 
 ### AI Integration
 - AI-powered automatic tag suggestions:
@@ -230,7 +239,14 @@ Right-clicking on search results provides useful options:
 ## Version History
 
 - 1.0.0 (April 2025) - Initial release with core functionality
-- Current: Development version
+- 0.0.1 (Development) - Current development version
+
+## About
+
+Developed by: Busy Wyvern
+Website: [Busy Wyvern](https://www.busywyvern.com)
+Built with Python, PySide6, SQLAlchemy, and Vector Search technologies
+© 2025 All Rights Reserved
 
 ## License
 
