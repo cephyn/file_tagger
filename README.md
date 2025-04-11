@@ -238,7 +238,6 @@ Right-clicking on search results provides useful options:
 
 ## Version History
 
-- 1.0.0 (April 2025) - Initial release with core functionality
 - 0.0.1 (Development) - Current development version
 
 ## About
