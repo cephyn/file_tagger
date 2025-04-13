@@ -5,6 +5,16 @@ from PySide6.QtGui import QColor, QPixmap
 from models import init_db
 from config import Config
 from vector_search import VectorSearch
+try:
+    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+except ImportError:
+    # Handle case where it might not exist in some installations,
+    # although the error suggests it's expected.
+    pass
+
+# Also ensure sentence_transformers is imported somewhere obvious
+import sentence_transformers
+import onnxruntime # Add this too
 
 class InitializationWorker(QThread):
     progress_signal = Signal(str, int)
