@@ -1,5 +1,7 @@
 import os
 import sys
+import logging
+import traceback
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTreeView, QListWidget, QPushButton, QInputDialog,
                              QColorDialog, QLabel, QFileSystemModel, QMessageBox,
@@ -151,58 +153,157 @@ class AboutDialog(QDialog):
         layout.addWidget(close_button)
 
 class FileTagManager(QMainWindow):
-    """Main window for the File Tagger application."""
+    """Main window for the File Tagger application."""    
     def __init__(self, db_session, config, vector_search):
-        super().__init__()
-        self.db_session = db_session
-        self.config = config
-        self.vector_search = vector_search
-        self.current_file_path = None
-        self.current_search_results = []  # Initialize search results storage
+        # Set up logging for the main window
+        self.logger = logging.getLogger("FileTagManager")
+        # Make sure we have a logs directory
+        os.makedirs('logs', exist_ok=True)
+        # Add a file handler for main window-specific issues
+        file_handler = logging.FileHandler('main_window_debug.log')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(logging.StreamHandler())
         
-        self.init_ui()
+        self.logger.debug("FileTagManager initialization started")
         
+        try:
+            super().__init__()
+            self.logger.debug("QMainWindow initialized")
+            
+            try:
+                self.logger.debug(f"Received db_session: {db_session is not None}")
+                self.db_session = db_session
+                
+                self.logger.debug(f"Received config: {config is not None}")
+                self.config = config
+                
+                self.logger.debug(f"Received vector_search: {vector_search is not None}")
+                self.vector_search = vector_search
+                
+                self.current_file_path = None
+                self.current_search_results = []  # Initialize search results storage
+                
+                self.logger.debug("About to call init_ui")
+                self.init_ui()
+                self.logger.debug("init_ui completed successfully")
+            except Exception as e:
+                self.logger.error(f"Error during FileTagManager initialization: {str(e)}")
+                self.logger.error(traceback.format_exc())
+                raise
+                
+        except Exception as e:
+            self.logger.critical(f"Fatal error in FileTagManager constructor: {str(e)}")
+            self.logger.critical(traceback.format_exc())
+            # Show error dialog since this is a critical failure
+            QMessageBox.critical(None, "Critical Error", 
+                                f"Failed to initialize the main window: {str(e)}\n\n"
+                                "Please check the logs for more details.")
+            raise
+    
+    def showEvent(self, event):
+        """Override showEvent to log when window is shown"""
+        self.logger.debug("Main window show event received")
+        super().showEvent(event)
+        self.logger.debug("Main window is now visible")
+    
+    def closeEvent(self, event):
+        """Override closeEvent to log when window is closed"""
+        self.logger.debug(f"Main window close event received, reason: {event.spontaneous()}")
+        self.logger.debug("Stack trace at close event:")
+        self.logger.debug(''.join(traceback.format_stack()))
+        
+        # Call parent class method to proceed with normal closing
+        super().closeEvent(event)
+        self.logger.debug("Main window closed")
     def init_ui(self):
-        self.setWindowTitle('File Tagger')
-        self.setGeometry(100, 100, 1200, 700)
-        
-        # Create menu bar and menus
-        self.setup_menus()
-        
-        # Create central widget and main layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        
-        # Create the main tab widget
-        self.main_tabs = QTabWidget()
-        main_layout.addWidget(self.main_tabs)
-        
-        # Create and add the tagging and search tabs
-        tagging_tab = self.create_tagging_tab()
-        search_tab = self.create_search_tab()
-        
-        self.main_tabs.addTab(tagging_tab, "Tagging Interface")
-        self.main_tabs.addTab(search_tab, "Search Interface")
-        
-        # Set initial directory from config
-        initial_path = self.config.get_home_directory()
-        self.tree.setRootIndex(self.model.index(initial_path))
-        
-        # Update initial path display
-        self.path_display.setText(initial_path)
-        
-        # Update drive list and select current drive
-        self.update_drive_list()
-        drive = os.path.splitdrive(initial_path)[0] + os.path.sep
-        for i in range(self.drive_combo.count()):
-            if self.drive_combo.itemData(i).startswith(drive):
-                self.drive_combo.setCurrentIndex(i)
-                break
-        
-        # Connect signals after initialization
-        self.drive_combo.currentIndexChanged.connect(self.on_drive_changed)
-        self.refresh_tags()
+        self.logger.debug("init_ui started")
+        try:
+            self.setWindowTitle('File Tagger')
+            self.setGeometry(100, 100, 1200, 700)
+            self.logger.debug("Window title and geometry set")
+            
+            # Create menu bar and menus
+            self.logger.debug("Setting up menus")
+            self.setup_menus()
+            self.logger.debug("Menus set up successfully")
+            
+            # Create central widget and main layout
+            self.logger.debug("Creating central widget")
+            central_widget = QWidget()
+            self.setCentralWidget(central_widget)
+            main_layout = QVBoxLayout(central_widget)
+            self.logger.debug("Central widget created")
+            
+            # Create the main tab widget
+            self.logger.debug("Creating main tabs")
+            self.main_tabs = QTabWidget()
+            main_layout.addWidget(self.main_tabs)
+            self.logger.debug("Main tabs created")
+            
+            # Create and add the tagging and search tabs
+            self.logger.debug("Creating tagging tab")
+            tagging_tab = self.create_tagging_tab()
+            self.logger.debug("Tagging tab created")
+            
+            self.logger.debug("Creating search tab")
+            search_tab = self.create_search_tab()
+            self.logger.debug("Search tab created")
+            
+            self.main_tabs.addTab(tagging_tab, "Tagging Interface")
+            self.main_tabs.addTab(search_tab, "Search Interface")
+            self.logger.debug("Added tabs to main tabs widget")
+            
+            # Set initial directory from config
+            self.logger.debug("Setting initial directory")
+            try:
+                initial_path = self.config.get_home_directory()
+                self.logger.debug(f"Got home directory from config: {initial_path}")
+                self.tree.setRootIndex(self.model.index(initial_path))
+                self.logger.debug("Set root index of tree to home directory")
+                
+                # Update initial path display
+                self.path_display.setText(initial_path)
+                self.logger.debug("Updated path display")
+            except Exception as e:
+                self.logger.error(f"Error setting initial directory: {str(e)}")
+                self.logger.error(traceback.format_exc())
+                raise
+            
+            # Update drive list and select current drive
+            self.logger.debug("Updating drive list")
+            try:
+                self.update_drive_list()
+                self.logger.debug("Drive list updated")
+                drive = os.path.splitdrive(initial_path)[0] + os.path.sep
+                for i in range(self.drive_combo.count()):
+                    if self.drive_combo.itemData(i).startswith(drive):
+                        self.drive_combo.setCurrentIndex(i)
+                        break
+                self.logger.debug(f"Selected drive in combo box: {drive}")
+            except Exception as e:
+                self.logger.error(f"Error updating drive list: {str(e)}")
+                self.logger.error(traceback.format_exc())
+                raise
+            
+            # Connect signals after initialization
+            self.logger.debug("Connecting signals")
+            try:
+                self.drive_combo.currentIndexChanged.connect(self.on_drive_changed)
+                self.logger.debug("Connected drive_combo signal")
+                self.refresh_tags()
+                self.logger.debug("Tags refreshed")
+            except Exception as e:
+                self.logger.error(f"Error connecting signals or refreshing tags: {str(e)}")
+                self.logger.error(traceback.format_exc())
+                raise
+                
+            self.logger.debug("init_ui completed successfully")
+        except Exception as e:
+            self.logger.error(f"Error in init_ui: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            raise
 
     def setup_menus(self):
         """Set up the application menus."""

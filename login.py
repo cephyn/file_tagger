@@ -2,7 +2,21 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                             QLineEdit, QPushButton, QFrame, QProgressBar, QDialog)
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
+import logging
+import traceback
+import os
 from initialization import InitializationWorker
+
+# Configure additional logging for login process
+logger = logging.getLogger("Login")
+# Make sure we have a logs directory
+os.makedirs('logs', exist_ok=True)
+# Add a file handler for login-specific issues
+login_log_handler = logging.FileHandler('login_debug.log')
+login_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.setLevel(logging.DEBUG)
+logger.addHandler(login_log_handler)
+logger.addHandler(logging.StreamHandler())
 
 class AboutDialog(QDialog):
     """Dialog showing information about the application."""
@@ -42,12 +56,12 @@ class AboutDialog(QDialog):
         layout.addWidget(separator)
         
         # Author info
-        author = QLabel("Developed by: YourName")
+        author = QLabel("Developed by: Busy Wyvern")
         author.setAlignment(Qt.AlignCenter)
         layout.addWidget(author)
         
         # Website link (clickable)
-        website_label = QLabel("<a href='https://yourwebsite.com'>Visit Website</a>")
+        website_label = QLabel("<a href='https://busywyvern.com'>Visit Website</a>")
         website_label.setOpenExternalLinks(True)
         website_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(website_label)
@@ -219,25 +233,60 @@ class LoginScreen(QWidget):
         self.worker = InitializationWorker(password)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_initialization_finished)
-        self.worker.start()
-    
+        self.worker.start()    
     def on_initialization_finished(self, result):
         """Handle completion of the initialization process."""
-        db_session, config, vector_search = result
-        if db_session and config and vector_search:
-            self.hide()
+        logger.debug("on_initialization_finished called with result")
+        try:
+            db_session, config, vector_search = result
+            logger.debug(f"Unpacked result: db_session={db_session is not None}, config={config is not None}, vector_search={vector_search is not None}")
             
-            # Import here to avoid circular imports
-            from file_tag_manager import FileTagManager
-            
-            # Create and show the main window
-            window = FileTagManager(db_session, config, vector_search)
-            window.show()
-            
-            # Close the login screen
-            self.close()
-        else:
-            self.show_error("Failed to initialize the application. Incorrect password or corrupted configuration.")
+            if db_session and config and vector_search:
+                logger.debug("Initialization succeeded, preparing to show main window")
+                try:
+                    # Hide the login window
+                    self.hide()
+                    logger.debug("Login window hidden")
+                    
+                    # Import here to avoid circular imports
+                    logger.debug("Importing FileTagManager")
+                    from file_tag_manager import FileTagManager
+                    logger.debug("FileTagManager imported successfully")
+                    
+                    # Create and show the main window
+                    logger.debug("Creating FileTagManager instance")
+                    window = FileTagManager(db_session, config, vector_search)
+                    logger.debug("FileTagManager instance created")
+                    
+                    # Save a reference to the window to prevent it from being garbage collected
+                    self._main_window = window
+                    logger.debug("Main window reference saved")
+                    
+                    logger.debug("About to show main window")
+                    window.show()
+                    logger.debug("Main window shown successfully")
+                    
+                    # Set window attributes to ensure it stays alive
+                    window.setAttribute(Qt.WA_DeleteOnClose, False)
+                    logger.debug("Window attributes set to prevent automatic deletion")
+                    
+                    # Close the login screen
+                    logger.debug("Closing login screen")
+                    self.close()
+                    logger.debug("Login screen closed")
+                except Exception as e:
+                    logger.error(f"Error during main window creation: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    self.show_error(f"Error launching application: {str(e)}")
+                    self.cleanup_worker()
+            else:
+                logger.error("Initialization failed - missing required components")
+                self.show_error("Failed to initialize the application. Incorrect password or corrupted configuration.")
+                self.cleanup_worker()
+        except Exception as e:
+            logger.error(f"Unexpected error in on_initialization_finished: {str(e)}")
+            logger.error(traceback.format_exc())
+            self.show_error(f"Unexpected error: {str(e)}")
             self.cleanup_worker()
     
     def cleanup_worker(self):

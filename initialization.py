@@ -1,20 +1,45 @@
 import time
+import logging
+import traceback
+import os
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QProgressBar
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QPixmap
 from models import init_db
 from config import Config
 from vector_search import VectorSearch
-try:
-    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
-except ImportError:
-    # Handle case where it might not exist in some installations,
-    # although the error suggests it's expected.
-    pass
 
-# Also ensure sentence_transformers is imported somewhere obvious
-import sentence_transformers
-import onnxruntime # Add this too
+# Set ONNX environment variable here too for the worker thread
+os.environ["CHROMADB_DISABLE_ONNX"] = "1"
+
+# Log initialization steps
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('initialization_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("Initialization")
+
+# Safely try imports that might be problematic after packaging
+logger.debug("Attempting to import potentially problematic modules...")
+try:
+    logger.debug("Importing sentence_transformers...")
+    import sentence_transformers
+    logger.debug("Successfully imported sentence_transformers")
+except Exception as e:
+    logger.error(f"Error importing sentence_transformers: {str(e)}")
+    logger.error(traceback.format_exc())
+
+try:
+    logger.debug("Importing onnxruntime...")
+    import onnxruntime
+    logger.debug("Successfully imported onnxruntime")
+except Exception as e:
+    logger.error(f"Error importing onnxruntime: {str(e)}")
+    logger.error(traceback.format_exc())
 
 class InitializationWorker(QThread):
     progress_signal = Signal(str, int)
@@ -23,32 +48,56 @@ class InitializationWorker(QThread):
     def __init__(self, password):
         super().__init__()
         self.password = password
+        logger.debug("InitializationWorker created")
         
     def run(self):
+        logger.debug("InitializationWorker.run() started")
         try:
             # Initialize database
+            logger.debug("Starting database initialization")
             self.progress_signal.emit("Initializing database...", 10)
             db_session = init_db()
+            logger.debug("Database initialized successfully")
             
             # Initialize config
+            logger.debug(f"Starting config initialization with password (length: {len(self.password)})")
             self.progress_signal.emit("Loading configuration...", 30)
-            config = Config(self.password)
-              # Initialize vector search
+            try:
+                config = Config(self.password)
+                logger.debug("Config initialized successfully")
+            except Exception as config_error:
+                logger.error(f"Config initialization failed: {str(config_error)}")
+                logger.error(traceback.format_exc())
+                raise
+            
+            # Initialize vector search
+            logger.debug("Starting vector search initialization")
             self.progress_signal.emit("Setting up search engine...", 50)
-            vector_search = VectorSearch(db_session, config)
+            try:
+                vector_search = VectorSearch(db_session, config)
+                logger.debug("Vector search initialized successfully")
+            except Exception as vs_error:
+                logger.error(f"Vector search initialization failed: {str(vs_error)}")
+                logger.error(traceback.format_exc())
+                raise
             
             # Loading existing files and tags
+            logger.debug("Loading existing files and tags")
             self.progress_signal.emit("Loading files and tags...", 70)
             time.sleep(0.5)  # Small delay to make the progress visible
             
             # Finalizing initialization
+            logger.debug("Finalizing initialization")
             self.progress_signal.emit("Finalizing...", 90)
             time.sleep(0.5)  # Small delay to make the progress visible
             
             # Send the results back to the main thread
+            logger.debug("Initialization completed successfully, emitting signal")
             self.finished_signal.emit((db_session, config, vector_search))
             
         except Exception as e:
+            logger.error(f"Initialization failed with error: {str(e)}")
+            logger.error(traceback.format_exc())
             self.progress_signal.emit(f"Error: {str(e)}", 100)
             self.finished_signal.emit((None, None, None))
 
