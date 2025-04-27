@@ -145,6 +145,7 @@ class Config:
                     'model_path': '',
                     'model_type': 'llama'  # Default model type
                 },
+                'pdf_extractor': 'accurate',  # 'fast' or 'accurate' for PDF extraction
                 'system_message': DEFAULT_SYSTEM_MESSAGE
             }
         
@@ -168,6 +169,10 @@ class Config:
             # Add system_message if it doesn't exist in older config files
             if 'system_message' not in config:
                 config['system_message'] = DEFAULT_SYSTEM_MESSAGE
+            
+            # Add pdf_extractor if it doesn't exist in older config files
+            if 'pdf_extractor' not in config:
+                config['pdf_extractor'] = 'accurate'
                 
             return config
         except Exception:
@@ -183,6 +188,7 @@ class Config:
                     'model_path': '',
                     'model_type': 'llama'
                 },
+                'pdf_extractor': 'accurate',  # 'fast' or 'accurate' for PDF extraction
                 'system_message': DEFAULT_SYSTEM_MESSAGE
             }
     
@@ -378,3 +384,15 @@ class Config:
         except Exception as e:
             print(f"Error creating AI service: {str(e)}")
             return None
+            
+    def set_pdf_extractor(self, preference: str):
+        """Set the PDF content extractor preference ('fast' or 'accurate')."""
+        if preference not in ['fast', 'accurate']:
+            raise ValueError("PDF extractor preference must be 'fast' or 'accurate'")
+            
+        self.config_data['pdf_extractor'] = preference
+        self.save()
+        
+    def get_pdf_extractor(self) -> str:
+        """Get the PDF content extractor preference."""
+        return self.config_data.get('pdf_extractor', 'accurate')
