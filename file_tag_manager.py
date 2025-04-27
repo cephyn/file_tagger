@@ -1793,49 +1793,98 @@ class FileTagManager(QMainWindow):
                 print(f"Error checking AI configuration: {str(e)}")
             
             from vector_search.content_extractor import ContentExtractor
-            # Extract content from the file
-            print(f"Extracting content from: {file_path}")
-            content = ContentExtractor.extract_file_content(file_path)
-            if not content:
-                QMessageBox.warning(
-                    self, 
-                    "Error", 
-                    f"Could not extract content from {os.path.basename(file_path)}.\n\n"
-                    "This file type may not be supported for content extraction."
-                )
-                return False
             
-            print(f"Content extracted, length: {len(content)} characters")
+            # Create progress dialog for extraction
+            progress = QProgressDialog("Extracting content...", "Cancel", 0, 0, self)
+            progress.setWindowTitle("Extracting Content")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setCancelButton(None)  # No cancel button
+            progress.setRange(0, 0)  # Show busy indicator (spinner)
+            progress.show()
             
-            # Remove existing entries before reindexing
-            print(f"Removing existing document entries for: {file_path}")
-            self.vector_search.remove_file(file_path)
+            # Variable to store extracted content
+            extracted_content = None
             
-            # Index the file with existing content
-            print(f"Reindexing file: {file_path}")
-            self.vector_search.index_file(file_path, content)
+            # Define callbacks for the async extraction
+            def on_progress(message):
+                progress.setLabelText(message)
+                QApplication.processEvents()
             
-            # Verify that the file was indexed with a summary
-            try:
-                results = self.vector_search.collection.get(
-                    ids=[file_path], include=['metadatas']
-                )
-                if results and results['ids'] and len(results['ids']) > 0:
-                    metadata = results['metadatas'][0]
-                    print(f"Verification successful - file found in vector store")
-                    if 'summary' in metadata and metadata['summary']:
-                        print(f"Document summary generated: {metadata['summary']}")
-                    else:
-                        print("No document summary was generated")
-            except Exception as verify_err:
-                print(f"Error verifying file in vector store: {str(verify_err)}")
+            def on_extraction_complete(result):
+                nonlocal extracted_content
+                progress.close()
+                
+                if result.get('success', False):
+                    extracted_content = result.get('content', '')
+                    print(f"Content extraction completed successfully, length: {len(extracted_content)} characters")
+                    finish_reindexing(extracted_content)
+                else:
+                    error = result.get('error', 'Unknown error')
+                    print(f"Content extraction failed: {error}")
+                    QMessageBox.warning(
+                        self, 
+                        "Error", 
+                        f"Content extraction failed: {error}"
+                    )
             
-            QMessageBox.information(
-                self,
-                "Success",
-                f"The file {os.path.basename(file_path)} has been successfully reindexed."
-            )
-            return True
+            def finish_reindexing(content):
+                if not content:
+                    QMessageBox.warning(
+                        self, 
+                        "Error", 
+                        f"Could not extract content from {os.path.basename(file_path)}.\n\n"
+                        "This file type may not be supported for content extraction."
+                    )
+                    return False
+                
+                try:
+                    # Remove existing entries before reindexing
+                    print(f"Removing existing document entries for: {file_path}")
+                    self.vector_search.remove_file(file_path)
+                    
+                    # Index the file with extracted content
+                    print(f"Reindexing file: {file_path}")
+                    self.vector_search.index_file(file_path, content)
+                    
+                    # Verify that the file was indexed with a summary
+                    try:
+                        results = self.vector_search.collection.get(
+                            ids=[file_path], include=['metadatas']
+                        )
+                        if results and results['ids'] and len(results['ids']) > 0:
+                            metadata = results['metadatas'][0]
+                            print(f"Verification successful - file found in vector store")
+                            if 'summary' in metadata and metadata['summary']:
+                                print(f"Document summary generated: {metadata['summary']}")
+                            else:
+                                print("No document summary was generated")
+                    except Exception as verify_err:
+                        print(f"Error verifying file in vector store: {str(verify_err)}")
+                    
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"The file {os.path.basename(file_path)} has been successfully reindexed."
+                    )
+                    return True
+                except Exception as e:
+                    print(f"Error during finishing reindexing: {str(e)}")
+                    traceback.print_exc()
+                    QMessageBox.warning(
+                        self,
+                        "Error",
+                        f"Failed to complete reindexing: {str(e)}"
+                    )
+                    return False
+            
+            # Start the async extraction process
+            print(f"Starting async content extraction from: {file_path}")
+            ContentExtractor.extract_file_content_async(file_path, on_extraction_complete, on_progress)
+            return True  # Return true immediately, the actual work happens asynchronously
             
         except Exception as e:
             print(f"Error during force reindex: {str(e)}")

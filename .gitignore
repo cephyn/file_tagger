@@ -36,6 +36,7 @@ htmlcov/
 # Local development
 *.log
 .DS_Store
+plans/
 
 # Database
 *.db

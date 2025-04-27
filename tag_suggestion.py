@@ -474,8 +474,7 @@ class TagSuggestionDialog(QDialog):
             
             # Commit changes to the database
             self.db_session.commit()
-            
-            # Check if this is the first time the file has been tagged
+              # Check if this is the first time the file has been tagged
             # If so, add it to the vector database for search
             if is_new_file or not had_tags_before:
                 try:
@@ -491,14 +490,52 @@ class TagSuggestionDialog(QDialog):
                     else:
                         vector_search = VectorSearch(self.db_session)
                     
-                    # Extract content from the file
-                    content = ContentExtractor.extract_file_content(self.file_path)
-                    if content:
-                        # Add file to vector database
-                        vector_search.index_file(self.file_path, content)
-                        print(f"Added newly tagged file to vector search index: {self.file_path}")
-                    else:
-                        print(f"Warning: No content could be extracted from file: {self.file_path}")
+                    # Create progress dialog for extraction
+                    progress = QProgressDialog("Extracting content...", "Cancel", 0, 0, self)
+                    progress.setWindowTitle("Extracting Content")
+                    progress.setWindowModality(Qt.WindowModal)
+                    progress.setMinimumDuration(0)
+                    progress.setValue(0)
+                    progress.setAutoClose(False)
+                    progress.setAutoReset(False)
+                    progress.setCancelButton(None)  # No cancel button
+                    progress.setRange(0, 0)  # Show busy indicator (spinner)
+                    progress.show()
+                    
+                    # Variable to track completion state for the accept() call
+                    self.content_extraction_complete = False
+                    
+                    # Define callbacks for the async extraction
+                    def on_progress(message):
+                        progress.setLabelText(message)
+                        QApplication.processEvents()
+                    
+                    def on_extraction_complete(result):
+                        progress.close()
+                        content = result.get('content', '')
+                        
+                        if content:
+                            try:
+                                # Add file to vector database
+                                vector_search.index_file(self.file_path, content)
+                                print(f"Added newly tagged file to vector search index: {self.file_path}")
+                            except Exception as e:
+                                import traceback
+                                print(f"Error indexing file: {str(e)}")
+                                traceback.print_exc()
+                        else:
+                            print(f"Warning: No content could be extracted from file: {self.file_path}")
+                        
+                        # Mark extraction as complete and accept the dialog
+                        self.content_extraction_complete = True
+                        self.accept()
+                    
+                    # Start async content extraction
+                    ContentExtractor.extract_file_content_async(self.file_path, on_extraction_complete, on_progress)
+                    
+                    # Return without accepting the dialog - the callback will handle it
+                    return
+                    
                 except Exception as e:
                     import traceback
                     print(f"Error adding file to vector search: {str(e)}")
@@ -519,6 +556,7 @@ class TagSuggestionDialog(QDialog):
                 except Exception as e:
                     import traceback
                     print(f"Error updating vector search metadata: {str(e)}")
+                    traceback.print_exc()
                     traceback.print_exc()
                     
             self.accept()
