@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QFrame, QListWidgetItem, QDialog, QTextEdit, QStyledItemDelegate,
                              QStyleOptionViewItem, QApplication, QStyle)
 from PySide6.QtCore import Qt, QDir, QStorageInfo
-from PySide6.QtGui import QColor, QFont, QDesktopServices, QTextDocument
+from PySide6.QtGui import QColor, QFont, QDesktopServices, QTextDocument, QAction, QActionGroup
 from PySide6.QtCore import QUrl, QSize
 from sqlalchemy import and_, or_
 from models import File, Tag
@@ -320,6 +320,33 @@ class FileTagManager(QMainWindow):
         
         password_action = settings_menu.addAction('Password Management')
         password_action.triggered.connect(self.show_password_management)
+        
+        # Add PDF extractor settings submenu
+        pdf_extractor_menu = settings_menu.addMenu('PDF Extractor')
+        
+        # Create action group to ensure only one option is selected at a time
+        self.pdf_extractor_group = QActionGroup(self)
+        self.pdf_extractor_group.setExclusive(True)
+        
+        # Create actions for PDF extractor options
+        self.fast_action = QAction('Fast (markitdown)', self)
+        self.fast_action.setCheckable(True)
+        self.fast_action.setActionGroup(self.pdf_extractor_group)
+        self.fast_action.triggered.connect(lambda: self.set_pdf_extractor('fast'))
+        
+        self.accurate_action = QAction('Slower, more accurate (docling)', self)
+        self.accurate_action.setCheckable(True)
+        self.accurate_action.setActionGroup(self.pdf_extractor_group)
+        self.accurate_action.triggered.connect(lambda: self.set_pdf_extractor('accurate'))
+        
+        # Add actions to the menu
+        pdf_extractor_menu.addAction(self.fast_action)
+        pdf_extractor_menu.addAction(self.accurate_action)
+        
+        # Set initial state based on configuration
+        pdf_extractor = self.config.get_pdf_extractor()
+        self.fast_action.setChecked(pdf_extractor == 'fast')
+        self.accurate_action.setChecked(pdf_extractor == 'accurate')
         
         # Add scan directory action
         scan_action = menubar.addAction('Scan Directory')
@@ -1793,49 +1820,98 @@ class FileTagManager(QMainWindow):
                 print(f"Error checking AI configuration: {str(e)}")
             
             from vector_search.content_extractor import ContentExtractor
-            # Extract content from the file
-            print(f"Extracting content from: {file_path}")
-            content = ContentExtractor.extract_file_content(file_path)
-            if not content:
-                QMessageBox.warning(
-                    self, 
-                    "Error", 
-                    f"Could not extract content from {os.path.basename(file_path)}.\n\n"
-                    "This file type may not be supported for content extraction."
-                )
-                return False
             
-            print(f"Content extracted, length: {len(content)} characters")
+            # Create progress dialog for extraction
+            progress = QProgressDialog("Extracting content...", "Cancel", 0, 0, self)
+            progress.setWindowTitle("Extracting Content")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setCancelButton(None)  # No cancel button
+            progress.setRange(0, 0)  # Show busy indicator (spinner)
+            progress.show()
             
-            # Remove existing entries before reindexing
-            print(f"Removing existing document entries for: {file_path}")
-            self.vector_search.remove_file(file_path)
+            # Variable to store extracted content
+            extracted_content = None
             
-            # Index the file with existing content
-            print(f"Reindexing file: {file_path}")
-            self.vector_search.index_file(file_path, content)
+            # Define callbacks for the async extraction
+            def on_progress(message):
+                progress.setLabelText(message)
+                QApplication.processEvents()
             
-            # Verify that the file was indexed with a summary
-            try:
-                results = self.vector_search.collection.get(
-                    ids=[file_path], include=['metadatas']
-                )
-                if results and results['ids'] and len(results['ids']) > 0:
-                    metadata = results['metadatas'][0]
-                    print(f"Verification successful - file found in vector store")
-                    if 'summary' in metadata and metadata['summary']:
-                        print(f"Document summary generated: {metadata['summary']}")
-                    else:
-                        print("No document summary was generated")
-            except Exception as verify_err:
-                print(f"Error verifying file in vector store: {str(verify_err)}")
+            def on_extraction_complete(result):
+                nonlocal extracted_content
+                progress.close()
+                
+                if result.get('success', False):
+                    extracted_content = result.get('content', '')
+                    print(f"Content extraction completed successfully, length: {len(extracted_content)} characters")
+                    finish_reindexing(extracted_content)
+                else:
+                    error = result.get('error', 'Unknown error')
+                    print(f"Content extraction failed: {error}")
+                    QMessageBox.warning(
+                        self, 
+                        "Error", 
+                        f"Content extraction failed: {error}"
+                    )
             
-            QMessageBox.information(
-                self,
-                "Success",
-                f"The file {os.path.basename(file_path)} has been successfully reindexed."
-            )
-            return True
+            def finish_reindexing(content):
+                if not content:
+                    QMessageBox.warning(
+                        self, 
+                        "Error", 
+                        f"Could not extract content from {os.path.basename(file_path)}.\n\n"
+                        "This file type may not be supported for content extraction."
+                    )
+                    return False
+                
+                try:
+                    # Remove existing entries before reindexing
+                    print(f"Removing existing document entries for: {file_path}")
+                    self.vector_search.remove_file(file_path)
+                    
+                    # Index the file with extracted content
+                    print(f"Reindexing file: {file_path}")
+                    self.vector_search.index_file(file_path, content)
+                    
+                    # Verify that the file was indexed with a summary
+                    try:
+                        results = self.vector_search.collection.get(
+                            ids=[file_path], include=['metadatas']
+                        )
+                        if results and results['ids'] and len(results['ids']) > 0:
+                            metadata = results['metadatas'][0]
+                            print(f"Verification successful - file found in vector store")
+                            if 'summary' in metadata and metadata['summary']:
+                                print(f"Document summary generated: {metadata['summary']}")
+                            else:
+                                print("No document summary was generated")
+                    except Exception as verify_err:
+                        print(f"Error verifying file in vector store: {str(verify_err)}")
+                    
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"The file {os.path.basename(file_path)} has been successfully reindexed."
+                    )
+                    return True
+                except Exception as e:
+                    print(f"Error during finishing reindexing: {str(e)}")
+                    traceback.print_exc()
+                    QMessageBox.warning(
+                        self,
+                        "Error",
+                        f"Failed to complete reindexing: {str(e)}"
+                    )
+                    return False
+            
+            # Start the async extraction process
+            print(f"Starting async content extraction from: {file_path}")
+            ContentExtractor.extract_file_content_async(file_path, on_extraction_complete, on_progress)
+            return True  # Return true immediately, the actual work happens asynchronously
             
         except Exception as e:
             print(f"Error during force reindex: {str(e)}")
@@ -1847,3 +1923,43 @@ class FileTagManager(QMainWindow):
                 f"Failed to reindex file: {str(e)}"
             )
             return False
+
+    def set_pdf_extractor(self, preference):
+        """Set the PDF extractor preference."""
+        try:
+            current = self.config.get_pdf_extractor()
+            if current == preference:
+                return  # No change needed
+                
+            # Update configuration
+            self.config.set_pdf_extractor(preference)
+            
+            # Update action states - use the stored action references
+            # instead of trying to access the menu directly
+            self.fast_action.setChecked(preference == 'fast')
+            self.accurate_action.setChecked(preference == 'accurate')
+            
+            # Show confirmation message
+            if preference == 'fast':
+                QMessageBox.information(
+                    self,
+                    "PDF Extractor Changed",
+                    "PDF extractor set to Fast mode (using markitdown).\n\n"
+                    "This setting will be used for all future PDF and Word document extraction."
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "PDF Extractor Changed",
+                    "PDF extractor set to Accurate mode (using docling).\n\n"
+                    "This setting will be used for all future PDF and Word document extraction."
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Error setting PDF extractor preference: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            QMessageBox.warning(
+                self,
+                "Error",
+                f"Failed to change PDF extractor preference: {str(e)}"
+            )
