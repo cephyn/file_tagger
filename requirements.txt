@@ -18,3 +18,5 @@ python-docx>=0.8.11
 python-pptx>=0.6.21
 openpyxl>=3.1.0
 beautifulsoup4>=4.12.0
+docling>=2.30.0
+markitdown[all]>=0.1.1
