@@ -239,17 +239,18 @@ class VectorSearch:
                     metadata['summary'] = existing_summary
             
             if existing_docs and existing_docs['ids'] and len(existing_docs['ids']) > 0:
-                # If we don't have an existing summary, try to generate one
-                if not existing_summary and os.path.exists(file_path):
-                    try:
-                        from .content_extractor import ContentExtractor
-                        content = ContentExtractor.extract_file_content(file_path)
-                        if content:
-                            summary = self.generate_document_summary(file_path, content)
-                            if summary:
-                                metadata['summary'] = summary
-                    except Exception as e:
-                        print(f"Error generating summary during metadata update: {str(e)}")
+                # If we don't have an existing summary, try to generate one                if not existing_summary and os.path.exists(file_path):
+                try:
+                    from .content_extractor import ContentExtractor
+                    # Use the configured PDF extractor preference
+                    pdf_extractor = self.get_pdf_extractor_preference()
+                    content = ContentExtractor.extract_file_content(file_path, pdf_extractor=pdf_extractor)
+                    if content:
+                        summary = self.generate_document_summary(file_path, content)
+                        if summary:
+                            metadata['summary'] = summary
+                except Exception as e:
+                    print(f"Error generating summary during metadata update: {str(e)}")
                 
                 # Update document metadata
                 self.collection.update(
@@ -576,17 +577,20 @@ class VectorSearch:
             for i, file_obj in enumerate(files):
                 if progress_callback:
                     progress = 5 + int((i / total_files) * 90)  # 5-95% for indexing
-                    progress_callback(f"Indexing {i+1}/{total_files}: {file_obj.path}", progress)
-
-                try:
-                    if os.path.exists(file_obj.path):
-                        # Get file content
-                        content = ContentExtractor.extract_file_content(file_obj.path)
-                        if content:
-                            self.index_file(file_obj.path, content)
-                            indexed += 1
-                except Exception as e:
-                    print(f"Error indexing {file_obj.path}: {str(e)}")
+                    progress_callback(f"Indexing {i+1}/{total_files}: {file_obj.path}", progress)                
+                    try:
+                        if os.path.exists(file_obj.path):
+                            # Get the PDF extractor preference
+                            pdf_extractor = self.get_pdf_extractor_preference()
+                            
+                            print(f"Reindexing {file_obj.path} using {pdf_extractor} extraction mode")
+                            # Get file content
+                            content = ContentExtractor.extract_file_content(file_obj.path, pdf_extractor=pdf_extractor)
+                            if content:
+                                self.index_file(file_obj.path, content)
+                                indexed += 1
+                    except Exception as e:
+                        print(f"Error indexing {file_obj.path}: {str(e)}")
 
             if progress_callback:
                 progress_callback(f"Indexed {indexed}/{total_files} files successfully", 95)
@@ -753,3 +757,34 @@ class VectorSearch:
                 
         # If no suitable paragraph found, just take first 150 chars
         return content[:150] + "..." if len(content) > 150 else content
+
+    def get_pdf_extractor_preference(self) -> str:
+        """
+        Get the PDF extractor preference from the configuration.
+        Returns 'fast' or 'accurate' based on the current settings.
+        
+        Returns:
+            str: The PDF extractor preference ('fast' or 'accurate')
+        """
+        # Default to accurate extraction
+        pdf_extractor = 'accurate'
+        
+        # Try to get preference from db_session if it has config attached
+        if hasattr(self.db_session, 'config') and self.db_session.config:
+            pdf_extractor = self.db_session.config.get_pdf_extractor()
+        # Otherwise try to load config directly
+        elif config_module and hasattr(config_module, 'Config'):
+            try:                
+                from password_management import get_password
+                try:
+                    password = get_password()
+                    if password:
+                        cfg = config_module.Config(password)
+                        pdf_extractor = cfg.get_pdf_extractor()
+                except:
+                    # This might be first run where password isn't set yet
+                    pass
+            except Exception as e:
+                print(f"Could not load PDF extractor preference from config: {e}")
+                
+        return pdf_extractor

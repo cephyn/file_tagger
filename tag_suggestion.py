@@ -529,9 +529,17 @@ class TagSuggestionDialog(QDialog):
                         # Mark extraction as complete and accept the dialog
                         self.content_extraction_complete = True
                         self.accept()
+                      # Get the PDF extractor preference from config
+                    pdf_extractor = self.config.get_pdf_extractor()
+                    print(f"Starting async content extraction using {pdf_extractor} mode")
                     
-                    # Start async content extraction
-                    ContentExtractor.extract_file_content_async(self.file_path, on_extraction_complete, on_progress)
+                    # Start async content extraction with the chosen extractor mode
+                    ContentExtractor.extract_file_content_async(
+                        self.file_path, 
+                        on_extraction_complete, 
+                        on_progress,
+                        pdf_extractor=pdf_extractor
+                    )
                     
                     # Return without accepting the dialog - the callback will handle it
                     return
