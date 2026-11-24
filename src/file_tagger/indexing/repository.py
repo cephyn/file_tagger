@@ -1,6 +1,8 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
+import json
 from pathlib import Path
 import struct
 from typing import Any
@@ -10,7 +12,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..domain.errors import IndexTransactionError
 from ..extraction.docling_adapter import ExtractedDocument
-from ..persistence.models import Chunk, Document, File, IndexJob, Page
+from ..persistence.models import (
+    Chunk,
+    Document,
+    File,
+    IndexJob,
+    IndexJobCheckpointChunk,
+    Page,
+)
+from .chunker import DocumentChunk
 from .embedder import EmbeddedChunk
 
 VECTOR_DIMENSIONS = (256, 512, 768)
@@ -27,6 +37,22 @@ class JobState:
     retry_count: int
     revision: int | None
     failure: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class JobCheckpoint:
+    extracted: ExtractedDocument
+    chunks: tuple[DocumentChunk, ...]
+    embedded_chunks: tuple[EmbeddedChunk, ...]
+    processed_count: int
+    total_count: int
+    extraction_version: str
+    model_digest: str
+    index_version: str
+    dimensions: int
+    source_size: int
+    source_mtime_ns: int
+    source_hash: str
 
 
 class IndexingRepository:
@@ -90,13 +116,153 @@ class IndexingRepository:
         *,
         processed_count: int,
         total_count: int,
+        extracted: ExtractedDocument | None = None,
+        chunks: Sequence[DocumentChunk] = (),
+        embedded_chunks: Sequence[EmbeddedChunk] = (),
+        extraction_version: str | None = None,
+        model_digest: str | None = None,
+        index_version: str | None = None,
+        dimensions: int | None = None,
+        source_size: int | None = None,
+        source_mtime_ns: int | None = None,
+        source_hash: str | None = None,
+        source_ordinal: int | None = None,
     ) -> JobState:
         with self._session_factory.begin() as session:
             job = self._job(session, job_id)
             job.processed_count = max(0, processed_count)
             job.total_count = max(0, total_count)
+            if extracted is not None:
+                metadata = (
+                    extraction_version,
+                    model_digest,
+                    index_version,
+                    dimensions,
+                    source_size,
+                    source_mtime_ns,
+                    source_hash,
+                )
+                if any(value is None for value in metadata):
+                    raise IndexTransactionError(
+                        "Incomplete indexing checkpoint metadata."
+                    )
+                session.execute(
+                    delete(IndexJobCheckpointChunk).where(
+                        IndexJobCheckpointChunk.job_id == job.id
+                    )
+                )
+                checkpoint_data = {
+                    "schema_version": 1,
+                    "extracted": extracted.model_dump(mode="json"),
+                    "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+                    "extraction_version": extraction_version,
+                    "model_digest": model_digest,
+                    "index_version": index_version,
+                    "dimensions": dimensions,
+                    "source_size": source_size,
+                    "source_mtime_ns": source_mtime_ns,
+                    "source_hash": source_hash,
+                }
+                job.checkpoint = {
+                    **checkpoint_data,
+                    "checksum": self._checkpoint_checksum(checkpoint_data),
+                }
+            if embedded_chunks:
+                if source_ordinal is None:
+                    raise IndexTransactionError(
+                        "Embedded checkpoint chunks need a source ordinal."
+                    )
+                session.add(
+                    IndexJobCheckpointChunk(
+                        job_id=job.id,
+                        source_ordinal=source_ordinal,
+                        embedded_chunks=[
+                            chunk.model_dump(mode="json")
+                            for chunk in embedded_chunks
+                        ],
+                    )
+                )
             session.flush()
             return self._state(session, job)
+
+    def load_checkpoint(self, job_id: int) -> JobCheckpoint | None:
+        with self._session_factory() as session:
+            payload = self._job(session, job_id).checkpoint
+            if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+                return None
+            checkpoint_data = dict(payload)
+            embedded_rows = list(
+                session.execute(
+                    select(
+                        IndexJobCheckpointChunk.source_ordinal,
+                        IndexJobCheckpointChunk.embedded_chunks,
+                    )
+                    .where(IndexJobCheckpointChunk.job_id == job_id)
+                    .order_by(IndexJobCheckpointChunk.source_ordinal)
+                )
+            )
+            embedded_payloads = [row[1] for row in embedded_rows]
+            try:
+                checksum = checkpoint_data.pop("checksum")
+                if checksum != self._checkpoint_checksum(checkpoint_data):
+                    return None
+                checkpoint = JobCheckpoint(
+                    extracted=ExtractedDocument.model_validate(
+                        checkpoint_data["extracted"]
+                    ),
+                    chunks=tuple(
+                        DocumentChunk.model_validate(item)
+                        for item in checkpoint_data["chunks"]
+                    ),
+                    embedded_chunks=tuple(
+                        EmbeddedChunk.model_validate(item)
+                        for embedded_group in embedded_payloads
+                        for item in embedded_group
+                    ),
+                    processed_count=len(embedded_payloads),
+                    total_count=len(checkpoint_data["chunks"]),
+                    extraction_version=str(checkpoint_data["extraction_version"]),
+                    model_digest=str(checkpoint_data["model_digest"]),
+                    index_version=str(checkpoint_data["index_version"]),
+                    dimensions=int(checkpoint_data["dimensions"]),
+                    source_size=int(checkpoint_data["source_size"]),
+                    source_mtime_ns=int(checkpoint_data["source_mtime_ns"]),
+                    source_hash=str(checkpoint_data["source_hash"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                checkpoint_data.get("schema_version") != 1
+                or [row[0] for row in embedded_rows]
+                != list(range(len(embedded_rows)))
+                or len(embedded_payloads) > len(checkpoint_data["chunks"])
+                or [chunk.ordinal for chunk in checkpoint.chunks]
+                != list(range(checkpoint.total_count))
+                or any(
+                    chunk.content_hash != self._content_hash(chunk.text)
+                    for chunk in checkpoint.chunks
+                )
+                or [chunk.chunk.ordinal for chunk in checkpoint.embedded_chunks]
+                != list(range(len(checkpoint.embedded_chunks)))
+                or any(
+                    len(chunk.vector) != checkpoint.dimensions
+                    for chunk in checkpoint.embedded_chunks
+                )
+                or _merged_spans(chunk.source_span for chunk in checkpoint.chunks[
+                    : checkpoint.processed_count
+                ])
+                != _merged_spans(
+                    chunk.chunk.source_span for chunk in checkpoint.embedded_chunks
+                )
+                or any(
+                    embedded.chunk.content_hash != self._content_hash(
+                        embedded.chunk.text
+                    )
+                    for embedded in checkpoint.embedded_chunks
+                )
+            ):
+                return None
+            return checkpoint
 
     def request_cancellation(self, job_id: int) -> JobState:
         with self._session_factory.begin() as session:
@@ -298,6 +464,12 @@ class IndexingRepository:
             job.status = "completed"
             job.failure = None
             job.processed_count = job.total_count
+            job.checkpoint = None
+            session.execute(
+                delete(IndexJobCheckpointChunk).where(
+                    IndexJobCheckpointChunk.job_id == job.id
+                )
+            )
             job.completed_at = datetime.now(UTC)
             session.flush()
             return self._state(session, job)
@@ -338,5 +510,31 @@ class IndexingRepository:
             failure=dict(job.failure) if job.failure else None,
         )
 
+    @staticmethod
+    def _checkpoint_checksum(payload: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        return sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _content_hash(text: str) -> str:
+        return sha256(text.encode()).hexdigest()
+
 
 IndexRepository = IndexingRepository
+
+
+def _merged_spans(
+    spans: Iterable[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]

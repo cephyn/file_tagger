@@ -35,6 +35,7 @@ def test_new_database_has_unified_search_tables(schema_database: Path) -> None:
         "pages",
         "chunks",
         "index_jobs",
+        "index_job_checkpoint_chunks",
         "model_profiles",
         "chunks_fts",
         "chunk_embeddings_256",

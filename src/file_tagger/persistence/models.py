@@ -222,6 +222,7 @@ class IndexJob(Base):
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     failure: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -232,6 +233,27 @@ class IndexJob(Base):
     )
 
     file: Mapped[File | None] = relationship(back_populates="index_jobs")
+
+
+class IndexJobCheckpointChunk(Base):
+    __tablename__ = "index_job_checkpoint_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "source_ordinal", name="uq_checkpoint_job_source_ordinal"
+        ),
+        CheckConstraint(
+            "source_ordinal >= 0", name="ck_checkpoint_source_ordinal_nonnegative"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("index_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    source_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedded_chunks: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False
+    )
 
 
 class ModelProfileRecord(Base):

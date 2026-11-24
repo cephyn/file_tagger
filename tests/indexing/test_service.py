@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from hashlib import sha256
+import os
 from pathlib import Path
 
 from sqlalchemy import text
@@ -15,8 +17,10 @@ from file_tagger.infrastructure.database import create_session_factory, upgrade_
 @dataclass
 class MutableExtractor:
     document: ExtractedDocument
+    calls: int = 0
 
     def extract(self, file_path: str | Path) -> ExtractedDocument:
+        self.calls += 1
         return self.document
 
 
@@ -33,6 +37,29 @@ class FixedGateway:
         del model, text, truncate, keep_alive
         assert dimensions is not None
         return (tuple(float(index) for index in range(dimensions)),)
+
+
+@dataclass
+class CountingGateway(FixedGateway):
+    texts: list[str]
+
+    async def embed(
+        self,
+        model: str,
+        text: str,
+        *,
+        dimensions: int | None = None,
+        truncate: bool = False,
+        keep_alive: str = "5m",
+    ) -> tuple[tuple[float, ...],]:
+        self.texts.append(text)
+        return await super().embed(
+            model,
+            text,
+            dimensions=dimensions,
+            truncate=truncate,
+            keep_alive=keep_alive,
+        )
 
 
 class SplittingGateway(FixedGateway):
@@ -63,9 +90,10 @@ class FailingExtractor:
 
 
 def extraction(path: Path, *, marker: str, file_hash: str) -> ExtractedDocument:
+    del file_hash
     return ExtractedDocument(
         file_path=str(path),
-        file_hash=file_hash,
+        file_hash=sha256(path.read_bytes()).hexdigest(),
         parser="test",
         parser_version="1",
         status="complete",
@@ -172,10 +200,13 @@ def test_cancellation_checkpoint_resumes_with_retry_count(tmp_path: Path) -> Non
         marker="first source second source",
         file_hash="one",
     )
+    chunker_calls = 0
 
     def two_chunks(
         pages: tuple[ExtractedPage, ...],
     ) -> list[DocumentChunk]:
+        nonlocal chunker_calls
+        chunker_calls += 1
         del pages
         return [
             DocumentChunk(
@@ -184,17 +215,19 @@ def test_cancellation_checkpoint_resumes_with_retry_count(tmp_path: Path) -> Non
                 page_number=1,
                 text=text,
                 source_span=(start, start + len(text)),
-                content_hash=f"hash-{ordinal}",
+                content_hash=sha256(text.encode()).hexdigest(),
             )
             for ordinal, (text, start) in enumerate(
                 (("first source", 0), ("second source", 13))
             )
         ]
 
+    extractor = MutableExtractor(document)
+    gateway = CountingGateway([])
     service = IndexingService(
         repository,
-        extractor=MutableExtractor(document),
-        embedding_gateway=FixedGateway(),
+        extractor=extractor,
+        embedding_gateway=gateway,
         embedding_profile=ModelProfile(
             role="embedding",
             model="embeddinggemma-2:270m",
@@ -228,6 +261,79 @@ def test_cancellation_checkpoint_resumes_with_retry_count(tmp_path: Path) -> Non
     assert completed.retry_count == 1
     assert completed.processed_count == 2
     assert repository.current_revision(source) == 1
+    assert extractor.calls == 1
+    assert chunker_calls == 1
+    assert gateway.texts == ["first source", "second source"]
+
+
+def test_resume_invalidates_checkpoint_when_source_content_changes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "changed-source.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    initial_stat = source.stat()
+    upgrade_database(database)
+    repository = IndexingRepository(create_session_factory(database))
+    extractor = MutableExtractor(
+        extraction(source, marker="first second", file_hash="one")
+    )
+    gateway = CountingGateway([])
+
+    def two_chunks(
+        pages: tuple[ExtractedPage, ...],
+    ) -> list[DocumentChunk]:
+        del pages
+        return [
+            DocumentChunk(
+                stable_id=f"chunk-{ordinal}",
+                ordinal=ordinal,
+                page_number=1,
+                text=text,
+                source_span=(start, start + len(text)),
+                content_hash=sha256(text.encode()).hexdigest(),
+            )
+            for ordinal, (text, start) in enumerate(
+                (("first", 0), ("second", 6))
+            )
+        ]
+
+    service = IndexingService(
+        repository,
+        extractor=extractor,
+        embedding_gateway=gateway,
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+        chunker=two_chunks,
+    )
+    job_id = service.queue(source)
+    checks = 0
+
+    def cancel_after_first_chunk() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    paused = service.resume(job_id, cancellation_check=cancel_after_first_chunk)
+    source.write_text("update", encoding="utf-8")
+    os.utime(source, ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns))
+    extractor.document = extraction(
+        source,
+        marker="first second updated",
+        file_hash="unused",
+    )
+
+    completed = service.resume(job_id)
+
+    assert paused.processed_count == 1
+    assert completed.status == "completed"
+    assert extractor.calls == 2
+    assert gateway.texts == ["first", "first", "second"]
 
 
 def test_cancelled_queued_job_pauses_before_extraction_and_can_resume(

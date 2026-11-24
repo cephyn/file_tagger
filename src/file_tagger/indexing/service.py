@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 import inspect
 from pathlib import Path
 from typing import Any, cast
@@ -14,7 +15,7 @@ from ..domain.errors import (
 from ..extraction.docling_adapter import ExtractedDocument
 from .chunker import DocumentChunk, chunk_document
 from .embedder import EmbeddedChunk, EmbeddingBatchResult, embed_document_chunks
-from .repository import IndexingRepository, JobState
+from .repository import IndexingRepository, JobCheckpoint, JobState
 
 CancellationCheck = Callable[[], bool]
 
@@ -119,25 +120,61 @@ class IndexingService:
             if self._cancelled(job_id, cancellation_check):
                 return IndexingResult.from_state(self._repository.pause(job_id))
 
-            extracted = self._extract(state.file_path)
-            if not isinstance(extracted, ExtractedDocument):
-                raise IndexTransactionError(
-                    "The extractor did not return an extracted document."
-                )
-            if extracted.status == "failed":
-                raise IndexTransactionError(
-                    "Document extraction failed before indexing could continue."
+            checkpoint = self._repository.load_checkpoint(job_id)
+            if self._checkpoint_reusable(state, checkpoint):
+                assert checkpoint is not None
+                extracted = checkpoint.extracted
+                chunks = list(checkpoint.chunks)
+                embedded = list(checkpoint.embedded_chunks)
+                total_count = checkpoint.total_count
+                source_size = checkpoint.source_size
+                source_mtime_ns = checkpoint.source_mtime_ns
+                source_hash = checkpoint.source_hash
+                first_unprocessed = checkpoint.processed_count
+            else:
+                source_signature = self._source_signature(state.file_path)
+                extracted = self._extract(state.file_path)
+                if not isinstance(extracted, ExtractedDocument):
+                    raise IndexTransactionError(
+                        "The extractor did not return an extracted document."
+                    )
+                if extracted.status == "failed":
+                    raise IndexTransactionError(
+                        "Document extraction failed before indexing could continue."
+                    )
+                after_extraction = self._source_signature(state.file_path)
+                if after_extraction != source_signature:
+                    raise IndexTransactionError(
+                        "The source file changed during document extraction."
+                    )
+                if extracted.file_hash != source_signature[2]:
+                    raise IndexTransactionError(
+                        "The extracted source hash does not match the checkpoint source."
+                    )
+
+                chunks = list(self._chunker(extracted.pages))
+                total_count = len(chunks)
+                source_size, source_mtime_ns, source_hash = after_extraction
+                first_unprocessed = 0
+                self._repository.checkpoint(
+                    job_id,
+                    processed_count=0,
+                    total_count=total_count,
+                    extracted=extracted,
+                    chunks=chunks,
+                    extraction_version=self._extraction_version,
+                    model_digest=self._profile.digest,
+                    index_version=self._index_version,
+                    dimensions=self._profile.dimensions,
+                    source_size=source_size,
+                    source_mtime_ns=source_mtime_ns,
+                    source_hash=source_hash,
                 )
 
-            chunks = list(self._chunker(extracted.pages))
-            total_count = len(chunks)
-            self._repository.checkpoint(
-                job_id,
-                processed_count=0,
-                total_count=total_count,
-            )
-
-            for processed_count, chunk in enumerate(chunks, start=1):
+            for processed_count, chunk in enumerate(
+                chunks[first_unprocessed:],
+                start=first_unprocessed + 1,
+            ):
                 if self._cancelled(job_id, cancellation_check):
                     self._repository.checkpoint(
                         job_id,
@@ -163,10 +200,13 @@ class IndexingService:
                             }
                         )
                     )
+                checkpoint_vectors = embedded[-len(result.vectors) :] if result.vectors else ()
                 self._repository.checkpoint(
                     job_id,
                     processed_count=processed_count,
                     total_count=total_count,
+                    embedded_chunks=checkpoint_vectors,
+                    source_ordinal=processed_count - 1,
                 )
 
             if self._cancelled(job_id, cancellation_check):
@@ -174,6 +214,14 @@ class IndexingService:
 
             dimensions = self._profile.dimensions
             assert dimensions is not None
+            if self._source_signature(state.file_path) != (
+                source_size,
+                source_mtime_ns,
+                source_hash,
+            ):
+                raise IndexTransactionError(
+                    "The source file changed before the revision swap."
+                )
             completed = self._repository.replace_revision(
                 job_id,
                 extracted,
@@ -251,6 +299,50 @@ class IndexingService:
         return self._repository.cancellation_requested(job_id) or bool(
             cancellation_check and cancellation_check()
         )
+
+    def _checkpoint_reusable(
+        self,
+        state: JobState,
+        checkpoint: JobCheckpoint | None,
+    ) -> bool:
+        if checkpoint is None:
+            return False
+        dimensions = self._profile.dimensions
+        if (
+            checkpoint.extraction_version != self._extraction_version
+            or checkpoint.model_digest != self._profile.digest
+            or checkpoint.index_version != self._index_version
+            or checkpoint.dimensions != dimensions
+            or checkpoint.processed_count != state.processed_count
+            or checkpoint.total_count != state.total_count
+            or checkpoint.total_count != len(checkpoint.chunks)
+        ):
+            return False
+        source_hash = checkpoint.source_hash
+        try:
+            source = Path(checkpoint.extracted.file_path).expanduser().resolve()
+            current_signature = self._source_signature(str(source))
+        except (OSError, IndexTransactionError):
+            return False
+        return (
+            str(source) == state.file_path
+            and current_signature
+            == (checkpoint.source_size, checkpoint.source_mtime_ns, source_hash)
+        )
+
+    @staticmethod
+    def _source_signature(file_path: str) -> tuple[int, int, str]:
+        source = Path(file_path)
+        before = source.stat()
+        digest = sha256()
+        with source.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        after = source.stat()
+        signature = (after.st_size, after.st_mtime_ns)
+        if signature != (before.st_size, before.st_mtime_ns):
+            raise IndexTransactionError("The source file changed while being read.")
+        return *signature, digest.hexdigest()
 
     @staticmethod
     def _safe_failure(exc: Exception) -> dict[str, str]:
