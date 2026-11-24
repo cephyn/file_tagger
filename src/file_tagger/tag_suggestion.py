@@ -5,16 +5,27 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
 from PySide6.QtCore import Qt, QSize, Signal, QEvent
 from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
+from collections.abc import Sequence
 import mimetypes
 import os
 import random
 from typing import Protocol
 
+from .domain.contracts import TagDecision
 from .models import Tag, File
-from .tagging.decision_service import decide_tags
+from .tagging.decision_service import (
+    MAX_SYSTEM_ONE_QUESTIONS,
+    TagDecisionResult,
+    decide_tags,
+)
+from .vector_search.content_extractor import ContentExtractor
 
 
 MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
+_TRUNCATION_MARKER = "\n[truncated]"
+_STRUCTURED_TEXT_SUBTYPES = frozenset(
+    {"calendar", "csv", "html", "rtf", "sgml", "xml"}
+)
 
 
 class TagSuggestionConfig(Protocol):
@@ -24,12 +35,16 @@ class TagSuggestionConfig(Protocol):
 def _document_state(file_path: str) -> str:
     mime_type, _ = mimetypes.guess_type(file_path)
     stat = os.stat(file_path)
-    try:
-        with open(file_path, "rb") as source:
-            sample = source.read(MAX_DOCUMENT_STATE_SAMPLE_BYTES)
-        content = sample.decode("utf-8", errors="replace").strip()
-    except OSError:
-        content = ""
+    content = ""
+    if _is_plain_text_mime(mime_type):
+        try:
+            with open(file_path, "rb") as source:
+                sample = source.read(MAX_DOCUMENT_STATE_SAMPLE_BYTES)
+            content = sample.decode("utf-8", errors="replace").strip()
+        except OSError:
+            pass
+    else:
+        content = ContentExtractor.extract_file_content(file_path) or ""
     state = (
         f"Filename: {os.path.basename(file_path)}\n"
         f"Type: {mime_type or 'application/octet-stream'}\n"
@@ -37,7 +52,41 @@ def _document_state(file_path: str) -> str:
     )
     if content:
         state += f"\nContent sample:\n{content}"
-    return state
+    return _truncate_utf8(state, MAX_DOCUMENT_STATE_SAMPLE_BYTES)
+
+
+def _is_plain_text_mime(mime_type: str | None) -> bool:
+    if not mime_type:
+        return False
+    media_type, separator, subtype = mime_type.partition("/")
+    return (
+        bool(separator)
+        and media_type == "text"
+        and subtype not in _STRUCTURED_TEXT_SUBTYPES
+    )
+
+
+def _truncate_utf8(value: str, limit: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+
+    marker = _TRUNCATION_MARKER.encode("utf-8")
+    if limit <= len(marker):
+        return marker[:limit].decode("utf-8", errors="ignore")
+    prefix = encoded[: limit - len(marker)].decode("utf-8", errors="ignore").rstrip()
+    return prefix + _TRUNCATION_MARKER
+
+
+def _decide_tags_in_batches(
+    document_state: str,
+    candidates: Sequence[str],
+) -> TagDecisionResult:
+    decisions: list[TagDecision] = []
+    for start in range(0, len(candidates), MAX_SYSTEM_ONE_QUESTIONS):
+        batch = candidates[start : start + MAX_SYSTEM_ONE_QUESTIONS]
+        decisions.extend(decide_tags(document_state, batch).decisions)
+    return TagDecisionResult(decisions=tuple(decisions))
 
 
 class TagSuggester:
@@ -52,7 +101,7 @@ class TagSuggester:
         """
         self.config = config
         
-    def suggest_tags_for_file(self, file_path: str) -> dict:
+    def suggest_tags_for_file(self, file_path: str) -> dict[str, float]:
         """
         Get AI tag suggestions for a single file.
         
@@ -67,10 +116,13 @@ class TagSuggester:
             from .models import init_db
 
             db_session = init_db()
-            existing_tags = [tag.name for tag in db_session.query(Tag).all()]
+            existing_tags = [str(tag.name) for tag in db_session.query(Tag).all()]
             if not existing_tags:
                 return {}
-            result = decide_tags(_document_state(file_path), existing_tags)
+            result = _decide_tags_in_batches(
+                _document_state(file_path),
+                existing_tags,
+            )
             return {
                 decision.tag: decision.confidence
                 for decision in result.accepted
@@ -318,7 +370,9 @@ class TagSuggestionDialog(QDialog):
     def analyze_file(self, force_refresh=False):
         """Analyze the file with the local System One decision model."""
         try:
-            existing_tags = [tag.name for tag in self.db_session.query(Tag).all()]
+            existing_tags = [
+                str(tag.name) for tag in self.db_session.query(Tag).all()
+            ]
             if not existing_tags:
                 QMessageBox.information(
                     self,
@@ -331,7 +385,10 @@ class TagSuggestionDialog(QDialog):
                 "Refreshing local tag decisions" if force_refresh else "Requesting tag decisions",
                 25,
             )
-            result = decide_tags(_document_state(self.file_path), existing_tags)
+            result = _decide_tags_in_batches(
+                _document_state(self.file_path),
+                existing_tags,
+            )
             self.explanation_text = (
                 "Suggestions are based on typed local System One decisions. "
                 "Review confidence before applying a tag."

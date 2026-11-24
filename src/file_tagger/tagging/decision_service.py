@@ -305,7 +305,7 @@ def _parse_score(answer: Any) -> tuple[TagOutcome, float]:
         )
     if not isinstance(probabilities, Mapping):
         raise ValueError("System One score probabilities must be a mapping.")
-    _validated_distribution(
+    checked_probabilities = _validated_distribution(
         probabilities,
         expected_keys,
         "System One score",
@@ -316,6 +316,19 @@ def _parse_score(answer: Any) -> tuple[TagOutcome, float]:
     maximum = float(len(legend) - 1)
     if score < 0 or score > maximum:
         raise ValueError(f"System One score must be between 0 and {maximum:g}.")
+    expected_score = math.fsum(
+        int(level) * checked_probabilities[level] for level in expected_keys
+    )
+    if not math.isclose(
+        score,
+        expected_score,
+        rel_tol=0.0,
+        abs_tol=DISTRIBUTION_TOLERANCE,
+    ):
+        raise ValueError(
+            "System One score does not match the weighted probability score "
+            f"within tolerance {DISTRIBUTION_TOLERANCE:g}."
+        )
     normalized = score / maximum
     decision: TagOutcome
     if normalized < 1.0 / 3.0:

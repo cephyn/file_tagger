@@ -262,6 +262,37 @@ def test_choice_probability_tolerance_accepts_rounding_noise() -> None:
     assert result.accepted[0].confidence == pytest.approx(0.8, abs=1e-6)
 
 
+def test_score_must_match_weighted_level_probabilities() -> None:
+    answer = {
+        "type": "score",
+        "score": 0,
+        "legend": {"0": "no", "1": "yes"},
+        "probabilities": {"0": 0.2, "1": 0.8},
+        "confidence": 0.8,
+    }
+
+    with pytest.raises(ValueError, match="weighted"):
+        decide_tags("document", ["dungeon"], gateway=FakeGateway([answer]))
+
+
+def test_score_tolerance_accepts_weighted_probability_rounding() -> None:
+    answer = {
+        "type": "score",
+        "score": 0.8000005,
+        "legend": {"0": "no", "1": "yes"},
+        "probabilities": {"0": 0.2, "1": 0.8},
+        "confidence": 0.8,
+    }
+
+    result = decide_tags(
+        "document",
+        ["dungeon"],
+        gateway=FakeGateway([answer]),
+    )
+
+    assert result.accepted[0].tag == "dungeon"
+
+
 def test_original_candidate_identity_is_preserved_after_prompt_normalization() -> None:
     gateway = FakeGateway([choice("accept", 1.0)])
 
@@ -418,3 +449,140 @@ def test_batch_tag_suggester_uses_typed_local_decision_service(
     assert calls[0]["candidates"] == ["dungeon", "invoice"]
     assert "flooded ruin" in calls[0]["state"]
     assert session.closed
+
+
+def test_batch_tag_suggester_splits_and_merges_more_than_64_tags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import models, tag_suggestion
+
+    source = tmp_path / "ruin.txt"
+    source.write_text("encounter table for a flooded ruin", encoding="utf-8")
+    existing_tags = [f"candidate-{index}" for index in range(65)]
+
+    class Query:
+        def all(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(name=name) for name in existing_tags]
+
+    class Session:
+        def query(self, model: Any) -> Query:
+            assert model is models.Tag
+            return Query()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(models, "init_db", lambda: Session())
+    calls: list[list[str]] = []
+
+    def fake_decide_tags(
+        document_state: str,
+        candidates: list[str],
+        **kwargs: Any,
+    ) -> TagDecisionResult:
+        del document_state, kwargs
+        calls.append(candidates)
+        return TagDecisionResult(
+            decisions=(
+                TagDecision(
+                    tag=candidates[0],
+                    decision="accept",
+                    confidence=0.9,
+                ),
+            )
+        )
+
+    monkeypatch.setattr(
+        tag_suggestion,
+        "decide_tags",
+        fake_decide_tags,
+        raising=False,
+    )
+
+    suggestions = tag_suggestion.TagSuggester(
+        SimpleNamespace()
+    ).suggest_tags_for_file(str(source))
+
+    assert [len(batch) for batch in calls] == [64, 1]
+    assert calls[0] == existing_tags[:64]
+    assert calls[1] == existing_tags[64:]
+    assert suggestions == {"candidate-0": 0.9, "candidate-64": 0.9}
+
+
+def test_document_state_raw_reads_plain_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+
+    source = tmp_path / "notes.txt"
+    source.write_text("plain text remains useful", encoding="utf-8")
+
+    def unexpected_extraction(file_path: str, **kwargs: Any) -> str:
+        del file_path, kwargs
+        raise AssertionError("plain text must not be sent to Docling")
+
+    monkeypatch.setattr(
+        tag_suggestion.ContentExtractor,
+        "extract_file_content",
+        unexpected_extraction,
+    )
+
+    state = tag_suggestion._document_state(str(source))
+
+    assert "plain text remains useful" in state
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".html", ".json", ".pdf"])
+def test_document_state_extracts_structured_and_non_text_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    from file_tagger import tag_suggestion
+
+    source = tmp_path / f"report{suffix}"
+    source.write_bytes(b"RAW_BINARY_SHOULD_NOT_APPEAR")
+    calls: list[str] = []
+
+    def extract(file_path: str, **kwargs: Any) -> str:
+        del kwargs
+        calls.append(file_path)
+        return "Filename: report\n\n# Extracted document"
+
+    monkeypatch.setattr(
+        tag_suggestion.ContentExtractor,
+        "extract_file_content",
+        extract,
+    )
+
+    state = tag_suggestion._document_state(str(source))
+
+    assert calls == [str(source)]
+    assert "# Extracted document" in state
+    assert "RAW_BINARY_SHOULD_NOT_APPEAR" not in state
+
+
+def test_document_state_is_truncated_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+
+    source = tmp_path / "large.pdf"
+    source.write_bytes(b"%PDF")
+    extracted = "Filename: large.pdf\n\n" + ("😀" * (32 * 1024))
+    monkeypatch.setattr(
+        tag_suggestion.ContentExtractor,
+        "extract_file_content",
+        lambda *args, **kwargs: extracted,
+    )
+
+    state = tag_suggestion._document_state(str(source))
+
+    assert len(state.encode("utf-8")) <= (
+        tag_suggestion.MAX_DOCUMENT_STATE_SAMPLE_BYTES
+    )
+    assert state.endswith("[truncated]")
+    assert "😀" in state
