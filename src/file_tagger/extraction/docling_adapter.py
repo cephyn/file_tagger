@@ -21,6 +21,12 @@ from .quality import (
     extract_headings,
     useful_text_length,
 )
+from .vision_candidates import (
+    VisionCandidate,
+    VisualAugmentationResult,
+    classify_page,
+    select_vision_candidates,
+)
 
 
 ConversionStatus = Literal["complete", "warnings", "failed"]
@@ -43,6 +49,23 @@ class ExtractedPage(BaseModel):
     markdown: str
     headings: tuple[str, ...] = ()
     quality: PageQuality = "good"
+    text_chars: int = Field(default=0, ge=0)
+    image_area: float = Field(default=0, ge=0, le=1)
+    table_area: float = Field(default=0, ge=0, le=1)
+    tables: int = Field(default=0, ge=0)
+    table_structure_valid: bool = True
+
+    @property
+    def vision_candidate(self) -> VisionCandidate:
+        return classify_page(
+            page_number=self.number,
+            text_chars=self.text_chars,
+            image_area=self.image_area,
+            table_area=self.table_area,
+            tables=self.tables,
+            table_structure_valid=self.table_structure_valid,
+            low_quality_text=self.quality in {"degraded", "ocr"},
+        )
 
 
 class ExtractedDocument(BaseModel):
@@ -62,6 +85,15 @@ class ExtractedDocument(BaseModel):
     @property
     def page_count(self) -> int:
         return len(self.pages)
+
+    def classify_visual_augmentation(
+        self,
+        embedding_profile: object,
+    ) -> VisualAugmentationResult:
+        return select_vision_candidates(
+            (page.vision_candidate for page in self.pages),
+            embedding_profile=embedding_profile,
+        )
 
 
 ConverterFactory = Callable[[bool], Any]
@@ -146,10 +178,124 @@ def _page_numbers(document: Any) -> list[int]:
     return []
 
 
+def _page_item(document: Any, page_number: int) -> Any:
+    pages = getattr(document, "pages", {})
+    if not hasattr(pages, "get"):
+        return None
+    return pages.get(page_number) or pages.get(str(page_number))
+
+
+def _items_for_page(
+    document: Any,
+    collection_name: str,
+    page_number: int,
+) -> tuple[Any, ...]:
+    items = getattr(document, collection_name, ())
+    if not isinstance(items, (list, tuple)):
+        return ()
+    return tuple(
+        item
+        for item in items
+        if any(
+            getattr(provenance, "page_no", None) == page_number
+            for provenance in (getattr(item, "prov", ()) or ())
+        )
+    )
+
+
+def _box_area(box: Any) -> float:
+    width = getattr(box, "width", None)
+    height = getattr(box, "height", None)
+    if width is not None and height is not None:
+        return max(0.0, float(width)) * max(0.0, float(height))
+    try:
+        left = float(getattr(box, "l"))
+        right = float(getattr(box, "r"))
+        top = float(getattr(box, "t"))
+        bottom = float(getattr(box, "b"))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, right - left) * max(0.0, abs(top - bottom))
+
+
+def _page_area(document: Any, page_number: int) -> float:
+    page = _page_item(document, page_number)
+    size = getattr(page, "size", None)
+    if size is None:
+        return 0.0
+    try:
+        return max(0.0, float(size.width)) * max(0.0, float(size.height))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _items_area(
+    items: tuple[Any, ...],
+    *,
+    page_number: int,
+) -> float:
+    area = 0.0
+    for item in items:
+        for provenance in getattr(item, "prov", ()) or ():
+            if getattr(provenance, "page_no", None) == page_number:
+                area += _box_area(getattr(provenance, "bbox", None))
+    return area
+
+
+def _coverage_ratio(
+    document: Any,
+    *,
+    page_number: int,
+    items: tuple[Any, ...],
+) -> float:
+    page_area = _page_area(document, page_number)
+    if page_area <= 0:
+        return 0.0
+    return min(1.0, _items_area(items, page_number=page_number) / page_area)
+
+
+def _has_table_structure(markdown: str) -> bool:
+    if "<table" in markdown.casefold():
+        return True
+    lines = [line.strip() for line in markdown.splitlines() if line.strip()]
+    for index, line in enumerate(lines[:-1]):
+        separator = lines[index + 1]
+        if "|" in line and "|" in separator and all(
+            character in "|-: " for character in separator
+        ):
+            return True
+    return False
+
+
+def _page_layout_metrics(
+    document: Any,
+    *,
+    page_number: int,
+    markdown: str,
+) -> tuple[float, float, int, bool]:
+    tables = _items_for_page(document, "tables", page_number)
+    pictures = _items_for_page(document, "pictures", page_number)
+    if not pictures:
+        pictures = _items_for_page(document, "images", page_number)
+    return (
+        _coverage_ratio(document, page_number=page_number, items=pictures),
+        _coverage_ratio(document, page_number=page_number, items=tables),
+        len(tables),
+        not tables or _has_table_structure(markdown),
+    )
+
+
 def _extract_pages(document: Any, *, used_ocr: bool) -> tuple[ExtractedPage, ...]:
     numbers = _page_numbers(document)
     if not numbers:
         markdown = str(document.export_to_markdown() or "")
+        image_area, table_area, tables, table_structure_valid = (
+            _page_layout_metrics(
+                document,
+                page_number=1,
+                markdown=markdown,
+            )
+        )
         return (
             ExtractedPage(
                 number=1,
@@ -157,6 +303,11 @@ def _extract_pages(document: Any, *, used_ocr: bool) -> tuple[ExtractedPage, ...
                 text=markdown,
                 markdown=markdown,
                 headings=extract_headings(markdown),
+                text_chars=useful_text_length(markdown),
+                image_area=image_area,
+                table_area=table_area,
+                tables=tables,
+                table_structure_valid=table_structure_valid,
                 quality=(
                     "ocr"
                     if used_ocr
@@ -174,6 +325,13 @@ def _extract_pages(document: Any, *, used_ocr: bool) -> tuple[ExtractedPage, ...
         quality: PageQuality = "ocr" if used_ocr else "good"
         if useful_text_length(markdown) < MINIMUM_PAGE_TEXT_CHARS:
             quality = "degraded" if not used_ocr else "ocr"
+        image_area, table_area, tables, table_structure_valid = (
+            _page_layout_metrics(
+                document,
+                page_number=number,
+                markdown=markdown,
+            )
+        )
         pages.append(
             ExtractedPage(
                 number=number,
@@ -182,6 +340,11 @@ def _extract_pages(document: Any, *, used_ocr: bool) -> tuple[ExtractedPage, ...
                 markdown=markdown,
                 headings=extract_headings(markdown),
                 quality=quality,
+                text_chars=useful_text_length(markdown),
+                image_area=image_area,
+                table_area=table_area,
+                tables=tables,
+                table_structure_valid=table_structure_valid,
             )
         )
     return tuple(pages)
