@@ -47,6 +47,12 @@ class ModelProfile(DomainRecord):
     measured_latency_ms: float | None = Field(default=None, ge=0)
     measured_memory_bytes: int | None = Field(default=None, ge=0)
 
+    @property
+    def default_index_version(self) -> str | None:
+        if self.dimensions is None:
+            return None
+        return f"{self.model}@{self.digest}:{self.dimensions}"
+
     @field_validator("model")
     @classmethod
     def reject_cloud_model(cls, model: str) -> str:

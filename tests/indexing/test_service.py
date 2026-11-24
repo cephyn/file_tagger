@@ -17,7 +17,8 @@ from file_tagger.indexing.chunker import DocumentChunk
 from file_tagger.indexing.repository import IndexingRepository
 from file_tagger.indexing.service import IndexingService
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
-from file_tagger.persistence.models import Chunk
+from file_tagger.persistence.models import Chunk, File
+from file_tagger.search.hybrid import HybridSearch
 
 
 @dataclass
@@ -177,6 +178,60 @@ def test_identical_files_receive_distinct_stable_chunk_ids(tmp_path: Path) -> No
         stable_ids = list(session.scalars(select(Chunk.stable_id)))
     assert len(stable_ids) == 2
     assert len(set(stable_ids)) == 2
+
+
+def test_indexed_file_mime_type_supports_filtered_hybrid_search(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "mime-search.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    repository = IndexingRepository(session_factory)
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=1_000,
+        dimensions=256,
+    )
+    service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="unicorn habitat", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=profile,
+    )
+
+    service.queue(source)
+    with session_factory.begin() as session:
+        file = session.scalar(select(File))
+        assert file is not None
+        assert file.mime_type == "text/markdown"
+        file.mime_type = "application/octet-stream"
+
+    indexed = service.reindex(source)
+
+    assert indexed.status == "completed"
+    embedding = tuple(float(index) for index in range(256))
+    with session_factory() as session:
+        file = session.scalar(select(File))
+        assert file is not None
+        assert file.mime_type == "text/markdown"
+        assert file.content_hash == sha256(source.read_bytes()).hexdigest()
+        assert file.size_bytes == source.stat().st_size
+        assert file.mtime_ns == source.stat().st_mtime_ns
+        results = HybridSearch(session).search(
+            "friendly woodland creature",
+            embedding,
+            embedding_profile=profile,
+            file_type="text/markdown",
+        )
+    assert len(results) == 1
+    assert results[0].file_path == str(source.resolve())
+    assert results[0].source == "vector"
 
 
 def test_job_claim_is_exclusive_and_stale_owner_cannot_mutate_completion(

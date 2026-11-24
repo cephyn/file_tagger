@@ -77,10 +77,10 @@ class IndexingService:
         self._embedder = embedder
         self._profile = selected_profile
         self._extraction_version = extraction_version
-        self._index_version = index_version or (
-            f"{selected_profile.model}@{selected_profile.digest}:"
-            f"{selected_profile.dimensions}"
-        )
+        selected_index_version = index_version or selected_profile.default_index_version
+        if selected_index_version is None:
+            raise ValueError("The embedding profile must have dimensions.")
+        self._index_version = selected_index_version
         self._chunker = chunker
         if recover_on_startup:
             self.recover_abandoned()

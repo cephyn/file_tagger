@@ -17,6 +17,8 @@ from file_tagger.search.results import (
 )
 
 DIMENSIONS = 256
+MODEL_DIGEST = "sha256:test"
+INDEX_VERSION = "test-v1"
 
 
 def _vector(*values: float) -> tuple[float, ...]:
@@ -193,7 +195,12 @@ def test_hybrid_search_hydrates_one_cited_result_per_file(
             session.add(FileTag(file_id=file.id, tag_id=tag.id))
         session.commit()
 
-        results = HybridSearch(session).search("adventure", _vector(1.0, 0.0))
+        results = HybridSearch(session).search(
+            "adventure",
+            _vector(1.0, 0.0),
+            model_digest=MODEL_DIGEST,
+            index_version=INDEX_VERSION,
+        )
 
         assert len(results) == 1
         result = results[0]
@@ -205,7 +212,12 @@ def test_hybrid_search_hydrates_one_cited_result_per_file(
         assert headings == [
             section.heading
             for section in HybridSearch(session)
-            .search("adventure", _vector(1.0, 0.0))[0]
+            .search(
+                "adventure",
+                _vector(1.0, 0.0),
+                model_digest=MODEL_DIGEST,
+                index_version=INDEX_VERSION,
+            )[0]
             .matched_sections
         ]
         assert {citation.chunk_id for citation in result.citations} == {

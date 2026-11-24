@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import mimetypes
 from pathlib import Path
 import struct
 from typing import Any, cast
@@ -90,11 +91,13 @@ class IndexingRepository:
             if file is None:
                 file = File(
                     canonical_path=canonical_path,
+                    mime_type=self._mime_type(canonical_path),
                     indexing_state="queued",
                 )
                 session.add(file)
                 session.flush()
             else:
+                file.mime_type = self._mime_type(canonical_path)
                 file.indexing_state = "queued"
             job = IndexJob(
                 file_id=file.id,
@@ -562,6 +565,7 @@ class IndexingRepository:
             file.indexing_state = "indexed"
             file.size_bytes = source_size
             file.mtime_ns = source_mtime_ns
+            file.mime_type = self._mime_type(canonical_path)
 
             job.status = "completed"
             job.lease_token = None
@@ -581,6 +585,10 @@ class IndexingRepository:
     @staticmethod
     def _canonical_path(file_path: str | Path) -> str:
         return str(Path(file_path).expanduser().resolve())
+
+    @staticmethod
+    def _mime_type(file_path: str) -> str | None:
+        return mimetypes.guess_type(file_path, strict=False)[0]
 
     @staticmethod
     def _vector_bytes(vector: Sequence[float]) -> bytes:

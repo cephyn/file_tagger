@@ -16,6 +16,8 @@ from file_tagger.search.hybrid import (
 from file_tagger.search.rrf import FusedHit, reciprocal_rank_fusion
 
 DIMENSIONS = 256
+MODEL_DIGEST = "sha256:test"
+INDEX_VERSION = "test-v1"
 
 
 def _vector(*values: float) -> tuple[float, ...]:
@@ -34,6 +36,8 @@ def _seed_chunk(
     page_number: int = 1,
     heading: str | None = None,
     revision: int = 1,
+    model_digest: str = "sha256:test",
+    index_version: str = "test-v1",
 ) -> None:
     canonical_path = str(path.resolve())
     file = session.scalar(select(File).where(File.canonical_path == canonical_path))
@@ -111,8 +115,8 @@ def _seed_chunk(
         heading=heading,
         section=heading,
         content_hash=f"content-{stable_id}",
-        model_digest="sha256:test",
-        index_version="test-v1",
+        model_digest=model_digest,
+        index_version=index_version,
     )
     session.add(chunk)
     session.flush()
@@ -188,6 +192,8 @@ def test_exact_term_recall_and_citation_metadata(
     result = HybridSearch(search_session).search(
         "Orion launch identifier",
         _vector(1.0, 0.0),
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
     )
 
     assert result[0].chunk_id == "orion-exact"
@@ -219,10 +225,81 @@ def test_semantic_recall_works_without_lexical_match(
     result = HybridSearch(search_session).search(
         "friendly woodland creature",
         _vector(0.99, 0.01),
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
     )
 
     assert result[0].chunk_id == "animal-semantic"
     assert result[0].source == "vector"
+
+
+def test_vector_search_without_identity_keeps_only_lexical_results(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "lexical.md",
+        stable_id="lexical-only",
+        text_value="The literal needle appears here.",
+        vector=_vector(0.0, 1.0),
+    )
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "semantic.md",
+        stable_id="semantic-only",
+        text_value="A semantically related document.",
+        vector=_vector(1.0, 0.0),
+    )
+    search_session.commit()
+
+    result = HybridSearch(search_session).search("needle", _vector(1.0, 0.0))
+
+    assert [candidate.chunk_id for candidate in result] == ["lexical-only"]
+    assert result[0].source == "fts"
+
+
+@pytest.mark.parametrize(
+    ("model_digest", "index_version"),
+    [
+        ("sha256:other-model", "test-v1"),
+        ("sha256:test", "test-v2"),
+    ],
+)
+def test_vector_search_excludes_same_dimension_different_identity(
+    search_session: Session,
+    tmp_path: Path,
+    model_digest: str,
+    index_version: str,
+) -> None:
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "different-identity.md",
+        stable_id="different-identity",
+        text_value="nearest result from another index",
+        vector=_vector(1.0, 0.0),
+        model_digest=model_digest,
+        index_version=index_version,
+    )
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "eligible.md",
+        stable_id="eligible-identity",
+        text_value="semantically close eligible result",
+        vector=_vector(0.9, 0.1),
+        model_digest="sha256:test",
+        index_version="test-v1",
+    )
+    search_session.commit()
+
+    result = HybridSearch(search_session, candidate_limit=1).search(
+        "quasar ziggurat nebula",
+        _vector(1.0, 0.0),
+        model_digest="sha256:test",
+        index_version="test-v1",
+    )
+
+    assert [candidate.chunk_id for candidate in result] == ["eligible-identity"]
 
 
 def test_mixed_search_preserves_lexical_and_vector_only_hits(
@@ -252,7 +329,12 @@ def test_mixed_search_preserves_lexical_and_vector_only_hits(
     )
     search_session.commit()
 
-    result = HybridSearch(search_session).search("needle", _vector(1.0, 0.0))
+    result = HybridSearch(search_session).search(
+        "needle",
+        _vector(1.0, 0.0),
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
+    )
 
     assert result[0].chunk_id == "shared"
     assert {candidate.chunk_id for candidate in result} == {
@@ -328,6 +410,8 @@ def test_search_applies_tag_path_and_type_filters_in_sql(
         tags=("work", "atlas"),
         path=str(reports),
         file_type="pdf",
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
     )
 
     assert [candidate.chunk_id for candidate in result] == ["wanted"]
@@ -367,6 +451,8 @@ def test_unicode_filters_match_lexical_and_vector_rankings(
         tags=("STRASSE",),
         path="strasse",
         file_type=file_type,
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
     )
 
     assert [candidate.chunk_id for candidate in result] == ["unicode-match"]
@@ -442,6 +528,8 @@ def test_vector_filters_are_applied_before_the_nearest_neighbor_limit(
         "unsearchable semantic phrase",
         _vector(1.0, 0.0),
         tags=("work",),
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
     )
 
     assert [candidate.chunk_id for candidate in result] == ["eligible"]
@@ -462,13 +550,19 @@ def test_search_pins_one_revision_snapshot_across_all_queries(
     )
     search_session.commit()
 
-    search = HybridSearch(search_session)
+    search = HybridSearch(
+        search_session,
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
+    )
     original_vector_rankings = search._vector_rankings
     revision_swapped = False
 
     def swap_revision_before_vector(
         query_embedding: tuple[float, ...],
         filters: SearchFilters,
+        model_digest: str,
+        index_version: str,
     ) -> tuple[str, ...]:
         nonlocal revision_swapped
         if not revision_swapped:
@@ -483,7 +577,12 @@ def test_search_pins_one_revision_snapshot_across_all_queries(
                     revision=2,
                 )
                 writer.commit()
-        return original_vector_rankings(query_embedding, filters)
+        return original_vector_rankings(
+            query_embedding,
+            filters,
+            model_digest,
+            index_version,
+        )
 
     monkeypatch.setattr(search, "_vector_rankings", swap_revision_before_vector)
 
@@ -552,7 +651,12 @@ def test_file_grouping_suppresses_duplicate_file_chunks(
     )
     search_session.commit()
 
-    result = HybridSearch(search_session).search("needle", _vector(1.0, 0.0))
+    result = HybridSearch(search_session).search(
+        "needle",
+        _vector(1.0, 0.0),
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
+    )
 
     assert len(result) == 2
     assert len({candidate.file_path for candidate in result}) == len(result)

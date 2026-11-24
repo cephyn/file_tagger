@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
+from ..domain.contracts import ModelProfile
 from ..infrastructure.database import normalize_unicode_key
 from .results import SearchResult, make_result, merge_results
 from .rrf import FusedHit, reciprocal_rank_fusion
@@ -53,6 +54,10 @@ class HybridSearch:
         *,
         candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
         rrf_k: int = DEFAULT_RRF_K,
+        model_digest: str | None = None,
+        index_version: str | None = None,
+        embedding_profile: ModelProfile | None = None,
+        profile: ModelProfile | None = None,
     ) -> None:
         if candidate_limit <= 0:
             raise ValueError("The candidate limit must be positive.")
@@ -61,6 +66,9 @@ class HybridSearch:
         self._session = session
         self._candidate_limit = candidate_limit
         self._rrf_k = rrf_k
+        self._model_digest = model_digest
+        self._index_version = index_version
+        self._profile = embedding_profile or profile
 
     def search(
         self,
@@ -73,6 +81,10 @@ class HybridSearch:
         file_types: Sequence[str] = (),
         filters: SearchFilters | None = None,
         limit: int = 10,
+        model_digest: str | None = None,
+        index_version: str | None = None,
+        embedding_profile: ModelProfile | None = None,
+        profile: ModelProfile | None = None,
     ) -> tuple[SearchResult, ...]:
         if limit < 0:
             raise ValueError("The result limit cannot be negative.")
@@ -99,10 +111,19 @@ class HybridSearch:
 
             embedding = tuple(query_embedding or ())
             if embedding:
-                rankings["vector"] = self._vector_rankings(
+                identity = self._vector_identity(
                     embedding,
-                    selected_filters,
+                    model_digest=model_digest,
+                    index_version=index_version,
+                    embedding_profile=embedding_profile,
+                    profile=profile,
                 )
+                if identity is not None:
+                    rankings["vector"] = self._vector_rankings(
+                        embedding,
+                        selected_filters,
+                        *identity,
+                    )
 
             fused = reciprocal_rank_fusion(rankings, k=self._rrf_k)
             if not fused:
@@ -145,6 +166,8 @@ class HybridSearch:
         self,
         query_embedding: tuple[float, ...],
         filters: SearchFilters,
+        model_digest: str,
+        index_version: str,
     ) -> tuple[str, ...]:
         dimensions = len(query_embedding)
         if dimensions not in VECTOR_DIMENSIONS:
@@ -160,6 +183,8 @@ class HybridSearch:
                     f"<{dimensions}f",
                     *query_embedding,
                 ),
+                "model_digest": model_digest,
+                "index_version": index_version,
                 "candidate_limit": self._candidate_limit,
             }
         )
@@ -173,6 +198,8 @@ class HybridSearch:
                     JOIN documents AS d ON d.id = c.document_id
                     JOIN files AS f ON f.id = d.file_id
                     WHERE {conditions}
+                      AND c.model_digest = :model_digest
+                      AND c.index_version = :index_version
                 ),
                 nearest AS (
                     SELECT chunk_id, distance
@@ -191,6 +218,36 @@ class HybridSearch:
             parameters,
         ).mappings()
         return tuple(str(row["stable_id"]) for row in rows)
+
+    def _vector_identity(
+        self,
+        query_embedding: tuple[float, ...],
+        *,
+        model_digest: str | None,
+        index_version: str | None,
+        embedding_profile: ModelProfile | None,
+        profile: ModelProfile | None,
+    ) -> tuple[str, str] | None:
+        selected_profile = embedding_profile or profile or self._profile
+        selected_digest = model_digest or self._model_digest
+        selected_version = index_version or self._index_version
+        if selected_profile is not None:
+            if selected_profile.role != "embedding":
+                return None
+            if selected_profile.dimensions is None:
+                return None
+            if selected_digest is not None and selected_digest != selected_profile.digest:
+                raise ValueError("The query embedding digest does not match its profile.")
+            if len(query_embedding) != selected_profile.dimensions:
+                raise ValueError(
+                    "The query embedding dimension does not match its profile."
+                )
+            selected_digest = selected_profile.digest
+            profile_version = selected_profile.default_index_version
+            selected_version = selected_version or profile_version
+        if not selected_digest or not selected_version:
+            return None
+        return selected_digest, selected_version
 
     def _hydrate_candidates(
         self,
@@ -281,11 +338,19 @@ def hybrid_search(
     limit: int = 10,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
     rrf_k: int = DEFAULT_RRF_K,
+    model_digest: str | None = None,
+    index_version: str | None = None,
+    embedding_profile: ModelProfile | None = None,
+    profile: ModelProfile | None = None,
 ) -> tuple[SearchResult, ...]:
     return HybridSearch(
         session,
         candidate_limit=candidate_limit,
         rrf_k=rrf_k,
+        model_digest=model_digest,
+        index_version=index_version,
+        embedding_profile=embedding_profile,
+        profile=profile,
     ).search(
         query,
         query_embedding,
