@@ -177,7 +177,37 @@ def test_recommendations_are_cache_hits_without_repeating_model_requests() -> No
     assert second == first
     assert len(gateway.chat_calls) == 1
     assert len(gateway.decision_calls) == 1
-    assert len(search.calls) == 1
+    assert len(search.calls) == 2
+
+
+def test_changed_tag_catalog_invalidates_cache_while_same_catalog_hits() -> None:
+    search = FakeSearch(["Research", "invoice"])
+    gateway = FakeGateway(["quarterly"])
+    cache = InMemoryTagRecommendationCache()
+    kwargs = {
+        "file_hash": "abc123",
+        "extraction_version": "docling-v1",
+        "search": search,
+        "gateway": gateway,
+        "cache": cache,
+        "candidate_model_digest": "generation-v1",
+        "decision_model_digest": "decision-v1",
+    }
+
+    first = recommend_tags("research invoice", **kwargs)
+    second = recommend_tags("research invoice", **kwargs)
+    search.tags = (" INVOICE ", "research")
+    normalized_duplicate = recommend_tags("research invoice", **kwargs)
+    search.tags = ("research", "finance")
+    changed_catalog = recommend_tags("research invoice", **kwargs)
+
+    assert second == first
+    assert normalized_duplicate == first
+    assert changed_catalog != first
+    assert changed_catalog.candidate_set_digest != first.candidate_set_digest
+    assert len(search.calls) == 4
+    assert len(gateway.chat_calls) == 2
+    assert len(gateway.decision_calls) == 2
 
 
 def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
@@ -187,6 +217,7 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
         extraction_version="docling-v1",
         candidate_model_digest="candidate-v1",
         decision_model_digest="decision-v1",
+        candidate_set_digest="catalog-v1",
         decisions=(),
     )
     cache.store(stored)
@@ -197,6 +228,7 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
             extraction_version="docling-v1",
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
         )
         == stored
     )
@@ -206,6 +238,7 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
             extraction_version="docling-v2",
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
         )
         is None
     )
@@ -215,6 +248,17 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
             extraction_version="docling-v1",
             candidate_model_digest="candidate-v2",
             decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v2",
         )
         is None
     )
@@ -242,6 +286,7 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
                 extraction_version="docling-v1",
                 candidate_model_digest="candidate-v1",
                 decision_model_digest="decision-v1",
+                candidate_set_digest="catalog-v1",
                 decisions=(
                     TagDecision(
                         tag="research",
@@ -259,6 +304,7 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
             extraction_version="docling-v1",
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
         )
         columns = {column["name"] for column in inspect(session.get_bind()).get_columns(
             "tag_suggestion_cache"
@@ -277,6 +323,7 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
         "extraction_version",
         "candidate_model_digest",
         "decision_model_digest",
+        "candidate_set_digest",
     } <= columns
 
 

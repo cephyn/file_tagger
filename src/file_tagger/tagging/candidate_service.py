@@ -1,6 +1,8 @@
 import asyncio
 from collections.abc import Coroutine, Mapping, Sequence
+import hashlib
 import inspect
+import json
 from typing import Any, Protocol, TypeVar
 import unicodedata
 
@@ -155,6 +157,16 @@ async def recommend_tags_async(
     selected_gateway: CandidateGateway = gateway or OllamaGateway()
     selected_decision_gateway = decision_gateway or selected_gateway
     try:
+        existing = _semantic_existing_tags(
+            search,
+            document_state,
+            limit=semantic_limit,
+            query_embedding=query_embedding,
+            embedding_model_digest=embedding_model_digest,
+            embedding_index_version=embedding_index_version,
+            embedding_profile=embedding_profile,
+        )
+        candidate_set_digest = _candidate_set_digest(existing)
         resolved_candidate_digest = await _model_digest(
             selected_gateway,
             role="generation",
@@ -173,19 +185,11 @@ async def recommend_tags_async(
                 extraction_version=extraction_version,
                 candidate_model_digest=resolved_candidate_digest,
                 decision_model_digest=resolved_decision_digest,
+                candidate_set_digest=candidate_set_digest,
             )
             if cached is not None:
                 return cached
 
-        existing = _semantic_existing_tags(
-            search,
-            document_state,
-            limit=semantic_limit,
-            query_embedding=query_embedding,
-            embedding_model_digest=embedding_model_digest,
-            embedding_index_version=embedding_index_version,
-            embedding_profile=embedding_profile,
-        )
         available_for_generation = max_candidates - len(existing)
         generated: tuple[str, ...] = ()
         if available_for_generation > 0:
@@ -231,6 +235,7 @@ async def recommend_tags_async(
             extraction_version=extraction_version,
             candidate_model_digest=resolved_candidate_digest,
             decision_model_digest=resolved_decision_digest,
+            candidate_set_digest=candidate_set_digest,
             decisions=decisions,
         )
         if cache is not None:
@@ -391,6 +396,12 @@ def _semantic_existing_tags(
             seen.add(key)
             tags.append(normalized)
     return tuple(tags)
+
+
+def _candidate_set_digest(tags: Sequence[str]) -> str:
+    normalized = sorted({_tag_key(tag) for tag in tags})
+    canonical = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 async def _generate_candidates(

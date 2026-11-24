@@ -21,6 +21,7 @@ class CachedTagRecommendations(DomainRecord):
     extraction_version: str | None = Field(default=None, min_length=1)
     candidate_model_digest: str | None = Field(default=None, min_length=1)
     decision_model_digest: str | None = Field(default=None, min_length=1)
+    candidate_set_digest: str | None = Field(default=None, min_length=1)
     model_digest: str | None = Field(default=None, min_length=1)
     decisions: tuple[TagDecision, ...] = Field(
         default=(),
@@ -84,6 +85,7 @@ class TagRecommendationCache(Protocol):
         extraction_version: str | None = None,
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
+        candidate_set_digest: str | None = None,
         model_digest: str | None = None,
     ) -> CachedTagRecommendations | None: ...
 
@@ -101,6 +103,7 @@ class InMemoryTagRecommendationCache:
         extraction_version: str | None = None,
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
+        candidate_set_digest: str | None = None,
         model_digest: str | None = None,
     ) -> CachedTagRecommendations | None:
         if not file_hash:
@@ -112,6 +115,7 @@ class InMemoryTagRecommendationCache:
                 extraction_version=extraction_version,
                 candidate_model_digest=candidate_model_digest,
                 decision_model_digest=decision_model_digest,
+                candidate_set_digest=candidate_set_digest,
                 model_digest=model_digest,
             ):
                 return stored
@@ -138,6 +142,7 @@ class DatabaseTagRecommendationCache:
         extraction_version: str | None = None,
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
+        candidate_set_digest: str | None = None,
         model_digest: str | None = None,
     ) -> CachedTagRecommendations | None:
         if not file_hash:
@@ -158,6 +163,10 @@ class DatabaseTagRecommendationCache:
         if selected_decision is not None:
             statement = statement.where(
                 TagSuggestionCache.decision_model_digest == selected_decision
+            )
+        if candidate_set_digest is not None:
+            statement = statement.where(
+                TagSuggestionCache.candidate_set_digest == candidate_set_digest
             )
         row = self._session.scalars(
             statement.order_by(TagSuggestionCache.cached_at.desc()).limit(1)
@@ -186,6 +195,7 @@ class DatabaseTagRecommendationCache:
                 extraction_version=stored.extraction_version,
                 candidate_model_digest=stored.effective_candidate_model_digest,
                 decision_model_digest=stored.effective_decision_model_digest,
+                candidate_set_digest=stored.candidate_set_digest,
                 cached_at=stored.cached_at,
                 suggestions=payload,
             )
@@ -196,6 +206,7 @@ class DatabaseTagRecommendationCache:
             row.extraction_version = stored.extraction_version
             row.candidate_model_digest = stored.effective_candidate_model_digest
             row.decision_model_digest = stored.effective_decision_model_digest
+            row.candidate_set_digest = stored.candidate_set_digest
             row.cached_at = stored.cached_at
             row.suggestions = payload
         self._session.flush()
@@ -247,6 +258,7 @@ def _same_identity(
             == right.effective_candidate_model_digest,
             left.effective_decision_model_digest
             == right.effective_decision_model_digest,
+            left.candidate_set_digest == right.candidate_set_digest,
         )
     )
 
@@ -258,6 +270,7 @@ def _matches(
     extraction_version: str | None,
     candidate_model_digest: str | None,
     decision_model_digest: str | None,
+    candidate_set_digest: str | None,
     model_digest: str | None,
 ) -> bool:
     if stored.file_hash != file_hash:
@@ -272,6 +285,9 @@ def _matches(
             return False
     if selected_decision is not None:
         if stored.effective_decision_model_digest != selected_decision:
+            return False
+    if candidate_set_digest is not None:
+        if stored.candidate_set_digest != candidate_set_digest:
             return False
     return True
 
@@ -288,6 +304,7 @@ def _database_payload(row: TagSuggestionCache) -> dict[str, Any] | None:
             "extraction_version": row.extraction_version,
             "candidate_model_digest": row.candidate_model_digest,
             "decision_model_digest": row.decision_model_digest,
+            "candidate_set_digest": row.candidate_set_digest,
             "cached_at": row.cached_at,
         }
     )

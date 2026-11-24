@@ -103,6 +103,7 @@ class TagSuggestionCache(Base):
     extraction_version: Mapped[str | None] = mapped_column(String(64))
     candidate_model_digest: Mapped[str | None] = mapped_column(String(255))
     decision_model_digest: Mapped[str | None] = mapped_column(String(255))
+    candidate_set_digest: Mapped[str | None] = mapped_column(String(64))
     suggestions: Mapped[dict[str, Any] | list[Any]] = mapped_column(
         JSON, nullable=False
     )
