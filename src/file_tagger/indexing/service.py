@@ -1,10 +1,10 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from hashlib import sha256
 import inspect
 from pathlib import Path
-from threading import Event, Thread
 from typing import Any, TypeVar, cast
 
 from ..domain.contracts import ModelProfile
@@ -307,22 +307,23 @@ class IndexingService:
         lease_token: str,
         operation: Callable[[], T],
     ) -> T:
-        stop = Event()
-
-        def renew_lease() -> None:
-            while not stop.wait(self._repository.heartbeat_interval):
+        interval = self._repository.heartbeat_interval
+        self._repository.heartbeat(job_id, lease_token=lease_token)
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="indexing-operation",
+        ) as executor:
+            future = executor.submit(operation)
+            while True:
                 try:
+                    result = future.result(timeout=interval)
+                    break
+                except TimeoutError:
+                    if future.done():
+                        raise
                     self._repository.heartbeat(job_id, lease_token=lease_token)
-                except IndexTransactionError:
-                    return
-
-        worker = Thread(target=renew_lease, name="indexing-lease-heartbeat", daemon=True)
-        worker.start()
-        try:
-            return operation()
-        finally:
-            stop.set()
-            worker.join()
+        self._repository.heartbeat(job_id, lease_token=lease_token)
+        return result
 
     def _extract(self, file_path: str) -> ExtractedDocument:
         extract = getattr(self._extractor, "extract", self._extractor)

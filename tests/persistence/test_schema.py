@@ -177,3 +177,30 @@ def test_tag_cache_parameter_migration_invalidates_existing_rows(
     assert "max_candidates" in columns
     assert "confirmation_threshold" in columns
     assert row == ("abc123", None, None, None)
+
+
+def test_tag_cache_identity_migration_adds_document_state_digest(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "tag-cache-v8.sqlite3"
+    config_path = Path(__file__).resolve().parents[2] / "alembic.ini"
+    config = Config(str(config_path))
+    config.attributes["database_path"] = database_path
+    command.upgrade(config, "0008_tag_cache_params")
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(tag_suggestion_cache)")
+        }
+        index_columns = [
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(ix_tag_suggestion_cache_identity)"
+            )
+        ]
+
+    assert "document_state_digest" in columns
+    assert "file_path" in index_columns
+    assert "document_state_digest" in index_columns

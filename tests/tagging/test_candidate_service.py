@@ -182,6 +182,72 @@ def test_recommendations_are_cache_hits_without_repeating_model_requests() -> No
     assert len(search.calls) == 2
 
 
+def test_force_refresh_bypasses_cache_and_replaces_persistent_result() -> None:
+    search = FakeSearch(["Research"])
+    gateway = FakeGateway(["invoice"])
+    cache = InMemoryTagRecommendationCache()
+    kwargs = {
+        "file_hash": "abc123",
+        "file_path": r"C:\docs\report.md",
+        "extraction_version": "docling-v1",
+        "search": search,
+        "gateway": gateway,
+        "cache": cache,
+        "candidate_model_digest": "generation-old",
+        "decision_model_digest": "decision-old",
+    }
+
+    first = recommend_tags("research report", **kwargs)
+    second = recommend_tags("research report", force_refresh=True, **kwargs)
+
+    assert len(gateway.chat_calls) == 2
+    assert len(gateway.decision_calls) == 2
+    assert second.cached_at >= first.cached_at
+    assert cache.lookup(
+        "abc123",
+        file_path=r"C:\docs\report.md",
+        extraction_version="docling-v1",
+        candidate_model_digest="generation-old",
+        decision_model_digest="decision-old",
+        document_state_digest=second.document_state_digest,
+    ) == second
+
+
+def test_cache_does_not_cross_target_file_boundaries_with_duplicate_content() -> None:
+    search = FakeSearch(["Research"])
+    gateway = FakeGateway(["invoice"])
+    cache = InMemoryTagRecommendationCache()
+
+    first = recommend_tags(
+        "Filename: first.md\nreport",
+        file_hash="same-content",
+        file_path=r"C:\docs\first.md",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        candidate_model_digest="generation-old",
+        decision_model_digest="decision-old",
+    )
+    second = recommend_tags(
+        "Filename: second.md\nreport",
+        file_hash="same-content",
+        file_path=r"C:\docs\second.md",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        candidate_model_digest="generation-old",
+        decision_model_digest="decision-old",
+    )
+
+    assert first.file_path == r"C:\docs\first.md"
+    assert second.file_path == r"C:\docs\second.md"
+    assert first.document_state_digest != second.document_state_digest
+    assert len(gateway.chat_calls) == 2
+    assert len(gateway.decision_calls) == 2
+
+
 def test_candidate_digest_preserves_bounded_order_and_refreshes_exact_spelling() -> None:
     search = FakeSearch(["Research", "invoice", "ignored"])
     gateway = FakeGateway([])
@@ -364,7 +430,70 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
         "candidate_set_digest",
         "max_candidates",
         "confirmation_threshold",
+        "document_state_digest",
     } <= columns
+
+
+def test_database_cache_lookup_is_scoped_to_the_target_file(tmp_path: Path) -> None:
+    database_path = tmp_path / "duplicate-tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    with session_factory.begin() as session:
+        files = [
+            File(
+                canonical_path=path,
+                content_hash="same-content",
+                size_bytes=10,
+                mtime_ns=index,
+                mime_type="text/markdown",
+            )
+            for index, path in enumerate(
+                (r"C:\docs\first.md", r"C:\docs\second.md"),
+                start=1,
+            )
+        ]
+        session.add_all(files)
+        session.flush()
+        for file in files:
+            DatabaseTagRecommendationCache(session).store(
+                CachedTagRecommendations(
+                    file_id=file.id,
+                    file_path=file.canonical_path,
+                    file_hash="same-content",
+                    document_state_digest=f"state-{file.id}",
+                    extraction_version="docling-v1",
+                    candidate_model_digest="candidate-v1",
+                    decision_model_digest="decision-v1",
+                    candidate_set_digest="catalog-v1",
+                    max_candidates=4,
+                    confirmation_threshold=0.7,
+                    decisions=(),
+                )
+            )
+
+    with session_factory() as session:
+        first = DatabaseTagRecommendationCache(session).lookup(
+            "same-content",
+            file_path=r"C:\docs\first.md",
+            document_state_digest="state-1",
+            extraction_version="docling-v1",
+        )
+        second = DatabaseTagRecommendationCache(session).lookup(
+            "same-content",
+            file_path=r"C:\docs\second.md",
+            document_state_digest="state-2",
+            extraction_version="docling-v1",
+        )
+        wrong = DatabaseTagRecommendationCache(session).lookup(
+            "same-content",
+            file_path=r"C:\docs\second.md",
+            document_state_digest="state-1",
+            extraction_version="docling-v1",
+        )
+
+    assert first is not None and first.file_path == r"C:\docs\first.md"
+    assert second is not None and second.file_path == r"C:\docs\second.md"
+    assert wrong is None
 
 
 def test_database_cache_store_is_safe_across_separate_sessions(tmp_path: Path) -> None:

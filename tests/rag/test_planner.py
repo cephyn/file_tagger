@@ -228,15 +228,18 @@ def test_planner_preserves_at_capacity_markdown_context() -> None:
         gateway=FakePlannerGateway(payload),
     )
 
-    assert plan.exact_terms == (
+    assert plan.exact_terms[:4] == (
         "Sunken Vault",
+        "model term 0",
         "Level 3",
-        *model_terms[1:15],
+        "model term 1",
     )
-    assert plan.normalized_constraints == (
-        "level 3",
-        *model_constraints[:15],
-    )
+    assert len(plan.exact_terms) == 16
+    assert "model term 6" in plan.exact_terms
+    assert plan.exact_terms[-1].startswith("model term")
+    assert plan.normalized_constraints[0] == "level 3"
+    assert len(plan.normalized_constraints) == 16
+    assert "constraint 0" in plan.normalized_constraints
 
 
 @pytest.mark.parametrize(
@@ -299,6 +302,53 @@ def test_planner_uses_selected_gemma_fallback_when_inkling_is_missing() -> None:
         DEFAULT_PLANNER_MODEL,
         "gemma4:e4b",
     ]
+
+
+@pytest.mark.parametrize("model", ["Inkling-2-Mini", "inkling-2-mini:latest"])
+def test_planner_recognizes_canonical_inkling_fallback_aliases(model: str) -> None:
+    gateway = FakePlannerGateway(
+        VALID_PLAN_JSON,
+        missing_models=frozenset({model}),
+    )
+
+    asyncio.run(
+        build_search_plan_async(
+            question="Find encounters",
+            model=model,
+            fallback_model="gemma4:e4b",
+            gateway=gateway,
+        )
+    )
+
+    assert [call["model"] for call in gateway.chat_calls] == [
+        model,
+        "gemma4:e4b",
+    ]
+
+
+def test_planner_exact_terms_interleave_bounded_model_and_context_quotas() -> None:
+    context_terms = [f"context term {index}" for index in range(10)]
+    model_terms = [f"question term {index}" for index in range(10)]
+    payload = json.dumps(
+        {
+            **json.loads(VALID_PLAN_JSON),
+            "exact_terms": model_terms,
+        }
+    )
+    markdown = "\n".join(f"# {term}" for term in context_terms)
+
+    plan = build_search_plan(
+        question="Find encounters",
+        markdown_context=markdown,
+        gateway=FakePlannerGateway(payload),
+    )
+
+    assert len(plan.exact_terms) == 16
+    assert sum(term.startswith("context term") for term in plan.exact_terms) == 8
+    assert sum(term.startswith("question term") for term in plan.exact_terms) == 8
+    for index in range(8):
+        assert plan.exact_terms[index * 2] == context_terms[index]
+        assert plan.exact_terms[index * 2 + 1] == model_terms[index]
 
 
 @pytest.mark.parametrize("response", ['{"intent_names":', '{"intent_names": []}'])

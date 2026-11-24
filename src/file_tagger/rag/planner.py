@@ -178,7 +178,9 @@ async def build_search_plan_async(
     selected_gateway: PlannerGateway = gateway or OllamaGateway()
     messages = _planning_messages(checked_question, context)
     models: tuple[str, ...] = (checked_model,)
-    if checked_model == DEFAULT_PLANNER_MODEL and checked_fallback is not None:
+    if _canonical_model_name(checked_model) == DEFAULT_PLANNER_MODEL and (
+        checked_fallback is not None
+    ):
         if checked_fallback != checked_model:
             models += (checked_fallback,)
 
@@ -244,6 +246,13 @@ def _reject_cloud_model(model: str) -> None:
         raise ModelIncompatibleError(
             "Cloud-hosted model variants are not supported."
         )
+
+
+def _canonical_model_name(model: str) -> str:
+    normalized = unicodedata.normalize("NFKC", model).strip().casefold()
+    if normalized.endswith(":latest"):
+        return normalized.removesuffix(":latest")
+    return normalized
 
 
 def _planning_messages(
@@ -404,12 +413,47 @@ def _merge_terms(
     max_items: int | None = None,
     max_length: int | None = None,
 ) -> tuple[str, ...]:
-    merged = _unique_nonempty((*first, *second))
-    if max_length is not None:
-        merged = tuple(term for term in merged if len(term) <= max_length)
-    if max_items is not None:
-        merged = merged[:max_items]
-    return merged
+    checked_first = tuple(
+        term
+        for term in _unique_nonempty(first)
+        if max_length is None or len(term) <= max_length
+    )
+    first_keys = {term.casefold() for term in checked_first}
+    checked_second = tuple(
+        term
+        for term in _unique_nonempty(second)
+        if term.casefold() not in first_keys
+        and (max_length is None or len(term) <= max_length)
+    )
+    if max_items is None:
+        return (*checked_first, *checked_second)
+    if max_items <= 0:
+        return ()
+    if not checked_first:
+        return checked_second[:max_items]
+    if not checked_second:
+        return checked_first[:max_items]
+
+    first_quota = min(len(checked_first), (max_items + 1) // 2)
+    second_quota = min(len(checked_second), max_items - first_quota)
+    unused = max_items - first_quota - second_quota
+    if unused:
+        extra_second = min(len(checked_second) - second_quota, unused)
+        second_quota += extra_second
+        unused -= extra_second
+    if unused:
+        extra_first = min(len(checked_first) - first_quota, unused)
+        first_quota += extra_first
+
+    selected_first = checked_first[:first_quota]
+    selected_second = checked_second[:second_quota]
+    interleaved: list[str] = []
+    for index in range(max(first_quota, second_quota)):
+        if index < first_quota:
+            interleaved.append(selected_first[index])
+        if index < second_quota:
+            interleaved.append(selected_second[index])
+    return tuple(interleaved[:max_items])
 
 
 def _unique_nonempty(values: Sequence[str]) -> tuple[str, ...]:

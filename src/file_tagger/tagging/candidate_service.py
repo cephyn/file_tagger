@@ -93,6 +93,7 @@ def recommend_tags(
     embedding_profile: ModelProfile | None = None,
     file_id: int | None = None,
     file_path: str | None = None,
+    force_refresh: bool = False,
 ) -> CachedTagRecommendations:
     return _run_sync(
         recommend_tags_async(
@@ -116,6 +117,7 @@ def recommend_tags(
             embedding_profile=embedding_profile,
             file_id=file_id,
             file_path=file_path,
+            force_refresh=force_refresh,
         )
     )
 
@@ -142,6 +144,7 @@ async def recommend_tags_async(
     embedding_profile: ModelProfile | None = None,
     file_id: int | None = None,
     file_path: str | None = None,
+    force_refresh: bool = False,
 ) -> CachedTagRecommendations:
     _validate_request(
         document_state=document_state,
@@ -156,6 +159,7 @@ async def recommend_tags_async(
     owns_gateway = gateway is None
     selected_gateway: CandidateGateway = gateway or OllamaGateway()
     selected_decision_gateway = decision_gateway or selected_gateway
+    document_state_digest = hashlib.sha256(document_state.encode("utf-8")).hexdigest()
     try:
         existing = _semantic_existing_tags(
             search,
@@ -180,9 +184,12 @@ async def recommend_tags_async(
             model=decision_model,
             digest=decision_model_digest,
         )
-        if cache is not None:
+        if cache is not None and not force_refresh:
             cached = cache.lookup(
                 file_hash,
+                file_id=file_id,
+                file_path=file_path,
+                document_state_digest=document_state_digest,
                 extraction_version=extraction_version,
                 candidate_model_digest=resolved_candidate_digest,
                 decision_model_digest=resolved_decision_digest,
@@ -238,6 +245,7 @@ async def recommend_tags_async(
             file_id=file_id,
             file_path=file_path,
             file_hash=file_hash,
+            document_state_digest=document_state_digest,
             extraction_version=extraction_version,
             candidate_model_digest=resolved_candidate_digest,
             decision_model_digest=resolved_decision_digest,

@@ -8,7 +8,8 @@ import pytest
 from file_tagger.adapters.ollama.gateway import OllamaGateway
 from file_tagger.domain.contracts import TagDecision
 from file_tagger.domain.errors import ModelIncompatibleError
-from file_tagger.tagging.decision_service import TagDecisionResult, decide_tags
+from file_tagger.tagging.cache import CachedTagRecommendations
+from file_tagger.tagging.decision_service import decide_tags
 
 
 class FakeGateway:
@@ -381,133 +382,169 @@ def test_cloud_model_tags_are_rejected_by_gateway() -> None:
         )
 
 
-def test_batch_tag_suggester_uses_typed_local_decision_service(
+def test_batch_tag_suggester_routes_through_candidate_service(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from file_tagger import models, tag_suggestion
+    from file_tagger import tag_suggestion
 
     source = tmp_path / "ruin.txt"
     source.write_text("encounter table for a flooded ruin", encoding="utf-8")
-
-    class Query:
-        def all(self) -> list[SimpleNamespace]:
-            return [SimpleNamespace(name="dungeon"), SimpleNamespace(name="invoice")]
-
-    class Session:
-        closed = False
-
-        def query(self, model: Any) -> Query:
-            assert model is models.Tag
-            return Query()
-
-        def close(self) -> None:
-            self.closed = True
-
-    session = Session()
-    monkeypatch.setattr(models, "init_db", lambda: session)
     calls: list[dict[str, Any]] = []
 
-    def fake_decide_tags(
-        document_state: str,
-        candidates: list[str],
-        **kwargs: Any,
-    ) -> TagDecisionResult:
-        calls.append(
-            {
-                "state": document_state,
-                "candidates": candidates,
-                **kwargs,
-            }
-        )
-        return TagDecisionResult(
-            decisions=(
+    class CandidateService:
+        def recommend(
+            self,
+            document_state: str,
+            *,
+            file_hash: str,
+            extraction_version: str,
+            file_path: str,
+            force_refresh: bool,
+        ) -> CachedTagRecommendations:
+            calls.append(
+                {
+                    "state": document_state,
+                    "file_hash": file_hash,
+                    "extraction_version": extraction_version,
+                    "file_path": file_path,
+                    "force_refresh": force_refresh,
+                }
+            )
+            return CachedTagRecommendations(
+                file_path=file_path,
+                file_hash=file_hash,
+                document_state_digest="document-state",
+                candidate_model_digest="candidate",
+                decision_model_digest="decision",
+                decisions=(
                 TagDecision(
                     tag="dungeon",
                     decision="accept",
                     confidence=0.9,
                 ),
+                    TagDecision(
+                        tag="invoice",
+                        decision="reject",
+                        confidence=0.9,
+                    ),
+                ),
             )
-        )
-
-    monkeypatch.setattr(
-        tag_suggestion,
-        "decide_tags",
-        fake_decide_tags,
-        raising=False,
-    )
 
     class CloudConfigMustNotBeRead:
         def __getattr__(self, name: str) -> Any:
             raise AssertionError(f"legacy provider configuration read: {name}")
 
     suggestions = tag_suggestion.TagSuggester(
-        CloudConfigMustNotBeRead()
-    ).suggest_tags_for_file(str(source))
+        CloudConfigMustNotBeRead(),
+        candidate_service=CandidateService(),
+    ).suggest_tags_for_file(str(source), force_refresh=True)
 
     assert suggestions == {"dungeon": 0.9}
-    assert calls[0]["candidates"] == ["dungeon", "invoice"]
+    assert calls[0]["force_refresh"] is True
     assert "flooded ruin" in calls[0]["state"]
-    assert session.closed
+    assert calls[0]["file_path"] == str(source.resolve())
 
 
-def test_batch_tag_suggester_splits_and_merges_more_than_64_tags(
+def test_tag_suggestion_dialog_splits_typed_existing_and_new_decisions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    qtbot: Any,
 ) -> None:
-    from file_tagger import models, tag_suggestion
+    from file_tagger import tag_suggestion
 
     source = tmp_path / "ruin.txt"
     source.write_text("encounter table for a flooded ruin", encoding="utf-8")
-    existing_tags = [f"candidate-{index}" for index in range(65)]
+    calls: list[bool] = []
 
-    class Query:
-        def all(self) -> list[SimpleNamespace]:
-            return [SimpleNamespace(name=name) for name in existing_tags]
-
-    class Session:
-        def query(self, model: Any) -> Query:
-            assert model is models.Tag
-            return Query()
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(models, "init_db", lambda: Session())
-    calls: list[list[str]] = []
-
-    def fake_decide_tags(
-        document_state: str,
-        candidates: list[str],
-        **kwargs: Any,
-    ) -> TagDecisionResult:
-        del document_state, kwargs
-        calls.append(candidates)
-        return TagDecisionResult(
+    def recommend(
+        self: Any,
+        file_path: str,
+        *,
+        force_refresh: bool = False,
+    ) -> CachedTagRecommendations:
+        calls.append(force_refresh)
+        return CachedTagRecommendations(
+            file_path=file_path,
+            file_hash="hash",
+            document_state_digest="document-state",
+            candidate_model_digest="candidate",
+            decision_model_digest="decision",
             decisions=(
+                TagDecision(tag="dungeon", decision="accept", confidence=0.9),
                 TagDecision(
-                    tag=candidates[0],
-                    decision="accept",
-                    confidence=0.9,
+                    tag="flooded ruin",
+                    decision="review",
+                    confidence=0.6,
+                    is_new=True,
                 ),
-            )
+                TagDecision(tag="invoice", decision="reject", confidence=0.9),
+            ),
         )
 
     monkeypatch.setattr(
-        tag_suggestion,
-        "decide_tags",
-        fake_decide_tags,
-        raising=False,
+        tag_suggestion.TagSuggester,
+        "recommend_tags_for_file",
+        recommend,
     )
 
-    suggestions = tag_suggestion.TagSuggester(
-        SimpleNamespace()
-    ).suggest_tags_for_file(str(source))
+    dialog = tag_suggestion.TagSuggestionDialog(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        str(source),
+    )
+    qtbot.addWidget(dialog)
 
-    assert [len(batch) for batch in calls] == [64, 1]
-    assert calls[0] == existing_tags[:64]
-    assert calls[1] == existing_tags[64:]
-    assert suggestions == {"candidate-0": 0.9, "candidate-64": 0.9}
+    assert dialog.existing_list.itemWidget(
+        dialog.existing_list.item(0)
+    ).tag_name == "dungeon"
+    assert dialog.new_list.itemWidget(dialog.new_list.item(0)).tag_name == "flooded ruin"
+    dialog.analyze_file(force_refresh=True)
+    assert calls == [False, True]
+
+
+def test_production_legacy_cache_persists_typed_recommendations() -> None:
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from file_tagger import models, tag_suggestion
+
+    engine = create_engine("sqlite:///:memory:")
+    models.Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        cache = tag_suggestion._LegacyTagRecommendationCache(session)
+        stored = CachedTagRecommendations(
+            file_path=r"C:\docs\ruin.md",
+            file_hash="content-hash",
+            document_state_digest="document-state",
+            extraction_version="tag-suggestion-state-v1",
+            candidate_model_digest="candidate-digest",
+            decision_model_digest="decision-digest",
+            candidate_set_digest="candidate-set",
+            max_candidates=24,
+            confirmation_threshold=0.7,
+            decisions=(
+                TagDecision(tag="flooded ruin", decision="review", confidence=0.6),
+            ),
+        )
+
+        cache.store(stored)
+        session.commit()
+
+    with Session(engine) as session:
+        cached = tag_suggestion._LegacyTagRecommendationCache(session).lookup(
+            "content-hash",
+            file_path=r"C:\docs\ruin.md",
+            document_state_digest="document-state",
+            extraction_version="tag-suggestion-state-v1",
+            candidate_model_digest="candidate-digest",
+            decision_model_digest="decision-digest",
+            candidate_set_digest="candidate-set",
+            max_candidates=24,
+            confirmation_threshold=0.7,
+        )
+
+    assert cached == stored
 
 
 def test_document_state_raw_reads_plain_text_only(

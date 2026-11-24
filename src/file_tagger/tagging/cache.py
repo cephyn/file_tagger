@@ -19,6 +19,7 @@ class CachedTagRecommendations(DomainRecord):
     file_id: int | None = Field(default=None, gt=0)
     file_path: str | None = Field(default=None, min_length=1)
     file_hash: str = Field(min_length=1)
+    document_state_digest: str | None = Field(default=None, min_length=1)
     extraction_version: str | None = Field(default=None, min_length=1)
     candidate_model_digest: str | None = Field(default=None, min_length=1)
     decision_model_digest: str | None = Field(default=None, min_length=1)
@@ -85,6 +86,9 @@ class TagRecommendationCache(Protocol):
         self,
         file_hash: str,
         *,
+        file_id: int | None = None,
+        file_path: str | None = None,
+        document_state_digest: str | None = None,
         extraction_version: str | None = None,
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
@@ -105,6 +109,9 @@ class InMemoryTagRecommendationCache:
         self,
         file_hash: str,
         *,
+        file_id: int | None = None,
+        file_path: str | None = None,
+        document_state_digest: str | None = None,
         extraction_version: str | None = None,
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
@@ -119,6 +126,9 @@ class InMemoryTagRecommendationCache:
             if _matches(
                 stored,
                 file_hash=file_hash,
+                file_id=file_id,
+                file_path=file_path,
+                document_state_digest=document_state_digest,
                 extraction_version=extraction_version,
                 candidate_model_digest=candidate_model_digest,
                 decision_model_digest=decision_model_digest,
@@ -148,6 +158,9 @@ class DatabaseTagRecommendationCache:
         self,
         file_hash: str,
         *,
+        file_id: int | None = None,
+        file_path: str | None = None,
+        document_state_digest: str | None = None,
         extraction_version: str | None = None,
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
@@ -161,6 +174,14 @@ class DatabaseTagRecommendationCache:
         statement = select(TagSuggestionCache).where(
             TagSuggestionCache.file_hash == file_hash
         )
+        if file_id is not None:
+            statement = statement.where(TagSuggestionCache.file_id == file_id)
+        if file_path is not None:
+            statement = statement.where(TagSuggestionCache.file_path == file_path)
+        if document_state_digest is not None:
+            statement = statement.where(
+                TagSuggestionCache.document_state_digest == document_state_digest
+            )
         if extraction_version is not None:
             statement = statement.where(
                 TagSuggestionCache.extraction_version == extraction_version
@@ -207,6 +228,7 @@ class DatabaseTagRecommendationCache:
             "file_id": file_id,
             "file_path": stored.file_path or self._file_path(file_id),
             "file_hash": stored.file_hash,
+            "document_state_digest": stored.document_state_digest,
             "extraction_version": stored.extraction_version,
             "candidate_model_digest": stored.effective_candidate_model_digest,
             "decision_model_digest": stored.effective_decision_model_digest,
@@ -222,6 +244,9 @@ class DatabaseTagRecommendationCache:
             set_={
                 "file_path": statement.excluded.file_path,
                 "file_hash": statement.excluded.file_hash,
+                "document_state_digest": (
+                    statement.excluded.document_state_digest
+                ),
                 "extraction_version": statement.excluded.extraction_version,
                 "candidate_model_digest": (
                     statement.excluded.candidate_model_digest
@@ -281,6 +306,9 @@ def _same_identity(
     return all(
         (
             left.file_hash == right.file_hash,
+            left.file_id == right.file_id,
+            left.file_path == right.file_path,
+            left.document_state_digest == right.document_state_digest,
             left.extraction_version == right.extraction_version,
             left.effective_candidate_model_digest
             == right.effective_candidate_model_digest,
@@ -297,6 +325,9 @@ def _matches(
     stored: CachedTagRecommendations,
     *,
     file_hash: str,
+    file_id: int | None,
+    file_path: str | None,
+    document_state_digest: str | None,
     extraction_version: str | None,
     candidate_model_digest: str | None,
     decision_model_digest: str | None,
@@ -306,6 +337,15 @@ def _matches(
     model_digest: str | None,
 ) -> bool:
     if stored.file_hash != file_hash:
+        return False
+    if file_id is not None and stored.file_id != file_id:
+        return False
+    if file_path is not None and stored.file_path != file_path:
+        return False
+    if (
+        document_state_digest is not None
+        and stored.document_state_digest != document_state_digest
+    ):
         return False
     if extraction_version is not None:
         if stored.extraction_version != extraction_version:
@@ -339,6 +379,7 @@ def _database_payload(row: TagSuggestionCache) -> dict[str, Any] | None:
             "file_id": row.file_id,
             "file_path": row.file_path,
             "file_hash": row.file_hash,
+            "document_state_digest": row.document_state_digest,
             "extraction_version": row.extraction_version,
             "candidate_model_digest": row.candidate_model_digest,
             "decision_model_digest": row.decision_model_digest,

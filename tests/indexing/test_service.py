@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from concurrent.futures import TimeoutError
 from hashlib import sha256
 import os
 from pathlib import Path
+import time
 
 import pytest
 from sqlalchemy import select, text
@@ -422,6 +424,107 @@ def test_live_worker_heartbeats_during_slow_embedding(tmp_path: Path) -> None:
     result = service.reindex(source)
 
     assert result.status == "completed"
+
+
+def test_lease_is_fenced_before_a_slow_synchronous_operation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "fenced-heartbeat.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    repository = IndexingRepository(
+        create_session_factory(database),
+        lease_duration=timedelta(seconds=0.2),
+    )
+    service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="fenced", file_hash="unused")
+        ),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+        embedder=lambda chunks: chunks,
+        recover_on_startup=False,
+    )
+    job_id = service.queue(source)
+    owner = repository.begin(job_id)
+    assert owner.lease_token is not None
+
+    heartbeat_calls = 0
+    original_heartbeat = repository.heartbeat
+
+    def tracked_heartbeat(job: int, *, lease_token: str):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        return original_heartbeat(job, lease_token=lease_token)
+
+    repository.heartbeat = tracked_heartbeat  # type: ignore[method-assign]
+
+    def operation():
+        assert heartbeat_calls > 0
+        time.sleep(0.35)
+        return repository.state(job_id)
+
+    result = service._with_lease_heartbeat(job_id, owner.lease_token, operation)
+
+    assert result.lease_token == owner.lease_token
+    assert heartbeat_calls >= 1
+
+
+def test_worker_timeout_error_does_not_become_heartbeat_polling(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "worker-timeout.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    repository = IndexingRepository(
+        create_session_factory(database),
+        lease_duration=timedelta(seconds=0.2),
+    )
+    service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="fenced", file_hash="unused")
+        ),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+        embedder=lambda chunks: chunks,
+        recover_on_startup=False,
+    )
+    job_id = service.queue(source)
+    owner = repository.begin(job_id)
+    assert owner.lease_token is not None
+    original_heartbeat = repository.heartbeat
+    heartbeat_calls = 0
+
+    def guarded_heartbeat(job: int, *, lease_token: str):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls > 2:
+            raise AssertionError("worker TimeoutError was treated as a poll timeout")
+        return original_heartbeat(job, lease_token=lease_token)
+
+    repository.heartbeat = guarded_heartbeat  # type: ignore[method-assign]
+
+    def operation():
+        raise TimeoutError("embedding timed out")
+
+    with pytest.raises(TimeoutError, match="embedding timed out"):
+        service._with_lease_heartbeat(job_id, owner.lease_token, operation)
+
+    assert heartbeat_calls == 1
 
 
 def test_changed_source_near_commit_preserves_previous_revision(

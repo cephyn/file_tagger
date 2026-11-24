@@ -6,18 +6,16 @@ from PySide6.QtCore import Qt, QSize, Signal, QEvent
 from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
 from collections.abc import Sequence
+from hashlib import sha256
 import mimetypes
 import os
 import random
-from typing import Protocol
+from types import SimpleNamespace
+from typing import Protocol, cast
 
-from .domain.contracts import TagDecision
-from .models import Tag, File
-from .tagging.decision_service import (
-    MAX_SYSTEM_ONE_QUESTIONS,
-    TagDecisionResult,
-    decide_tags,
-)
+from .models import File, Tag, TagSuggestionCache as LegacySuggestionCache
+from .tagging.cache import CachedTagRecommendations, TagRecommendationCache
+from .tagging.candidate_service import CandidateService
 from .vector_search.content_extractor import ContentExtractor
 
 
@@ -26,6 +24,7 @@ _TRUNCATION_MARKER = "\n[truncated]"
 _STRUCTURED_TEXT_SUBTYPES = frozenset(
     {"calendar", "csv", "html", "rtf", "sgml", "xml"}
 )
+TAG_SUGGESTION_EXTRACTION_VERSION = "tag-suggestion-state-v1"
 
 
 class TagSuggestionConfig(Protocol):
@@ -78,21 +77,17 @@ def _truncate_utf8(value: str, limit: int) -> str:
     return prefix + _TRUNCATION_MARKER
 
 
-def _decide_tags_in_batches(
-    document_state: str,
-    candidates: Sequence[str],
-) -> TagDecisionResult:
-    decisions: list[TagDecision] = []
-    for start in range(0, len(candidates), MAX_SYSTEM_ONE_QUESTIONS):
-        batch = candidates[start : start + MAX_SYSTEM_ONE_QUESTIONS]
-        decisions.extend(decide_tags(document_state, batch).decisions)
-    return TagDecisionResult(decisions=tuple(decisions))
-
-
 class TagSuggester:
     """Helper class to suggest tags for multiple files."""
-    
-    def __init__(self, config: TagSuggestionConfig):
+
+    def __init__(
+        self,
+        config: TagSuggestionConfig,
+        db_session: Session | None = None,
+        *,
+        candidate_service: CandidateService | None = None,
+        cache: TagRecommendationCache | None = None,
+    ):
         """
         Initialize the tag suggester with configuration.
         
@@ -100,8 +95,71 @@ class TagSuggester:
             config: Application configuration
         """
         self.config = config
-        
-    def suggest_tags_for_file(self, file_path: str) -> dict[str, float]:
+        self.db_session = db_session
+        self._candidate_service = candidate_service
+        self._cache = cache
+
+    def recommend_tags_for_file(
+        self,
+        file_path: str,
+        *,
+        force_refresh: bool = False,
+    ) -> CachedTagRecommendations:
+        """Return typed recommendations without applying any tags."""
+        document_state = _document_state(file_path)
+        canonical_path = os.path.abspath(os.path.normpath(file_path))
+        file_hash = _file_hash(file_path)
+        if self._candidate_service is not None:
+            return self._candidate_service.recommend(
+                document_state,
+                file_hash=file_hash,
+                extraction_version=TAG_SUGGESTION_EXTRACTION_VERSION,
+                file_path=canonical_path,
+                force_refresh=force_refresh,
+            )
+
+        from .models import init_db
+
+        catalog_session = self.db_session
+        owns_catalog_session = catalog_session is None
+        cache_session = None
+        selected_cache = self._cache
+        try:
+            if catalog_session is None:
+                catalog_session = cast(Session, init_db())
+            if selected_cache is None:
+                cache_session = cast(Session, init_db())
+                selected_cache = _LegacyTagRecommendationCache(cache_session)
+            service = CandidateService(
+                _LegacyCandidateSearch(catalog_session),
+                cache=selected_cache,
+            )
+            result = service.recommend(
+                document_state,
+                file_hash=file_hash,
+                extraction_version=TAG_SUGGESTION_EXTRACTION_VERSION,
+                file_path=canonical_path,
+                force_refresh=force_refresh,
+            )
+            if cache_session is not None:
+                cache_session.commit()
+            return result
+        except Exception:
+            if cache_session is not None:
+                cache_session.rollback()
+            raise
+        finally:
+            if cache_session is not None:
+                cache_session.close()
+            if owns_catalog_session and catalog_session is not None:
+                catalog_session.close()
+
+    def suggest_tags_for_file(
+        self,
+        file_path: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, float]:
         """
         Get AI tag suggestions for a single file.
         
@@ -111,28 +169,116 @@ class TagSuggester:
         Returns:
             Dictionary mapping tag names to confidence scores
         """
-        db_session = None
         try:
-            from .models import init_db
-
-            db_session = init_db()
-            existing_tags = [str(tag.name) for tag in db_session.query(Tag).all()]
-            if not existing_tags:
-                return {}
-            result = _decide_tags_in_batches(
-                _document_state(file_path),
-                existing_tags,
+            result = self.recommend_tags_for_file(
+                file_path,
+                force_refresh=force_refresh,
             )
             return {
                 decision.tag: decision.confidence
-                for decision in result.accepted
+                for decision in (*result.accepted, *result.review)
             }
         except Exception as e:
             print(f"Error suggesting tags for {file_path}: {str(e)}")
             return {}
-        finally:
-            if db_session is not None:
-                db_session.close()
+
+
+class _LegacyCandidateSearch:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def search(
+        self,
+        query: str,
+        query_embedding: Sequence[float] | None = None,
+        **kwargs: object,
+    ) -> tuple[SimpleNamespace, ...]:
+        del query, query_embedding, kwargs
+        tags = tuple(str(tag.name) for tag in self._session.query(Tag).all())
+        return (SimpleNamespace(tags=tags),)
+
+
+class _LegacyTagRecommendationCache:
+    """Persistent recommendation cache for the legacy desktop database."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lookup(
+        self,
+        file_hash: str,
+        *,
+        file_id: int | None = None,
+        file_path: str | None = None,
+        document_state_digest: str | None = None,
+        extraction_version: str | None = None,
+        candidate_model_digest: str | None = None,
+        decision_model_digest: str | None = None,
+        candidate_set_digest: str | None = None,
+        max_candidates: int | None = None,
+        confirmation_threshold: float | None = None,
+        model_digest: str | None = None,
+    ) -> CachedTagRecommendations | None:
+        del file_id
+        query = self._session.query(LegacySuggestionCache).filter_by(
+            file_hash=file_hash
+        )
+        if file_path is not None:
+            query = query.filter_by(file_path=file_path)
+        row = query.first()
+        if row is None or not isinstance(row.suggestions, dict):
+            return None
+        try:
+            stored = CachedTagRecommendations.model_validate(row.suggestions)
+        except (TypeError, ValueError):
+            return None
+        selected_candidate = candidate_model_digest or model_digest
+        selected_decision = decision_model_digest or model_digest
+        expected = (
+            (file_path, stored.file_path),
+            (document_state_digest, stored.document_state_digest),
+            (extraction_version, stored.extraction_version),
+            (selected_candidate, stored.effective_candidate_model_digest),
+            (selected_decision, stored.effective_decision_model_digest),
+            (candidate_set_digest, stored.candidate_set_digest),
+            (max_candidates, stored.max_candidates),
+            (confirmation_threshold, stored.confirmation_threshold),
+        )
+        if any(
+            requested is not None and requested != actual
+            for requested, actual in expected
+        ):
+            return None
+        return stored
+
+    def store(self, stored: CachedTagRecommendations) -> None:
+        if not stored.file_path:
+            raise ValueError("Persistent legacy cache entries require a file path.")
+        row = (
+            self._session.query(LegacySuggestionCache)
+            .filter_by(file_path=stored.file_path)
+            .first()
+        )
+        if row is None:
+            row = LegacySuggestionCache(file_path=stored.file_path)
+            self._session.add(row)
+        setattr(row, "file_hash", stored.file_hash)
+        setattr(row, "timestamp", stored.cached_at.replace(tzinfo=None))
+        setattr(
+            row,
+            "suggestions",
+            stored.model_dump(mode="json", exclude_none=True),
+        )
+        setattr(row, "provider", "ollama-tag-recommendations")
+        self._session.flush()
+
+
+def _file_hash(file_path: str) -> str:
+    digest = sha256()
+    with open(file_path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
         
 # Rest of the file remains unchanged
 class TagExplanationDialog(QDialog):
@@ -256,7 +402,8 @@ class TagSuggestionDialog(QDialog):
         self.file_path = file_path
         self.using_cache = False
         self.explanation_text = ""
-        self.tag_explanations = {}  # Dictionary to store tag-specific explanations
+        self.tag_explanations: dict[str, str] = {}
+        self.tag_suggester = TagSuggester(config, db_session)
         self.initUI()
         self.analyze_file()
         
@@ -361,33 +508,22 @@ class TagSuggestionDialog(QDialog):
     def show_tag_explanation(self, tag_name: str, confidence: float):
         """Show explanation dialog for the selected tag."""
         # Get the general explanation
-        explanation = self.explanation_text
+        explanation = self.tag_explanations.get(tag_name, self.explanation_text)
         
         # Show the explanation dialog
         dialog = TagExplanationDialog(tag_name, confidence, explanation, self)
         dialog.exec()
         
-    def analyze_file(self, force_refresh=False):
-        """Analyze the file with the local System One decision model."""
+    def analyze_file(self, force_refresh: bool = False) -> None:
+        """Analyze the file with the local candidate and decision services."""
         try:
-            existing_tags = [
-                str(tag.name) for tag in self.db_session.query(Tag).all()
-            ]
-            if not existing_tags:
-                QMessageBox.information(
-                    self,
-                    "No Tag Candidates",
-                    "Create at least one tag before requesting typed suggestions.",
-                )
-                return
-
             self._update_progress(
                 "Refreshing local tag decisions" if force_refresh else "Requesting tag decisions",
                 25,
             )
-            result = _decide_tags_in_batches(
-                _document_state(self.file_path),
-                existing_tags,
+            result = self.tag_suggester.recommend_tags_for_file(
+                self.file_path,
+                force_refresh=force_refresh,
             )
             self.explanation_text = (
                 "Suggestions are based on typed local System One decisions. "
@@ -396,12 +532,19 @@ class TagSuggestionDialog(QDialog):
             self.existing_list.clear()
             self.new_list.clear()
             for decision in result.accepted + result.review:
+                target = self.new_list if decision.is_new else self.existing_list
                 self._add_tag_item(
                     decision.tag,
                     decision.confidence,
-                    self.existing_list,
+                    target,
                 )
-            self.cache_label.setText("Generated new local decisions")
+                if decision.rationale:
+                    self.tag_explanations[decision.tag] = decision.rationale
+            self.cache_label.setText(
+                "Refreshed local recommendations"
+                if force_refresh
+                else "Recommendations checked against persistent cache"
+            )
             self.cache_label.setStyleSheet("color: green;")
             self._update_progress("Ready", 100)
         except Exception as e:

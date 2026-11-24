@@ -98,6 +98,7 @@ class TagSuggestionCache(Base):
     )
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     file_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    document_state_digest: Mapped[str | None] = mapped_column(String(64))
     cached_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
