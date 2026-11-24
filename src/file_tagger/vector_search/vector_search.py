@@ -15,7 +15,6 @@ import traceback
 from .document_chunker import DocumentChunker
 from .content_extractor import ContentExtractor
 from .search_utils import SearchUtils
-from ..ai_service import AIService
 from ..config import Config
 
 
@@ -784,28 +783,8 @@ class VectorSearch:
         Returns:
             str: Generated summary or None if generation failed
         """
-        try:
-            # Create an AI service using the config
-            ai_service = self.config.get_ai_service(self.db_session)
-
-            if not ai_service:
-                print("Could not create AI service, skipping summary generation")
-                return None
-
-            # Use the AI service to generate the summary
-            return ai_service.generate_document_summary(file_path, content)
-
-        except Exception as e:
-            print(f"Error generating summary for {file_path}: {str(e)}")
-            traceback.print_exc()
-            return self._extract_basic_summary(content)
-
-        except Exception as e:
-            print(f"Error generating summary for {file_path}: {str(e)}")
-            traceback.print_exc()
-            # Fallback to basic extraction
-            print("Falling back to basic extraction due to error")
-            return self._extract_basic_summary(content)
+        del file_path
+        return self._extract_basic_summary(content)
 
     def _extract_basic_summary(self, content: str) -> str:
         """Extract a basic summary from content when AI summarization fails."""

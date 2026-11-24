@@ -175,10 +175,10 @@ file_tagger/
 ├── api_settings.py      # API configuration dialog
 ├── config.py            # Configuration and encryption utilities
 ├── models.py            # Database models
-├── ai_service.py        # AI provider integration
+├── tagging/             # Typed local-model tag decisions
 ├── login.py             # Password verification interface
 ├── file_tag_manager.py  # Main application interface
-├── tag_suggestion.py    # AI tag suggestion dialog
+├── tag_suggestion.py    # Typed local tag suggestion dialog
 ├── search.py            # RAG/Chat interface for search results
 ├── password_management.py # Security settings interface
 ├── vector_search/       # Semantic search functionality

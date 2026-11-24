@@ -50,7 +50,6 @@ from .vector_search import VectorSearch
 from .api_settings import APISettingsDialog
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
-from .search import ChatWithResultsDialog
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
 
@@ -1475,21 +1474,12 @@ class FileTagManager(QMainWindow):
                 )
                 return
 
-            # Get AI service
-            ai_service = self.config.get_ai_service()
-            if ai_service is None:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    "Could not initialize AI service. Please check your API settings and try again.",
-                )
-                return
-
-            # Open the chat dialog with selected documents
-            dialog = ChatWithResultsDialog(
-                self, ai_service, selected_docs, self.query_input.text().strip()
+            QMessageBox.information(
+                self,
+                "Local Search Chat Unavailable",
+                "Search-result chat is not available in the current local-first "
+                "workflow. Tag decisions use the installed Ollama System One model.",
             )
-            dialog.exec()
 
         except Exception as e:
             QMessageBox.warning(
@@ -2002,32 +1992,6 @@ class FileTagManager(QMainWindow):
                 return False
 
             print(f"\n=== Force reindexing file: {file_path} ===")
-
-            # Check if AI is configured for summary generation
-            ai_configured = False
-            try:
-                if self.config.get_selected_provider() and self.config.get_api_key(
-                    self.config.get_selected_provider()
-                ):
-                    provider = self.config.get_selected_provider()
-                    print(f"AI provider configured: {provider}")
-                    ai_configured = True
-
-                    # Attach AI config information directly to db_session for use in VectorSearch
-                    self.db_session.provider = provider
-                    self.db_session.api_key = self.config.get_api_key(provider)
-                    self.db_session.local_model_path = (
-                        self.config.get_local_model_path()
-                    )
-                    self.db_session.local_model_type = (
-                        self.config.get_local_model_type()
-                    )
-                else:
-                    print(
-                        "AI not configured - document summaries will not be generated"
-                    )
-            except Exception as e:
-                print(f"Error checking AI configuration: {str(e)}")
 
             from .vector_search.content_extractor import ContentExtractor
 

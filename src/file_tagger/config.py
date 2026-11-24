@@ -8,8 +8,6 @@ import base64
 import hashlib
 import secrets
 import string
-from typing import Optional
-from .ai_service import AIService
 from .infrastructure.app_paths import AppPaths
 
 
@@ -366,34 +364,6 @@ class Config:
         self.config_data['system_message'] = DEFAULT_SYSTEM_MESSAGE
         self.save()
 
-    def get_ai_service(self, db_session=None) -> Optional[AIService]:
-        """Create and return an AI service instance based on current configuration."""
-        provider = self.get_selected_provider()
-        api_key = self.get_api_key(provider)
-        
-        # Get local model settings if needed
-        local_model_path = None
-        local_model_type = None
-        if provider == 'local':
-            local_model_path = self.get_local_model_path()
-            local_model_type = self.get_local_model_type()
-        
-        # Get system message
-        system_message = self.get_system_message()
-        
-        try:
-            return AIService(
-                provider=provider,
-                api_key=api_key,
-                db_session=db_session,
-                local_model_path=local_model_path,
-                local_model_type=local_model_type,
-                system_message=system_message
-            )
-        except Exception as e:
-            print(f"Error creating AI service: {str(e)}")
-            return None
-            
     def set_pdf_extractor(self, preference: str):
         """Set the PDF content extractor preference ('fast' or 'accurate')."""
         if preference not in ['fast', 'accurate']:

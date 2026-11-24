@@ -2,20 +2,43 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QLabel, QListWidget, QMessageBox, QProgressDialog,
                             QListWidgetItem, QProgressBar, QWidget, QApplication,
                             QTextEdit)
-from PySide6.QtCore import Qt, QSize, QRandomGenerator, Signal, QEvent
+from PySide6.QtCore import Qt, QSize, Signal, QEvent
 from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
-from datetime import datetime
+import mimetypes
+import os
 import random
-from .models import Tag, File, TagSuggestionCache
-from .ai_service import AIService
-from .config import Config
 
-# Add TagSuggester class for batch processing of files
+from .models import Tag, File
+from .tagging.decision_service import decide_tags
+
+
+MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
+
+
+def _document_state(file_path: str) -> str:
+    mime_type, _ = mimetypes.guess_type(file_path)
+    stat = os.stat(file_path)
+    try:
+        with open(file_path, "rb") as source:
+            sample = source.read(MAX_DOCUMENT_STATE_SAMPLE_BYTES)
+        content = sample.decode("utf-8", errors="replace").strip()
+    except OSError:
+        content = ""
+    state = (
+        f"Filename: {os.path.basename(file_path)}\n"
+        f"Type: {mime_type or 'application/octet-stream'}\n"
+        f"Size: {stat.st_size} bytes"
+    )
+    if content:
+        state += f"\nContent sample:\n{content}"
+    return state
+
+
 class TagSuggester:
     """Helper class to suggest tags for multiple files."""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: object):
         """
         Initialize the tag suggester with configuration.
         
@@ -34,68 +57,25 @@ class TagSuggester:
         Returns:
             Dictionary mapping tag names to confidence scores
         """
+        db_session = None
         try:
-            # Create a session for the database operations
             from .models import init_db
+
             db_session = init_db()
-            
-            # Get all existing tags
             existing_tags = [tag.name for tag in db_session.query(Tag).all()]
-            
-            # Get provider and API key
-            provider = self.config.get_selected_provider()
-            api_key = self.config.get_api_key(provider)
-            
-            # Get custom system message
-            system_message = self.config.get_system_message()
-            
-            # Configure AI service based on provider
-            if provider == 'local':
-                local_model_path = self.config.get_local_model_path()
-                local_model_type = self.config.get_local_model_type()
-                
-                if not local_model_path:
-                    raise ValueError("No local model path configured")
-                
-                service = AIService(
-                    provider, 
-                    api_key="", 
-                    db_session=db_session,
-                    local_model_path=local_model_path,
-                    local_model_type=local_model_type,
-                    system_message=system_message
-                )
-            else:
-                if not api_key:
-                    raise ValueError(f"No API key configured for {provider}")
-                
-                service = AIService(
-                    provider, 
-                    api_key, 
-                    db_session=db_session,
-                    system_message=system_message
-                )
-            
-            # Analyze file
-            existing_matches, new_suggestions, _ = service.analyze_file(
-                file_path, 
-                existing_tags
-            )
-            
-            # Combine suggestions into a single dictionary
-            suggestions = {}
-            
-            for tag, confidence in existing_matches:
-                suggestions[tag] = confidence
-                
-            for tag, confidence in new_suggestions:
-                suggestions[tag] = confidence
-                
-            return suggestions
-            
+            if not existing_tags:
+                return {}
+            result = decide_tags(_document_state(file_path), existing_tags)
+            return {
+                decision.tag: decision.confidence
+                for decision in result.accepted
+            }
         except Exception as e:
             print(f"Error suggesting tags for {file_path}: {str(e)}")
             return {}
+        finally:
+            if db_session is not None:
+                db_session.close()
         
 # Rest of the file remains unchanged
 class TagExplanationDialog(QDialog):
@@ -206,7 +186,7 @@ class ConfidenceWidget(QWidget):
         super().mousePressEvent(event)
 
 class TagSuggestionDialog(QDialog):
-    def __init__(self, config: Config, db_session: Session, file_path: str, parent=None):
+    def __init__(self, config: object, db_session: Session, file_path: str, parent=None):
         super().__init__(parent)
         self.config = config
         self.db_session = db_session
@@ -320,106 +300,42 @@ class TagSuggestionDialog(QDialog):
         # Get the general explanation
         explanation = self.explanation_text
         
-        # Check for tag-specific explanations (could be implemented in the future)
-        tag_specific = ""
-        
         # Show the explanation dialog
         dialog = TagExplanationDialog(tag_name, confidence, explanation, self)
         dialog.exec()
         
     def analyze_file(self, force_refresh=False):
-        """Analyze the file using the configured AI provider."""
+        """Analyze the file with the local System One decision model."""
         try:
-            # Get all existing tags
             existing_tags = [tag.name for tag in self.db_session.query(Tag).all()]
-            
-            # Get current provider and API key
-            provider = self.config.get_selected_provider()
-            api_key = self.config.get_api_key(provider)
-            
-            # Get custom system message
-            system_message = self.config.get_system_message()
-            
-            # For local models, handle the local model settings instead of API key
-            if provider == 'local':
-                local_model_path = self.config.get_local_model_path()
-                local_model_type = self.config.get_local_model_type()
-                
-                if not local_model_path:
-                    QMessageBox.warning(self, "Error", 
-                                      "No local model path configured.\n"
-                                      "Please configure it in Settings > API Settings.")
-                    return
-            elif not api_key:
-                QMessageBox.warning(self, "Error", 
-                                  "No API key configured for the selected provider.\n"
-                                  "Please configure it in Settings > API Settings.")
+            if not existing_tags:
+                QMessageBox.information(
+                    self,
+                    "No Tag Candidates",
+                    "Create at least one tag before requesting typed suggestions.",
+                )
                 return
-            
-            # Clear cache if force refresh
-            if (force_refresh):
-                self.db_session.query(TagSuggestionCache).filter_by(
-                    file_path=self.file_path
-                ).delete()
-                self.db_session.commit()
-            
-            # Create AI service with progress callback
-            if provider == 'local':
-                service = AIService(
-                    provider, 
-                    api_key="", 
-                    db_session=self.db_session,
-                    progress_callback=self._update_progress,
-                    local_model_path=local_model_path,
-                    local_model_type=local_model_type,
-                    system_message=system_message
-                )
-            else:
-                service = AIService(
-                    provider, 
-                    api_key, 
-                    db_session=self.db_session,
-                    progress_callback=self._update_progress,
-                    system_message=system_message
-                )
-            
-            # Analyze file
-            existing_matches, new_suggestions, explanation = service.analyze_file(
-                self.file_path, 
-                existing_tags
+
+            self._update_progress(
+                "Refreshing local tag decisions" if force_refresh else "Requesting tag decisions",
+                25,
             )
-            
-            # Store the explanation
-            self.explanation_text = explanation
-            
-            # Update lists
+            result = decide_tags(_document_state(self.file_path), existing_tags)
+            self.explanation_text = (
+                "Suggestions are based on typed local System One decisions. "
+                "Review confidence before applying a tag."
+            )
             self.existing_list.clear()
             self.new_list.clear()
-            
-            # Add items with confidence scores
-            for tag, confidence in existing_matches:
-                self._add_tag_item(tag, confidence, self.existing_list)
-                
-            for tag, confidence in new_suggestions:
-                self._add_tag_item(tag, confidence, self.new_list)
-            
-            # Update cache status
-            cache_entry = self.db_session.query(TagSuggestionCache).filter_by(
-                file_path=self.file_path
-            ).first()
-            
-            if cache_entry:
-                age = datetime.utcnow() - cache_entry.timestamp
-                self.cache_label.setText(
-                    f"Using cached suggestions from {age.days}d {age.seconds//3600}h ago"
+            for decision in result.accepted + result.review:
+                self._add_tag_item(
+                    decision.tag,
+                    decision.confidence,
+                    self.existing_list,
                 )
-                self.cache_label.setStyleSheet("color: blue;")
-            else:
-                self.cache_label.setText("Generated new suggestions")
-                self.cache_label.setStyleSheet("color: green;")
-            
+            self.cache_label.setText("Generated new local decisions")
+            self.cache_label.setStyleSheet("color: green;")
             self._update_progress("Ready", 100)
-            
         except Exception as e:
             self._update_progress("Error", 0)
             QMessageBox.warning(self, "Error", f"Failed to analyze file: {str(e)}")
