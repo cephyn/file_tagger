@@ -5,9 +5,9 @@ This will try to index a sample file and verify that it's properly added to the 
 
 import os
 import sys
-from models import init_db, File, Tag
-from vector_search import VectorSearch
-from vector_search.content_extractor import ContentExtractor
+from .models import init_db, File, Tag
+from .vector_search import VectorSearch
+from .vector_search.content_extractor import ContentExtractor
 
 def test_indexing():
     print("\n=== Vector Search Debugging ===\n")

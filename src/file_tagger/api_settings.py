@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                             QFileDialog, QGroupBox, QRadioButton, QButtonGroup,
                             QTextEdit)
 from PySide6.QtCore import Qt
-from config import Config
+from .config import Config
 import os
 
 class APISettingsDialog(QDialog):

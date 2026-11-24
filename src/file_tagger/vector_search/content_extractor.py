@@ -20,7 +20,7 @@ import importlib.util
 config_module = None
 if importlib.util.find_spec("config") is not None:
     try:
-        import config
+        from .. import config
 
         config_module = config
     except ImportError:
@@ -154,7 +154,7 @@ class ContentExtractor:
             if config_module:
                 try:
                     # Try to access config, but don't require it
-                    from password_management import get_password
+                    from ..password_management import get_password
 
                     password = get_password()
                     if password:
@@ -258,7 +258,7 @@ class ContentExtractor:
             if config_module:
                 try:
                     # Try to access config, but don't require it
-                    from password_management import get_password
+                    from ..password_management import get_password
 
                     password = get_password()
                     if password:

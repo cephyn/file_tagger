@@ -44,14 +44,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import QUrl, QSize
 from sqlalchemy import and_, or_
-from models import File, Tag
-from config import Config
-from vector_search import VectorSearch
-from api_settings import APISettingsDialog
-from password_management import PasswordManagementDialog
-from tag_suggestion import TagSuggestionDialog
-from search import ChatWithResultsDialog
-from utils import is_dark_color, get_score_color, open_file, open_containing_folder
+from .models import File, Tag
+from .config import Config
+from .vector_search import VectorSearch
+from .api_settings import APISettingsDialog
+from .password_management import PasswordManagementDialog
+from .tag_suggestion import TagSuggestionDialog
+from .search import ChatWithResultsDialog
+from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 
 
 class HTMLDelegate(QStyledItemDelegate):
@@ -1079,7 +1079,7 @@ class FileTagManager(QMainWindow):
         if is_new_file or not had_tags_before:
             print("DEBUGGING: File should be indexed (new file or first tags)")
             try:
-                from vector_search.content_extractor import ContentExtractor
+                from .vector_search.content_extractor import ContentExtractor
 
                 # Extract content from the file
                 print(f"DEBUGGING: Extracting content from: {self.current_file_path}")
@@ -1567,7 +1567,7 @@ class FileTagManager(QMainWindow):
 
                     # Check which files are not in database or have no tags
                     # and generate suggestions for each file
-                    from tag_suggestion import TagSuggester
+                    from .tag_suggestion import TagSuggester
 
                     tag_suggester = TagSuggester(self.config)
 
@@ -1901,7 +1901,7 @@ class FileTagManager(QMainWindow):
         # If this is the first time the file has been tagged, add it to the vector database
         if is_new_file or not had_tags_before:
             try:
-                from vector_search.content_extractor import ContentExtractor
+                from .vector_search.content_extractor import ContentExtractor
 
                 # Extract content from the file
                 print(f"Attempting to extract content from: {file_path}")
@@ -2028,7 +2028,7 @@ class FileTagManager(QMainWindow):
             except Exception as e:
                 print(f"Error checking AI configuration: {str(e)}")
 
-            from vector_search.content_extractor import ContentExtractor
+            from .vector_search.content_extractor import ContentExtractor
 
             # Create progress dialog for extraction
             progress = QProgressDialog("Extracting content...", "Cancel", 0, 0, self)

@@ -7,9 +7,9 @@ from PySide6.QtGui import QColor
 from sqlalchemy.orm import Session
 from datetime import datetime
 import random
-from models import Tag, File, TagSuggestionCache
-from ai_service import AIService
-from config import Config
+from .models import Tag, File, TagSuggestionCache
+from .ai_service import AIService
+from .config import Config
 
 # Add TagSuggester class for batch processing of files
 class TagSuggester:
@@ -36,7 +36,7 @@ class TagSuggester:
         """
         try:
             # Create a session for the database operations
-            from models import init_db
+            from .models import init_db
             db_session = init_db()
             
             # Get all existing tags
@@ -480,8 +480,8 @@ class TagSuggestionDialog(QDialog):
                 try:
                     print(f"Indexing newly tagged file (via AI suggestions): {self.file_path}")
                     # Get vector search from parent window if possible
-                    from vector_search.content_extractor import ContentExtractor
-                    from vector_search import VectorSearch
+                    from .vector_search.content_extractor import ContentExtractor
+                    from .vector_search import VectorSearch
                     
                     # Get vector search instance (either from parent or create new)
                     vector_search = None
@@ -556,7 +556,7 @@ class TagSuggestionDialog(QDialog):
                     if hasattr(self.parent(), 'vector_search'):
                         vector_search = self.parent().vector_search
                     else:
-                        from vector_search import VectorSearch
+                        from .vector_search import VectorSearch
                         vector_search = VectorSearch(self.db_session)
                     
                     vector_search.update_metadata(self.file_path)

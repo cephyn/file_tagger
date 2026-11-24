@@ -5,8 +5,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta
 import importlib
-from pypdf import PdfReader
-from models import TagSuggestionCache
+from .models import TagSuggestionCache
 
 MAX_AI_CONTENT_SIZE = 10 * 1024 * 1024  # 10MB max for AI analysis
 CACHE_DURATION = timedelta(days=7)  # Cache suggestions for 7 days
@@ -165,6 +164,8 @@ class AIService:
                 # For PDF files, extract text without size limit
                 elif mime_type == "application/pdf":
                     try:
+                        from pypdf import PdfReader
+
                         f.seek(0)
                         reader = PdfReader(f)
                         text = ""

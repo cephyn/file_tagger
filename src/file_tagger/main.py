@@ -4,7 +4,6 @@ import logging
 import traceback
 from datetime import datetime
 from PySide6.QtWidgets import QApplication
-from login import LoginScreen
 
 # Set up error logging to file
 def setup_logging():
@@ -43,6 +42,8 @@ def main():
     os.environ["CHROMADB_DISABLE_ONNX"] = "1"
     
     try:
+        from .login import LoginScreen
+
         app = QApplication(sys.argv)
         app.setStyle('Fusion')
         

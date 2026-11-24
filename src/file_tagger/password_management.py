@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 from PySide6.QtCore import Qt
-from config import Config, get_recovery_key
+from .config import Config, get_recovery_key
 
 
 # Function to get the password from the user

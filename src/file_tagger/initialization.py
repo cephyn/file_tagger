@@ -5,9 +5,8 @@ import os
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QProgressBar
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QPixmap
-from models import init_db
-from config import Config
-from vector_search import VectorSearch
+from .models import init_db
+from .config import Config
 
 # Set ONNX environment variable here too for the worker thread
 os.environ["CHROMADB_DISABLE_ONNX"] = "1"
@@ -74,6 +73,8 @@ class InitializationWorker(QThread):
             logger.debug("Starting vector search initialization")
             self.progress_signal.emit("Setting up search engine...", 50)
             try:
+                from .vector_search import VectorSearch
+
                 vector_search = VectorSearch(db_session, config)
                 logger.debug("Vector search initialized successfully")
             except Exception as vs_error:

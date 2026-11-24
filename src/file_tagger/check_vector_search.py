@@ -3,8 +3,8 @@ Quick diagnostic script to check if vector search is initialized properly
 """
 
 import os
-from models import init_db, File
-from vector_search import VectorSearch
+from .models import init_db, File
+from .vector_search import VectorSearch
 
 def main():
     print("\n=== Vector Search Initialization Check ===\n")

@@ -9,7 +9,7 @@ import hashlib
 import secrets
 import string
 from typing import Optional
-from ai_service import AIService
+from .ai_service import AIService
 
 CONFIG_FILE = "config.encrypted"
 SALT_FILE = ".salt"

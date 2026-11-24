@@ -1,4 +1,4 @@
-from models import init_db, Tag, File
+from .models import init_db, Tag, File
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 

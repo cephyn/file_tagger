@@ -15,8 +15,8 @@ import traceback
 from .document_chunker import DocumentChunker
 from .content_extractor import ContentExtractor
 from .search_utils import SearchUtils
-from ai_service import AIService
-from config import Config
+from ..ai_service import AIService
+from ..config import Config
 
 
 class VectorSearch:
@@ -104,7 +104,7 @@ class VectorSearch:
             metadata["summary"] = summary
 
         # Add file's current tags
-        from models import File
+        from ..models import File
 
         file_obj = self.db_session.query(File).filter_by(path=file_path).first()
         if file_obj:
@@ -210,7 +210,7 @@ class VectorSearch:
 
         try:
             # Get file from database
-            from models import File
+            from ..models import File
 
             file_obj = self.db_session.query(File).filter_by(path=file_path).first()
             if not file_obj:
@@ -602,7 +602,7 @@ class VectorSearch:
                     print(f"Error clearing collection: {str(e2)}")
 
             # Get all files from database
-            from models import File
+            from ..models import File
 
             files = self.db_session.query(File).all()
             total_files = len(files)
@@ -673,7 +673,7 @@ class VectorSearch:
         print(f"\nChecking specific file: {file_path}")
 
         # Check if file exists in database
-        from models import File
+        from ..models import File
 
         file_obj = self.db_session.query(File).filter_by(path=file_path).first()
         if file_obj:
@@ -833,7 +833,7 @@ class VectorSearch:
         config_module = None
         if importlib.util.find_spec("config") is not None:
             try:
-                import config
+                from .. import config
 
                 config_module = config
             except ImportError:
@@ -845,7 +845,7 @@ class VectorSearch:
         # Otherwise try to load config directly
         elif config_module and hasattr(config_module, "Config"):
             try:
-                from password_management import get_password
+                from ..password_management import get_password
 
                 try:
                     password = get_password()

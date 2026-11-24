@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QTextEdit, QPushButton, QMessageBox, QApplication)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QTextCursor  # Added QTextCursor
-from vector_search.content_extractor import ContentExtractor
+from .vector_search.content_extractor import ContentExtractor
 
 def markdown_to_html(markdown_text):
     """

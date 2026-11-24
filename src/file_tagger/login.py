@@ -5,7 +5,7 @@ from PySide6.QtGui import QFont
 import logging
 import traceback
 import os
-from initialization import InitializationWorker
+from .initialization import InitializationWorker
 
 # Configure additional logging for login process
 logger = logging.getLogger("Login")
@@ -250,7 +250,7 @@ class LoginScreen(QWidget):
                     
                     # Import here to avoid circular imports
                     logger.debug("Importing FileTagManager")
-                    from file_tag_manager import FileTagManager
+                    from .file_tag_manager import FileTagManager
                     logger.debug("FileTagManager imported successfully")
                     
                     # Create and show the main window
