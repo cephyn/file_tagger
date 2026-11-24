@@ -37,6 +37,8 @@ htmlcov/
 *.log
 .DS_Store
 plans/
+!docs/plans/
+!docs/plans/**
 
 # Database
 *.db
