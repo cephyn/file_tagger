@@ -32,7 +32,10 @@ Last updated: 2026-11-24
 | 13: selective PDF vision fallback | Complete | `ad941b0` |
 | 14: provenance-aware chunking | Complete | `a23e027` |
 | 15: complete embedding coverage | Complete | `89c7b34` |
-| 16-29 | Not started | — |
+| 16: resumable transactional indexing | Complete | `a6bcb05`, `c8fe9f1`, `284bed4`, `cf7de50` |
+| 17: SQLite hybrid search | Complete | `ad05116`, `82c395e` |
+| 18: citation-first search results | Complete | `4f117a3`, `c3ec25a` |
+| 19-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -808,6 +811,8 @@ git commit -m "feat: guarantee complete embedding coverage"
 
 ### Task 16: Add Transactional, Resumable Index Jobs
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/indexing/service.py`
 - Create: `src/file_tagger/indexing/repository.py`
@@ -853,6 +858,8 @@ git commit -m "feat: add resumable transactional indexing"
 
 ### Task 17: Implement FTS5 and Vector Search with RRF
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/search/hybrid.py`
 - Create: `src/file_tagger/search/rrf.py`
@@ -896,6 +903,8 @@ git commit -m "feat: add SQLite hybrid search"
 ```
 
 ### Task 18: Add Citation-First Search Results
+
+**Status: Complete**
 
 **Files:**
 - Modify: `src/file_tagger/search/hybrid.py`
