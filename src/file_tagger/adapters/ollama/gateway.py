@@ -258,14 +258,19 @@ class OllamaGateway:
         text: str | Sequence[str],
         *,
         dimensions: int | None = None,
+        truncate: Literal[False] = False,
         keep_alive: float | str | None = "5m",
     ) -> tuple[tuple[float, ...], ...]:
+        if truncate is not False:
+            raise EmbeddingContextRejectedError(
+                "Ollama embeddings must never request input truncation."
+            )
         self._validate_model(model)
         try:
             response = await self._client.embed(
                 model=model,
                 input=text,
-                truncate=False,
+                truncate=truncate,
                 dimensions=dimensions,
                 keep_alive=keep_alive,
             )
