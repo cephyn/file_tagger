@@ -8,12 +8,17 @@ from sqlalchemy.orm import Session
 import mimetypes
 import os
 import random
+from typing import Protocol
 
 from .models import Tag, File
 from .tagging.decision_service import decide_tags
 
 
 MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
+
+
+class TagSuggestionConfig(Protocol):
+    def get_pdf_extractor(self) -> str: ...
 
 
 def _document_state(file_path: str) -> str:
@@ -38,7 +43,7 @@ def _document_state(file_path: str) -> str:
 class TagSuggester:
     """Helper class to suggest tags for multiple files."""
     
-    def __init__(self, config: object):
+    def __init__(self, config: TagSuggestionConfig):
         """
         Initialize the tag suggester with configuration.
         
@@ -186,7 +191,13 @@ class ConfidenceWidget(QWidget):
         super().mousePressEvent(event)
 
 class TagSuggestionDialog(QDialog):
-    def __init__(self, config: object, db_session: Session, file_path: str, parent=None):
+    def __init__(
+        self,
+        config: TagSuggestionConfig,
+        db_session: Session,
+        file_path: str,
+        parent=None,
+    ):
         super().__init__(parent)
         self.config = config
         self.db_session = db_session

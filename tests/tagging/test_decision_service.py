@@ -42,7 +42,8 @@ class FakeGateway:
 
 
 def choice(decision: str, confidence: float) -> dict[str, Any]:
-    probabilities = {"accept": 0.1, "reject": 0.1, "review": 0.1}
+    remainder = (1.0 - confidence) / 2.0
+    probabilities = {"accept": remainder, "reject": remainder, "review": remainder}
     probabilities[decision] = confidence
     return {
         "type": "choice",
@@ -124,7 +125,7 @@ def test_choice_noul_and_score_answers_become_tag_decisions() -> None:
     assert all(0.0 <= item.confidence <= 1.0 for item in result.decisions)
 
 
-def test_candidate_named_answers_are_validated_in_candidate_order() -> None:
+def test_candidate_named_answer_keys_are_rejected() -> None:
     class CandidateNamedGateway:
         async def system_one(self, model: str, **kwargs: Any) -> SimpleNamespace:
             return SimpleNamespace(
@@ -134,16 +135,12 @@ def test_candidate_named_answers_are_validated_in_candidate_order() -> None:
                 }
             )
 
-    result = decide_tags(
-        "encounter table",
-        ["dungeon", "invoice"],
-        gateway=CandidateNamedGateway(),
-    )
-
-    assert [(item.tag, item.decision) for item in result.decisions] == [
-        ("dungeon", "accept"),
-        ("invoice", "reject"),
-    ]
+    with pytest.raises(ValueError, match="unknown question"):
+        decide_tags(
+            "encounter table",
+            ["dungeon", "invoice"],
+            gateway=CandidateNamedGateway(),
+        )
 
 
 def test_missing_answers_fail_visibly() -> None:
@@ -169,6 +166,130 @@ def test_unknown_candidates_fail_visibly() -> None:
 
     with pytest.raises(ValueError, match="unknown"):
         decide_tags("document", ["dungeon"], gateway=gateway)
+
+
+@pytest.mark.parametrize(
+    "answer, message",
+    [
+        (
+            {
+                "type": "choice",
+                "choice": "accept",
+                "probabilities": {"accept": 1.0},
+                "confidence": 1.0,
+            },
+            "keys",
+        ),
+        (
+            {
+                "type": "choice",
+                "choice": "accept",
+                "probabilities": {
+                    "accept": 0.8,
+                    "reject": 0.2,
+                    "review": 0.1,
+                },
+                "confidence": 0.8,
+            },
+            "sum",
+        ),
+        (
+            {
+                "type": "choice",
+                "choice": "reject",
+                "probabilities": {
+                    "accept": 0.8,
+                    "reject": 0.1,
+                    "review": 0.1,
+                },
+                "confidence": 0.1,
+            },
+            "highest",
+        ),
+        (
+            {
+                "type": "choice",
+                "choice": "accept",
+                "probabilities": {
+                    "accept": 0.8,
+                    "reject": 0.1,
+                    "review": 0.1,
+                },
+                "confidence": 0.7,
+            },
+            "confidence",
+        ),
+        (
+            {
+                "type": "score",
+                "score": 1,
+                "legend": {"0": "no", "1": "yes"},
+                "probabilities": {"0": 0.2, "unknown": 0.8},
+                "confidence": 0.8,
+            },
+            "keys",
+        ),
+        (
+            {
+                "type": "score",
+                "score": 1,
+                "legend": {"0": "no", "1": "yes"},
+                "probabilities": {"0": 0.2, "1": 0.7},
+                "confidence": 0.7,
+            },
+            "sum",
+        ),
+    ],
+)
+def test_invalid_system_one_distributions_fail(
+    answer: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        decide_tags("document", ["dungeon"], gateway=FakeGateway([answer]))
+
+
+def test_choice_probability_tolerance_accepts_rounding_noise() -> None:
+    answer = {
+        "type": "choice",
+        "choice": "accept",
+        "probabilities": {"accept": 0.8, "reject": 0.1, "review": 0.1},
+        "confidence": 0.8000005,
+    }
+
+    result = decide_tags("document", ["dungeon"], gateway=FakeGateway([answer]))
+
+    assert result.accepted[0].confidence == pytest.approx(0.8, abs=1e-6)
+
+
+def test_original_candidate_identity_is_preserved_after_prompt_normalization() -> None:
+    gateway = FakeGateway([choice("accept", 1.0)])
+
+    result = decide_tags(
+        "document",
+        ["  Dungeon  "],
+        gateway=gateway,
+    )
+
+    assert result.accepted[0].tag == "  Dungeon  "
+    instructions = gateway.calls[0]["questions"]["candidate_000"]["instructions"]
+    assert "'Dungeon'" in instructions
+    assert "'  Dungeon  '" not in instructions
+
+
+def test_generated_question_id_does_not_collide_with_candidate_name() -> None:
+    gateway = FakeGateway([choice("accept", 1.0), choice("reject", 1.0)])
+
+    result = decide_tags(
+        "document",
+        ["candidate_001", "candidate_000"],
+        gateway=gateway,
+    )
+
+    assert [(item.tag, item.decision) for item in result.decisions] == [
+        ("candidate_001", "accept"),
+        ("candidate_000", "reject"),
+    ]
 
 
 @pytest.mark.parametrize(

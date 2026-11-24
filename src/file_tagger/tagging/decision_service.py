@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Coroutine, Mapping, Sequence
+from dataclasses import dataclass
 import json
 import math
 from typing import Any, Literal, Protocol, TypeVar
@@ -11,9 +12,18 @@ from ..domain.contracts import DomainRecord, TagDecision
 DEFAULT_DECISION_MODEL = "nimble:9b"
 MAX_SYSTEM_ONE_QUESTIONS = 64
 MAX_SYSTEM_ONE_TEXT_AND_SCHEMA_BYTES = 64 * 1024
+# System One probability values are tolerated to six decimal places for rounding.
+DISTRIBUTION_TOLERANCE = 1e-6
 
 T = TypeVar("T")
 TagOutcome = Literal["accept", "reject", "review"]
+CHOICE_OUTCOMES = frozenset({"accept", "reject", "review"})
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    original: str
+    prompt: str
 
 
 class DecisionGateway(Protocol):
@@ -70,8 +80,8 @@ async def decide_tags_async(
     *,
     gateway: DecisionGateway | None = None,
 ) -> TagDecisionResult:
-    normalized = _validate_request(document_state, candidates, model)
-    questions, question_candidates = _build_questions(normalized)
+    checked_candidates = _validate_request(document_state, candidates, model)
+    questions, question_candidates = _build_questions(checked_candidates)
 
     owns_gateway = gateway is None
     selected_gateway: DecisionGateway = gateway or OllamaGateway()
@@ -86,7 +96,7 @@ async def decide_tags_async(
             await _close_gateway(selected_gateway)
 
     return TagDecisionResult(
-        decisions=_parse_decisions(response, normalized, question_candidates)
+        decisions=_parse_decisions(response, question_candidates)
     )
 
 
@@ -94,7 +104,7 @@ def _validate_request(
     document_state: str,
     candidates: Sequence[str],
     model: str,
-) -> tuple[str, ...]:
+) -> tuple[_Candidate, ...]:
     if not isinstance(document_state, str) or not document_state.strip():
         raise ValueError("Document state must be a nonempty string.")
     if not isinstance(model, str) or not model.strip():
@@ -102,20 +112,26 @@ def _validate_request(
     if isinstance(candidates, str):
         raise ValueError("Candidates must be a sequence of tag names.")
 
-    normalized = tuple(candidate.strip() for candidate in candidates)
-    if not normalized:
+    if not all(isinstance(candidate, str) for candidate in candidates):
+        raise ValueError("Candidate tag names must be strings.")
+
+    checked = tuple(
+        _Candidate(original=candidate, prompt=candidate.strip())
+        for candidate in candidates
+    )
+    if not checked:
         raise ValueError("At least one candidate tag is required.")
-    if any(not candidate for candidate in normalized):
+    if any(not candidate.prompt for candidate in checked):
         raise ValueError("Candidate tag names must not be blank.")
-    if len(set(normalized)) != len(normalized):
+    if len({candidate.prompt for candidate in checked}) != len(checked):
         raise ValueError("Candidate tag names must be unique.")
-    if len(normalized) > MAX_SYSTEM_ONE_QUESTIONS:
+    if len(checked) > MAX_SYSTEM_ONE_QUESTIONS:
         raise ValueError(
             "System One supports at most "
             f"{MAX_SYSTEM_ONE_QUESTIONS} questions per request."
         )
 
-    questions, _ = _build_questions(normalized)
+    questions, _ = _build_questions(checked)
     request_size = len(
         json.dumps(
             {"state": document_state, "questions": questions},
@@ -128,21 +144,21 @@ def _validate_request(
             "The System One document state and question schema are too large; "
             f"the limit is {MAX_SYSTEM_ONE_TEXT_AND_SCHEMA_BYTES} bytes."
         )
-    return normalized
+    return checked
 
 
 def _build_questions(
-    candidates: Sequence[str],
-) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    candidates: Sequence[_Candidate],
+) -> tuple[dict[str, dict[str, Any]], dict[str, _Candidate]]:
     questions: dict[str, dict[str, Any]] = {}
-    question_candidates: dict[str, str] = {}
+    question_candidates: dict[str, _Candidate] = {}
     for index, candidate in enumerate(candidates):
         question_name = f"candidate_{index:03d}"
         question_candidates[question_name] = candidate
         questions[question_name] = {
             "type": "choice",
             "instructions": (
-                f"Decide whether the candidate tag {candidate!r} should be applied "
+                f"Decide whether the candidate tag {candidate.prompt!r} should be applied "
                 "to the document state."
             ),
             "criteria": {
@@ -156,56 +172,50 @@ def _build_questions(
 
 def _parse_decisions(
     response: Any,
-    candidates: Sequence[str],
-    question_candidates: Mapping[str, str],
+    question_candidates: Mapping[str, _Candidate],
 ) -> tuple[TagDecision, ...]:
     answers = _required_field(response, "answers", "System One response")
     if not isinstance(answers, Mapping):
         raise ValueError("System One answers must be a mapping.")
 
-    by_candidate: dict[str, Any] = {}
-    candidate_set = set(candidates)
+    by_question: dict[str, Any] = {}
     unknown: list[str] = []
     for answer_name, answer in answers.items():
-        if answer_name in question_candidates:
-            candidate = question_candidates[answer_name]
-        elif answer_name in candidate_set:
-            candidate = answer_name
-        else:
+        if not isinstance(answer_name, str) or answer_name not in question_candidates:
             unknown.append(str(answer_name))
             continue
-        if candidate in by_candidate:
+        if answer_name in by_question:
             raise ValueError(
-                f"System One returned duplicate answers for candidate {candidate!r}."
+                f"System One returned duplicate answers for question {answer_name!r}."
             )
-        by_candidate[candidate] = answer
+        by_question[answer_name] = answer
 
     if unknown:
         raise ValueError(
-            f"System One returned unknown candidates: {', '.join(sorted(unknown))}."
+            f"System One returned unknown question IDs: {', '.join(sorted(unknown))}."
         )
-    missing = candidate_set - set(by_candidate)
+    missing = set(question_candidates) - set(by_question)
     if missing:
-        raise ValueError(f"Missing System One answers: {', '.join(sorted(missing))}.")
+        raise ValueError(
+            f"Missing System One answers for questions: {', '.join(sorted(missing))}."
+        )
 
     return tuple(
         _parse_answer(
-            candidate,
-            by_candidate[candidate],
-            candidates,
+            candidate.original,
+            by_question[question_name],
         )
-        for candidate in candidates
+        for question_name, candidate in question_candidates.items()
     )
 
 
 def _parse_answer(
     candidate: str,
     answer: Any,
-    candidates: Sequence[str],
 ) -> TagDecision:
     answer_type = _required_field(answer, "type", f"answer for {candidate}")
     if answer_type == "choice":
-        decision, confidence = _parse_choice(answer, candidate, candidates)
+        decision, confidence = _parse_choice(answer, candidate)
     elif answer_type == "noul":
         decision, confidence = _parse_noul(answer)
     elif answer_type == "score":
@@ -223,7 +233,6 @@ def _parse_answer(
 def _parse_choice(
     answer: Any,
     candidate: str,
-    candidates: Sequence[str],
 ) -> tuple[TagOutcome, float]:
     selected = _required_field(answer, "choice", f"choice answer for {candidate}")
     if not isinstance(selected, str):
@@ -234,44 +243,41 @@ def _parse_choice(
     )
     if not isinstance(probabilities, Mapping):
         raise ValueError("System One choice probabilities must be a mapping.")
-    checked_probabilities = {
-        str(key): _probability(value, f"probability for {key}")
-        for key, value in probabilities.items()
-    }
+    checked_probabilities = _validated_distribution(
+        probabilities,
+        CHOICE_OUTCOMES,
+        "System One choice",
+    )
 
     raw_confidence = _required_field(
         answer, "confidence", f"choice answer for {candidate}"
     )
     confidence = _probability(raw_confidence, "choice confidence")
 
-    decisions = {"accept", "reject", "review"}
-    if selected in decisions:
-        if selected not in checked_probabilities:
-            raise ValueError(f"Missing probability for selected choice {selected!r}.")
-        if set(checked_probabilities) - decisions:
-            raise ValueError("System One returned an unknown choice decision.")
-        if selected == "accept":
-            return "accept", confidence
-        if selected == "reject":
-            return "reject", confidence
-        return "review", confidence
+    if selected not in CHOICE_OUTCOMES:
+        raise ValueError(f"System One returned unknown choice {selected!r}.")
 
-    if selected in candidates:
-        unknown = set(checked_probabilities) - set(candidates)
-        if unknown:
-            raise ValueError(
-                f"System One returned unknown candidate choices: "
-                f"{', '.join(sorted(unknown))}."
-            )
-        if selected != candidate:
-            raise ValueError(
-                f"System One choice {selected!r} does not match candidate {candidate!r}."
-            )
-        if selected not in checked_probabilities:
-            raise ValueError(f"Missing probability for selected candidate {selected!r}.")
+    selected_probability = checked_probabilities[selected]
+    highest_probability = max(checked_probabilities.values())
+    if selected_probability < highest_probability:
+        raise ValueError(
+            f"System One selected choice {selected!r} is not the highest probability."
+        )
+    if not math.isclose(
+        confidence,
+        selected_probability,
+        rel_tol=0.0,
+        abs_tol=DISTRIBUTION_TOLERANCE,
+    ):
+        raise ValueError(
+            "System One choice confidence does not match the selected probability "
+            f"within tolerance {DISTRIBUTION_TOLERANCE:g}."
+        )
+    if selected == "accept":
         return "accept", confidence
-
-    raise ValueError(f"System One returned unknown candidate choice {selected!r}.")
+    if selected == "reject":
+        return "reject", confidence
+    return "review", confidence
 
 
 def _parse_noul(answer: Any) -> tuple[TagOutcome, float]:
@@ -289,10 +295,21 @@ def _parse_score(answer: Any) -> tuple[TagOutcome, float]:
     probabilities = _required_field(answer, "probabilities", "score answer")
     if not isinstance(legend, Mapping) or len(legend) < 2:
         raise ValueError("System One score answers require at least two legend levels.")
+    legend_keys = set(legend)
+    if not all(isinstance(key, str) for key in legend_keys):
+        raise ValueError("System One score legend keys must be strings.")
+    expected_keys = {str(index) for index in range(len(legend))}
+    if legend_keys != expected_keys:
+        raise ValueError(
+            "System One score legend keys must be a contiguous zero-based sequence."
+        )
     if not isinstance(probabilities, Mapping):
         raise ValueError("System One score probabilities must be a mapping.")
-    for key, value in probabilities.items():
-        _probability(value, f"score probability for {key}")
+    _validated_distribution(
+        probabilities,
+        expected_keys,
+        "System One score",
+    )
 
     raw_score = _required_field(answer, "score", "score answer")
     score = _finite_number(raw_score, "score")
@@ -340,6 +357,35 @@ def _probability(value: Any, label: str) -> float:
     if probability < 0.0 or probability > 1.0:
         raise ValueError(f"{label} must be a probability between 0 and 1.")
     return probability
+
+
+def _validated_distribution(
+    value: Mapping[Any, Any],
+    expected_keys: set[str] | frozenset[str],
+    label: str,
+) -> dict[str, float]:
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{label} probability keys must be strings.")
+    checked = {
+        key: _probability(item, f"{label} probability for {key}")
+        for key, item in value.items()
+    }
+    if set(checked) != set(expected_keys):
+        raise ValueError(
+            f"{label} probability keys are unknown or missing; expected exactly "
+            f"{', '.join(sorted(expected_keys))}."
+        )
+    if not math.isclose(
+        math.fsum(checked.values()),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=DISTRIBUTION_TOLERANCE,
+    ):
+        raise ValueError(
+            f"{label} probabilities must sum to 1 within tolerance "
+            f"{DISTRIBUTION_TOLERANCE:g}."
+        )
+    return checked
 
 
 async def _close_gateway(gateway: DecisionGateway) -> None:

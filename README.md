@@ -136,6 +136,11 @@ On first run, you'll be prompted to set a password for encrypting your settings.
 
 Note: Tag suggestions are cached for 7 days to improve performance. Use the "Force Refresh" button to re-analyze a file.
 
+Typed tag decisions use generated question IDs and preserve the exact database tag
+name separately from its prompt-normalized value. Probability distributions must
+sum to 1, and choice confidence may differ from the selected probability by at
+most `1e-6` to allow numeric rounding.
+
 ### Using Vector Search
 1. Navigate to the search tab
 2. Enter your search query in the semantic search field
