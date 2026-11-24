@@ -31,6 +31,34 @@ def test_database_configures_every_connection(tmp_path) -> None:
         assert session.scalar(text("PRAGMA journal_mode")) == "wal"
 
 
+def test_database_registers_deterministic_unicode_normalization_on_connections(
+    tmp_path,
+) -> None:
+    session_factory = create_session_factory(tmp_path / "app.sqlite3")
+
+    with session_factory() as first_session:
+        assert (
+            first_session.scalar(text("SELECT unicode_normalize('Straße')"))
+            == "strasse"
+        )
+        with session_factory() as second_session:
+            assert (
+                second_session.scalar(text("SELECT unicode_normalize('STRASSE')"))
+                == "strasse"
+            )
+            assert second_session.scalar(text("SELECT vec_version() IS NOT NULL")) == 1
+
+    with session_factory() as session:
+        function_flags = session.scalar(
+            text(
+                "SELECT flags FROM pragma_function_list "
+                "WHERE name = 'unicode_normalize'"
+            )
+        )
+        assert isinstance(function_flags, int)
+        assert function_flags & 0x800
+
+
 def test_database_reports_missing_vector_extension(tmp_path, monkeypatch) -> None:
     from file_tagger.infrastructure import database
 

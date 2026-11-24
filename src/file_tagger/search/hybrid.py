@@ -2,13 +2,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import struct
 from typing import Literal
-import unicodedata
 
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from ..domain.contracts import SearchCandidate
+from ..infrastructure.database import normalize_unicode_key
 from .rrf import FusedHit, reciprocal_rank_fusion
 
 VECTOR_DIMENSIONS = frozenset({256, 512, 768})
@@ -25,7 +25,8 @@ class SearchFilters:
 
 
 def normalize_fts_query(query: str) -> str:
-    normalized = unicodedata.normalize("NFKC", query).casefold()
+    normalized = normalize_unicode_key(query)
+    assert normalized is not None
     tokens: list[str] = []
     current: list[str] = []
     for character in normalized:
@@ -330,28 +331,36 @@ def _filter_sql(
             "EXISTS ("
             "SELECT 1 FROM file_tags AS ft "
             "JOIN tags AS t ON t.id = ft.tag_id "
-            "WHERE ft.file_id = f.id AND lower(t.name) = lower(:" + name + ")"
+            "WHERE ft.file_id = f.id "
+            "AND unicode_normalize(t.name) = unicode_normalize(:" + name + ")"
             ")"
         )
         parameters[name] = tag
 
     if filters.path is not None and filters.path.strip():
-        clauses.append("lower(f.canonical_path) LIKE :path_filter ESCAPE '\\'")
-        parameters["path_filter"] = (
-            f"%{_escape_like(filters.path.strip().casefold())}%"
+        normalized_path = normalize_unicode_key(filters.path.strip())
+        assert normalized_path is not None
+        clauses.append(
+            "unicode_normalize(f.canonical_path) "
+            "LIKE unicode_normalize(:path_filter) ESCAPE '\\'"
         )
+        parameters["path_filter"] = f"%{_escape_like(normalized_path)}%"
 
     type_clauses: list[str] = []
     for index, file_type in enumerate(filters.file_types):
-        normalized = file_type.strip().casefold()
+        normalized = normalize_unicode_key(file_type.strip())
+        assert normalized is not None
         name = f"file_type_{index}"
         if "/" in normalized:
-            type_clauses.append(f"lower(f.mime_type) = :{name}")
+            type_clauses.append(
+                f"unicode_normalize(f.mime_type) = unicode_normalize(:{name})"
+            )
             parameters[name] = normalized
         else:
             extension = normalized.removeprefix(".")
             type_clauses.append(
-                f"lower(f.canonical_path) LIKE :{name} ESCAPE '\\'"
+                f"unicode_normalize(f.canonical_path) "
+                f"LIKE unicode_normalize(:{name}) ESCAPE '\\'"
             )
             parameters[name] = f"%.{_escape_like(extension)}"
     if type_clauses:

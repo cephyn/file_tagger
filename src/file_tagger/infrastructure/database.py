@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+import unicodedata
 
 from alembic import command
 from alembic.config import Config
@@ -11,6 +12,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..domain.errors import DatabaseExtensionError
 
 BUSY_TIMEOUT_MS = 5_000
+
+
+def normalize_unicode_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return unicodedata.normalize("NFKC", value).casefold()
 
 
 def configure_sqlite_engine(engine: Engine) -> Engine:
@@ -33,6 +40,12 @@ def configure_sqlite_connection(
             sqlite_vec.load(dbapi_connection)
         finally:
             dbapi_connection.enable_load_extension(False)
+        dbapi_connection.create_function(
+            "unicode_normalize",
+            1,
+            normalize_unicode_key,
+            deterministic=True,
+        )
     except sqlite3.Error as exc:
         raise DatabaseExtensionError(
             "The required sqlite-vec extension could not be loaded."

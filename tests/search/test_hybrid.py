@@ -8,8 +8,12 @@ from sqlalchemy.orm import Session
 
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.persistence.models import Chunk, Document, File, FileTag, Page, Tag
-from file_tagger.search.hybrid import HybridSearch, normalize_fts_query
-from file_tagger.search.rrf import reciprocal_rank_fusion
+from file_tagger.search.hybrid import (
+    HybridSearch,
+    SearchFilters,
+    normalize_fts_query,
+)
+from file_tagger.search.rrf import FusedHit, reciprocal_rank_fusion
 
 DIMENSIONS = 256
 
@@ -296,6 +300,87 @@ def test_search_applies_tag_path_and_type_filters_in_sql(
     )
 
     assert [candidate.chunk_id for candidate in result] == ["wanted"]
+
+
+@pytest.mark.parametrize("file_type", ["strasse", "APPLICATION/STRASSE"])
+@pytest.mark.parametrize(
+    ("query", "embedding"),
+    [
+        ("unicode needle", None),
+        ("semantic phrase absent from text", _vector(1.0, 0.0)),
+    ],
+)
+def test_unicode_filters_match_lexical_and_vector_rankings(
+    search_session: Session,
+    tmp_path: Path,
+    file_type: str,
+    query: str,
+    embedding: tuple[float, ...] | None,
+) -> None:
+    folder = tmp_path / "Straße"
+    folder.mkdir()
+    _seed_chunk(
+        search_session,
+        path=folder / "record.STRASSE",
+        stable_id="unicode-match",
+        text_value="Unicode needle appears in searchable text.",
+        vector=_vector(1.0, 0.0),
+        tags=("Straße",),
+        mime_type="application/Straße",
+    )
+    search_session.commit()
+
+    result = HybridSearch(search_session).search(
+        query,
+        embedding,
+        tags=("STRASSE",),
+        path="strasse",
+        file_type=file_type,
+    )
+
+    assert [candidate.chunk_id for candidate in result] == ["unicode-match"]
+
+
+def test_unicode_filters_are_reapplied_during_hydration(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "Straße"
+    folder.mkdir()
+    _seed_chunk(
+        search_session,
+        path=folder / "record.STRASSE",
+        stable_id="hydration-match",
+        text_value="Hydration candidate.",
+        vector=_vector(1.0, 0.0),
+        tags=("Straße",),
+        mime_type="application/Straße",
+    )
+    search_session.commit()
+    fused = (
+        FusedHit(
+            chunk_id="hydration-match",
+            rank=1,
+            score=1.0,
+            source_ranks={"lexical": 1},
+        ),
+    )
+
+    matching = HybridSearch(search_session)._hydrate_candidates(
+        fused,
+        SearchFilters(
+            tags=("STRASSE",),
+            path="strasse",
+            file_types=("APPLICATION/STRASSE",),
+        ),
+    )
+    excluded = HybridSearch(search_session)._hydrate_candidates(
+        fused,
+        SearchFilters(tags=("personal",)),
+    )
+
+    assert set(matching) == {"hydration-match"}
+    assert excluded == {}
 
 
 def test_vector_filters_are_applied_before_the_nearest_neighbor_limit(
