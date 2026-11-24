@@ -669,9 +669,8 @@ class FileTagManager(QMainWindow):
 
         # Chat with results button
         chat_btn = QPushButton("Chat with Results")
-        chat_btn.clicked.connect(self.chat_with_results)
-        chat_btn.setEnabled(False)  # Disabled until results are available
-        self.chat_results_btn = chat_btn  # Store reference to enable/disable
+        chat_btn.setEnabled(False)
+        self.chat_results_btn = chat_btn
         buttons_layout.addWidget(chat_btn)
 
         results_layout.addLayout(buttons_layout)
@@ -1385,9 +1384,6 @@ class FileTagManager(QMainWindow):
 
                         # Add to results list
                         self.rag_search_results.addItem(snippet_item)
-
-            # Enable chat button if results are available
-            self.chat_results_btn.setEnabled(True)
 
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Search failed: {str(e)}")
