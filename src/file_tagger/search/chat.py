@@ -1,10 +1,16 @@
 import os
 import re
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QTextEdit, QPushButton, QMessageBox, QApplication)
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QTextCursor  # Added QTextCursor
-from .vector_search.content_extractor import ContentExtractor
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+)
+from PySide6.QtGui import QTextCursor
+from ..vector_search.content_extractor import ContentExtractor
 
 def markdown_to_html(markdown_text):
     """
@@ -177,7 +183,7 @@ class ChatWithResultsDialog(QDialog):
                     context += f"Content:\n```\n{full_content}\n```\n\n"
                 else:
                     # Fallback to snippets if full extraction fails
-                    context += f"Content snippets (full extraction failed):\n"
+                    context += "Content snippets (full extraction failed):\n"
                     for snippet in result.get('snippets', []):
                         context += f"- {snippet}\n"
                     context += "\n"
@@ -190,9 +196,9 @@ class ChatWithResultsDialog(QDialog):
         
         # Add the initial query as system message
         system_message = (
-            f"You are an assistant helping with questions about documents. "
-            f"Base your answers only on the document content provided. "
-            f"If the answer is not in the documents, say that you don't know based on the available information."
+            "You are an assistant helping with questions about documents. "
+            "Base your answers only on the document content provided. "
+            "If the answer is not in the documents, say that you don't know based on the available information."
         )
         
         # Display a welcome message
