@@ -8,6 +8,7 @@ from ..domain.contracts import DomainRecord
 
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_HTML_COMMENT = re.compile(r"<!--.*?-->", flags=re.DOTALL)
 _LIST_PREFIX = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 _BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 _INLINE_CODE = re.compile(r"`([^`]+)`")
@@ -47,6 +48,7 @@ def normalize_markdown_context(markdown_context: str) -> NormalizedMarkdownConte
         raise ValueError("Markdown context must be a string.")
 
     normalized = unicodedata.normalize("NFKC", markdown_context)
+    normalized = _HTML_COMMENT.sub(_comment_newlines, normalized)
     sections: list[MarkdownSection] = []
     current_name: str | None = None
     current_lines: list[str] = []
@@ -99,11 +101,10 @@ def normalize_markdown_context(markdown_context: str) -> NormalizedMarkdownConte
 
 
 def _normalize_text(value: str) -> str:
-    normalized = re.sub(r"<!--.*?-->", "", value, flags=re.DOTALL)
     normalized = re.sub(
         r"!\[([^\]]*)\]\([^)]*\)",
         lambda match: match.group(1),
-        normalized,
+        value,
     )
     normalized = re.sub(
         r"\[([^\]]+)\]\([^)]*\)",
@@ -125,6 +126,10 @@ def _normalize_text(value: str) -> str:
     normalized = re.sub(r"(?<!\w)[*_~](.+?)[*_~](?!\w)", r"\1", normalized)
     normalized = re.sub(r"<[^>]+>", "", normalized)
     return " ".join(normalized.split())
+
+
+def _comment_newlines(match: re.Match[str]) -> str:
+    return "\n" * match.group(0).count("\n")
 
 
 def _extract_explicit_entities(line: str) -> tuple[str, ...]:

@@ -26,6 +26,14 @@ class ModelIncompatibleError(FileTaggerError):
     """Raised when an installed model lacks a required capability."""
 
 
+class GenerationContextRejectedError(ModelIncompatibleError):
+    """Raised when generation input cannot fit the model context."""
+
+
+class StructuredOutputError(ModelIncompatibleError, ValueError):
+    """Raised when a model cannot produce the requested structured output."""
+
+
 class ModelRecommendationError(FileTaggerError):
     """Raised when local hardware cannot support a required model role."""
 

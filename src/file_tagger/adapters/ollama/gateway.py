@@ -9,11 +9,13 @@ from ollama import AsyncClient, ResponseError
 from ...domain.contracts import ModelProfile, OllamaReadiness
 from ...domain.errors import (
     EmbeddingContextRejectedError,
+    GenerationContextRejectedError,
     ModelIncompatibleError,
     ModelMissingError,
     OllamaTimeoutError,
     OllamaUnavailableError,
     RemoteOllamaHostError,
+    StructuredOutputError,
 )
 
 
@@ -336,12 +338,42 @@ class OllamaGateway:
         except ResponseError as exc:
             if exc.status_code == 404:
                 raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
+            message = str(exc).casefold()
+            if any(
+                marker in message
+                for marker in ("context length", "context window", "too many tokens")
+            ):
+                raise GenerationContextRejectedError(
+                    "Local Ollama chat input exceeded the model context."
+                ) from exc
+            if any(
+                marker in message
+                for marker in (
+                    "json schema",
+                    "structured output",
+                    "response format",
+                    "invalid format",
+                    "unsupported format",
+                )
+            ):
+                raise StructuredOutputError(
+                    "Local Ollama model rejected structured chat output."
+                ) from exc
+            if any(
+                marker in message
+                for marker in ("capability", "does not support", "unsupported")
+            ):
+                raise ModelIncompatibleError(
+                    "Local Ollama model is incompatible with structured chat."
+                ) from exc
             raise OllamaUnavailableError(
                 f"Local Ollama chat failed with status {exc.status_code}."
             ) from exc
         content = response.message.content
         if not isinstance(content, str):
-            raise OllamaUnavailableError("Local Ollama returned an empty chat response.")
+            raise StructuredOutputError(
+                "Local Ollama returned an empty chat response."
+            )
         return content
 
     async def chat_stream(
@@ -371,6 +403,30 @@ class OllamaGateway:
             if exc.status_code == 404:
                 raise ModelMissingError(
                     f"Local Ollama model is not installed: {model}."
+                ) from exc
+            message = str(exc).casefold()
+            if any(
+                marker in message
+                for marker in ("context length", "context window", "too many tokens")
+            ):
+                raise GenerationContextRejectedError(
+                    "Local Ollama streaming chat input exceeded the model context."
+                ) from exc
+            if any(
+                marker in message
+                for marker in (
+                    "json schema",
+                    "structured output",
+                    "response format",
+                    "invalid format",
+                    "unsupported format",
+                    "capability",
+                    "does not support",
+                    "unsupported",
+                )
+            ):
+                raise ModelIncompatibleError(
+                    "Local Ollama model is incompatible with structured streaming chat."
                 ) from exc
             raise OllamaUnavailableError(
                 f"Local Ollama streaming chat failed with status {exc.status_code}."

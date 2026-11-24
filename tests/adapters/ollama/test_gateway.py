@@ -6,6 +6,7 @@ import pytest
 from file_tagger.adapters.ollama.gateway import OllamaGateway
 from file_tagger.domain.errors import (
     EmbeddingContextRejectedError,
+    GenerationContextRejectedError,
     ModelIncompatibleError,
     OllamaUnavailableError,
     RemoteOllamaHostError,
@@ -215,3 +216,42 @@ def test_embedding_context_rejection_is_explicit() -> None:
 
     with pytest.raises(EmbeddingContextRejectedError):
         asyncio.run(gateway.embed("embeddinggemma-2:270m", "too large"))
+
+
+class StructuredOutputRejectedClient(FakeAsyncClient):
+    async def chat(self, **kwargs):
+        from ollama import ResponseError
+
+        raise ResponseError("model does not support JSON schema output", status_code=400)
+
+
+def test_local_structured_output_failure_is_model_incompatible() -> None:
+    gateway = OllamaGateway(client=StructuredOutputRejectedClient())
+
+    with pytest.raises(ModelIncompatibleError):
+        asyncio.run(
+            gateway.chat(
+                "gemma4:e4b",
+                messages=[{"role": "user", "content": "Find the guide"}],
+                schema={"type": "object"},
+            )
+        )
+
+
+class ChatContextRejectedClient(FakeAsyncClient):
+    async def chat(self, **kwargs):
+        from ollama import ResponseError
+
+        raise ResponseError("prompt is too long for the context window", status_code=400)
+
+
+def test_local_chat_context_failure_is_explicit() -> None:
+    gateway = OllamaGateway(client=ChatContextRejectedClient())
+
+    with pytest.raises(GenerationContextRejectedError):
+        asyncio.run(
+            gateway.chat(
+                "gemma4:e4b",
+                messages=[{"role": "user", "content": "Find the guide"}],
+            )
+        )

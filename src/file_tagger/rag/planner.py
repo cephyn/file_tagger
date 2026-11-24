@@ -1,19 +1,46 @@
 import asyncio
 from collections.abc import Coroutine, Mapping, Sequence
 import json
-from typing import Any, Protocol, TypeAlias, TypeVar
+from typing import Annotated, Any, Protocol, TypeAlias, TypeVar
 import unicodedata
 
 from pydantic import AliasChoices, ConfigDict, Field, ValidationError, field_validator
 
 from ..adapters.ollama.gateway import OllamaGateway
-from ..domain.contracts import DomainRecord
-from ..domain.errors import ModelIncompatibleError, ModelMissingError
+from ..domain.contracts import DomainRecord, ModelProfile
+from ..domain.errors import (
+    GenerationContextRejectedError,
+    ModelIncompatibleError,
+    ModelMissingError,
+    StructuredOutputError,
+)
 from .context import NormalizedMarkdownContext, normalize_markdown_context
 
 
 DEFAULT_PLANNER_MODEL = "inkling-2-mini"
 DEFAULT_FALLBACK_MODEL = "gemma4:e4b"
+DEFAULT_UNPROFILED_CONTEXT_LENGTH = 32_768
+MAX_PLAN_RESPONSE_BYTES = 16_384
+MAX_QUESTION_LENGTH = 1_024
+MAX_INTENT_ITEMS = 8
+MAX_EXACT_TERM_ITEMS = 16
+MAX_PARAPHRASE_ITEMS = 8
+MAX_AUXILIARY_ITEMS = 16
+MAX_EVIDENCE_ITEMS = 8
+MAX_NAME_LENGTH = 64
+MAX_TERM_LENGTH = 128
+MAX_QUERY_LENGTH = 256
+MAX_AUXILIARY_LENGTH = 160
+ASCII_BYTES_PER_TOKEN = 4
+OUTPUT_TOKEN_RESERVE = 4_096
+
+PlanName: TypeAlias = Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)]
+PlanTerm: TypeAlias = Annotated[str, Field(min_length=1, max_length=MAX_TERM_LENGTH)]
+PlanQuery: TypeAlias = Annotated[str, Field(min_length=1, max_length=MAX_QUERY_LENGTH)]
+PlanConstraint: TypeAlias = Annotated[
+    str,
+    Field(min_length=1, max_length=MAX_AUXILIARY_LENGTH),
+]
 
 T = TypeVar("T")
 JsonMapping: TypeAlias = Mapping[str, Any]
@@ -33,23 +60,38 @@ class PlannerGateway(Protocol):
 class SearchPlan(DomainRecord):
     model_config = ConfigDict(extra="forbid", frozen=True, validate_by_name=True)
 
-    question: str = Field(min_length=1)
-    intent_names: tuple[str, ...] = Field(
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_LENGTH)
+    intent_names: tuple[PlanName, ...] = Field(
         min_length=1,
+        max_length=MAX_INTENT_ITEMS,
         validation_alias=AliasChoices("intent_names", "intents"),
     )
-    exact_terms: tuple[str, ...] = Field(
+    exact_terms: tuple[PlanTerm, ...] = Field(
         default=(),
+        max_length=MAX_EXACT_TERM_ITEMS,
         validation_alias=AliasChoices("exact_terms", "exact_entities"),
     )
-    paraphrase_queries: tuple[str, ...] = Field(
+    paraphrase_queries: tuple[PlanQuery, ...] = Field(
         min_length=1,
+        max_length=MAX_PARAPHRASE_ITEMS,
         validation_alias=AliasChoices("paraphrase_queries", "subqueries"),
     )
-    filters: tuple[str, ...] = ()
-    exclusions: tuple[str, ...] = ()
-    normalized_constraints: tuple[str, ...] = ()
-    evidence_categories: tuple[str, ...] = Field(min_length=1)
+    filters: tuple[PlanConstraint, ...] = Field(
+        default=(),
+        max_length=MAX_AUXILIARY_ITEMS,
+    )
+    exclusions: tuple[PlanConstraint, ...] = Field(
+        default=(),
+        max_length=MAX_AUXILIARY_ITEMS,
+    )
+    normalized_constraints: tuple[PlanConstraint, ...] = Field(
+        default=(),
+        max_length=MAX_AUXILIARY_ITEMS,
+    )
+    evidence_categories: tuple[PlanName, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVIDENCE_ITEMS,
+    )
 
     @field_validator("question", mode="before")
     @classmethod
@@ -143,24 +185,23 @@ async def build_search_plan_async(
     try:
         for index, current_model in enumerate(models):
             try:
+                profile = await _generation_profile(selected_gateway, current_model)
+                _enforce_prompt_budget(
+                    current_model,
+                    messages,
+                    SearchPlan.model_json_schema(),
+                    profile,
+                )
                 response = await selected_gateway.chat(
                     current_model,
                     messages=messages,
                     schema=SearchPlan.model_json_schema(),
                 )
-            except ModelMissingError:
+                return _parse_plan(response, checked_question, context)
+            except (ModelMissingError, ModelIncompatibleError):
                 if index + 1 < len(models):
                     continue
                 raise
-            except ModelIncompatibleError:
-                if (
-                    checked_model == DEFAULT_PLANNER_MODEL
-                    and index + 1 < len(models)
-                    and "cloud" not in current_model.casefold()
-                ):
-                    continue
-                raise
-            return _parse_plan(response, checked_question, context)
         raise ModelMissingError("No local search planning model is available.")
     finally:
         if owns_gateway:
@@ -177,15 +218,32 @@ def _validate_request(
     if not isinstance(model, str) or not model.strip():
         raise ValueError("A local search planning model is required.")
     checked_question = " ".join(unicodedata.normalize("NFKC", question).split())
+    if len(checked_question) > MAX_QUESTION_LENGTH:
+        raise ValueError(
+            f"A search question must not exceed {MAX_QUESTION_LENGTH} characters."
+        )
     checked_model = model.strip()
+    _reject_cloud_model(checked_model)
     if fallback_model is None:
         return checked_question, checked_model, None
     if not isinstance(fallback_model, str) or not fallback_model.strip():
         raise ValueError("The Gemma search planning fallback must be a model name.")
     checked_fallback = fallback_model.strip()
+    _reject_cloud_model(checked_fallback)
     if not checked_fallback.casefold().startswith("gemma4:"):
         raise ValueError("The search planning fallback must be a Gemma 4 model.")
     return checked_question, checked_model, checked_fallback
+
+
+def _reject_cloud_model(model: str) -> None:
+    normalized = model.casefold()
+    if normalized == "cloud" or any(
+        marker in normalized
+        for marker in (":cloud", "-cloud", "cloud:", ".cloud")
+    ):
+        raise ModelIncompatibleError(
+            "Cloud-hosted model variants are not supported."
+        )
 
 
 def _planning_messages(
@@ -225,26 +283,110 @@ def _parse_plan(
     question: str,
     context: NormalizedMarkdownContext,
 ) -> SearchPlan:
+    if not isinstance(response, str):
+        raise StructuredOutputError(
+            "search plan generation returned invalid structured data."
+        )
+    if len(response.encode("utf-8")) > MAX_PLAN_RESPONSE_BYTES:
+        raise StructuredOutputError(
+            "search plan generation returned oversized structured data."
+        )
     try:
         payload = json.loads(response)
     except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("search plan generation returned malformed JSON.") from exc
+        raise StructuredOutputError(
+            "search plan generation returned malformed JSON."
+        ) from exc
     if not isinstance(payload, dict):
-        raise ValueError("search plan generation returned invalid structured data.")
+        raise StructuredOutputError(
+            "search plan generation returned invalid structured data."
+        )
 
     payload["question"] = question
     try:
         plan = SearchPlan.model_validate(payload)
     except ValidationError as exc:
-        raise ValueError("search plan generation returned invalid structured data.") from exc
-    return plan.model_copy(
-        update={
-            "exact_terms": _merge_terms(plan.exact_terms, context.entities),
-            "normalized_constraints": _merge_terms(
-                plan.normalized_constraints,
-                context.constraints,
-            ),
-        }
+        raise StructuredOutputError(
+            "search plan generation returned invalid structured data."
+        ) from exc
+    try:
+        return SearchPlan.model_validate(
+            {
+                **plan.model_dump(),
+                "exact_terms": _merge_terms(plan.exact_terms, context.entities),
+                "normalized_constraints": _merge_terms(
+                    plan.normalized_constraints,
+                    context.constraints,
+                ),
+            }
+        )
+    except ValidationError as exc:
+        raise StructuredOutputError(
+            "search plan generation exceeded structured data bounds."
+        ) from exc
+
+
+async def _generation_profile(
+    gateway: PlannerGateway,
+    model: str,
+) -> ModelProfile | None:
+    profile_method = getattr(gateway, "model_profile", None)
+    if not callable(profile_method):
+        return None
+    raw_profile = await profile_method("generation", model)
+    try:
+        profile = (
+            raw_profile
+            if isinstance(raw_profile, ModelProfile)
+            else ModelProfile.model_validate(raw_profile)
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ModelIncompatibleError(
+            f"Model {model} returned an invalid generation profile."
+        ) from exc
+    if profile.role != "generation" or profile.model != model:
+        raise ModelIncompatibleError(
+            f"Model {model} returned a mismatched generation profile."
+        )
+    if "completion" not in profile.capabilities:
+        raise ModelIncompatibleError(
+            f"Model {model} lacks the required completion capability."
+        )
+    return profile
+
+
+def _enforce_prompt_budget(
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    schema: JsonMapping,
+    profile: ModelProfile | None,
+) -> None:
+    context_length = (
+        profile.context_length
+        if profile is not None
+        else DEFAULT_UNPROFILED_CONTEXT_LENGTH
+    )
+    prompt_text = json.dumps(
+        {"messages": messages, "format": schema},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    estimated_prompt_tokens = _estimate_token_count(prompt_text)
+    required_context_tokens = estimated_prompt_tokens + OUTPUT_TOKEN_RESERVE
+    if required_context_tokens > context_length:
+        raise GenerationContextRejectedError(
+            f"Search planning prompt for {model} exceeds its context budget "
+            f"({required_context_tokens} required, {context_length} available)."
+        )
+
+
+def _estimate_token_count(text: str) -> int:
+    ascii_bytes = sum(character.isascii() for character in text)
+    non_ascii_bytes = len(text.encode("utf-8")) - ascii_bytes
+    return max(
+        1,
+        (ascii_bytes + ASCII_BYTES_PER_TOKEN - 1) // ASCII_BYTES_PER_TOKEN
+        + non_ascii_bytes,
     )
 
 
