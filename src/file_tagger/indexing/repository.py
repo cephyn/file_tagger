@@ -5,9 +5,11 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import struct
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import case, delete, func, select, text, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..domain.errors import IndexTransactionError
@@ -29,6 +31,7 @@ VECTOR_DIMENSIONS = (256, 512, 768)
 @dataclass(frozen=True)
 class JobState:
     id: int
+    lease_token: str | None
     file_path: str
     status: str
     total_count: int
@@ -89,31 +92,58 @@ class IndexingRepository:
             return int(job.id)
 
     def begin(self, job_id: int) -> JobState:
+        lease_token = uuid4().hex
+        claimed_at = datetime.now(UTC)
         with self._session_factory.begin() as session:
-            job = self._job(session, job_id)
-            if job.status == "completed":
-                raise IndexTransactionError(
-                    "A completed indexing job cannot be resumed."
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(IndexJob)
+                    .where(
+                        IndexJob.id == job_id,
+                        IndexJob.status.in_(("queued", "failed", "pending")),
+                        IndexJob.lease_token.is_(None),
+                    )
+                    .values(
+                        status="running",
+                        lease_token=lease_token,
+                        retry_count=IndexJob.retry_count
+                        + case(
+                            (IndexJob.started_at.is_not(None), 1),
+                            else_=0,
+                        ),
+                        started_at=func.coalesce(IndexJob.started_at, claimed_at),
+                        completed_at=None,
+                        updated_at=claimed_at,
+                    )
                 )
-            is_retry = job.started_at is not None
-            if is_retry:
-                job.retry_count += 1
-            job.status = "running"
+            )
+            if result.rowcount != 1:
+                job = self._job(session, job_id)
+                if job.status == "completed":
+                    raise IndexTransactionError(
+                        "A completed indexing job cannot be resumed."
+                    )
+                raise IndexTransactionError("The indexing job is already claimed.")
+            job = self._job(session, job_id)
             if not (
                 job.failure and job.failure.get("code") == "cancel_requested"
             ):
                 job.failure = None
-            job.started_at = job.started_at or datetime.now(UTC)
-            job.completed_at = None
-            if job.file is not None:
-                job.file.indexing_state = "running"
-            session.flush()
+            session.execute(
+                update(File)
+                .where(File.id == job.file_id)
+                .values(indexing_state="running", updated_at=datetime.now(UTC))
+            )
+            session.expire_all()
+            job = self._job(session, job_id)
             return self._state(session, job)
 
     def checkpoint(
         self,
         job_id: int,
         *,
+        lease_token: str,
         processed_count: int,
         total_count: int,
         extracted: ExtractedDocument | None = None,
@@ -129,7 +159,7 @@ class IndexingRepository:
         source_ordinal: int | None = None,
     ) -> JobState:
         with self._session_factory.begin() as session:
-            job = self._job(session, job_id)
+            job = self._owned_job(session, job_id, lease_token)
             job.processed_count = max(0, processed_count)
             job.total_count = max(0, total_count)
             if extracted is not None:
@@ -283,10 +313,11 @@ class IndexingRepository:
             failure = self._job(session, job_id).failure
             return bool(failure and failure.get("code") == "cancel_requested")
 
-    def pause(self, job_id: int) -> JobState:
+    def pause(self, job_id: int, *, lease_token: str) -> JobState:
         with self._session_factory.begin() as session:
-            job = self._job(session, job_id)
+            job = self._owned_job(session, job_id, lease_token)
             job.status = "queued"
+            job.lease_token = None
             job.failure = None
             job.completed_at = None
             if job.file is not None:
@@ -298,10 +329,13 @@ class IndexingRepository:
         self,
         job_id: int,
         failure: dict[str, str],
+        *,
+        lease_token: str,
     ) -> JobState:
         with self._session_factory.begin() as session:
-            job = self._job(session, job_id)
+            job = self._owned_job(session, job_id, lease_token)
             job.status = "failed"
+            job.lease_token = None
             job.failure = dict(failure)
             job.failed_count += 1
             job.completed_at = datetime.now(UTC)
@@ -332,10 +366,14 @@ class IndexingRepository:
         extracted: ExtractedDocument,
         embedded_chunks: Sequence[EmbeddedChunk],
         *,
+        lease_token: str,
         extraction_version: str,
         model_digest: str,
         index_version: str,
         dimensions: int,
+        source_size: int,
+        source_mtime_ns: int,
+        source_hash: str,
     ) -> JobState:
         if dimensions not in VECTOR_DIMENSIONS:
             raise IndexTransactionError(
@@ -343,7 +381,7 @@ class IndexingRepository:
             )
 
         with self._session_factory.begin() as session:
-            job = self._job(session, job_id)
+            job = self._owned_job(session, job_id, lease_token)
             if job.file_id is None:
                 raise IndexTransactionError("The indexing job has no file.")
             file = session.get(File, job.file_id)
@@ -354,6 +392,10 @@ class IndexingRepository:
             if file.canonical_path != canonical_path:
                 raise IndexTransactionError(
                     "The extracted path does not match the queued file."
+                )
+            if extracted.file_hash != source_hash:
+                raise IndexTransactionError(
+                    "The extracted source hash does not match the verified source."
                 )
 
             previous_revision = session.scalar(
@@ -386,7 +428,7 @@ class IndexingRepository:
             document = Document(
                 file_id=file.id,
                 revision=revision,
-                file_hash=extracted.file_hash,
+                file_hash=source_hash,
                 extraction_version=extraction_version,
                 parser=extracted.parser,
                 parser_version=extracted.parser_version,
@@ -423,7 +465,10 @@ class IndexingRepository:
                         "A chunk refers to an extracted page that is unavailable."
                     )
                 chunk = Chunk(
-                    stable_id=embedded.chunk.stable_id,
+                    stable_id=self._file_chunk_id(
+                        int(file.id),
+                        embedded.chunk.stable_id,
+                    ),
                     document_id=document.id,
                     page_id=page_id,
                     ordinal=embedded.chunk.ordinal,
@@ -450,18 +495,22 @@ class IndexingRepository:
                     {"chunk_id": chunk_id, "embedding": vector},
                 )
 
-            file.content_hash = extracted.file_hash
+            if self._source_signature(extracted.file_path) != (
+                source_size,
+                source_mtime_ns,
+                source_hash,
+            ):
+                raise IndexTransactionError(
+                    "The source file changed before the revision swap."
+                )
+
+            file.content_hash = source_hash
             file.indexing_state = "indexed"
-            try:
-                source = Path(extracted.file_path)
-                stat = source.stat()
-            except OSError:
-                pass
-            else:
-                file.size_bytes = stat.st_size
-                file.mtime_ns = stat.st_mtime_ns
+            file.size_bytes = source_size
+            file.mtime_ns = source_mtime_ns
 
             job.status = "completed"
+            job.lease_token = None
             job.failure = None
             job.processed_count = job.total_count
             job.checkpoint = None
@@ -483,11 +532,54 @@ class IndexingRepository:
         return struct.pack(f"<{len(vector)}f", *vector)
 
     @staticmethod
+    def _file_chunk_id(file_id: int, stable_id: str) -> str:
+        return sha256(f"{file_id}:{stable_id}".encode()).hexdigest()
+
+    @staticmethod
+    def _source_signature(file_path: str) -> tuple[int, int, str]:
+        source = Path(file_path)
+        before = source.stat()
+        digest = sha256()
+        with source.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        after = source.stat()
+        signature = (after.st_size, after.st_mtime_ns)
+        if signature != (before.st_size, before.st_mtime_ns):
+            raise IndexTransactionError("The source file changed while being read.")
+        return *signature, digest.hexdigest()
+
+    @staticmethod
     def _job(session: Session, job_id: int) -> IndexJob:
         job = session.get(IndexJob, job_id)
         if job is None:
             raise IndexTransactionError("The requested indexing job was not found.")
         return job
+
+    @staticmethod
+    def _owned_job(
+        session: Session,
+        job_id: int,
+        lease_token: str,
+    ) -> IndexJob:
+        result = cast(
+            CursorResult[Any],
+            session.execute(
+                update(IndexJob)
+                .where(
+                    IndexJob.id == job_id,
+                    IndexJob.status == "running",
+                    IndexJob.lease_token == lease_token,
+                )
+                .values(updated_at=datetime.now(UTC))
+            )
+        )
+        if result.rowcount != 1:
+            raise IndexTransactionError(
+                "The worker does not own the indexing job lease."
+            )
+        session.expire_all()
+        return IndexingRepository._job(session, job_id)
 
     def _state(self, session: Session, job: IndexJob) -> JobState:
         revision = None
@@ -500,6 +592,7 @@ class IndexingRepository:
         file_path = str(job.file.canonical_path) if job.file is not None else ""
         return JobState(
             id=int(job.id),
+            lease_token=job.lease_token,
             file_path=file_path,
             status=job.status,
             total_count=job.total_count,

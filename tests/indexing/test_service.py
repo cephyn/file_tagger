@@ -3,15 +3,20 @@ from hashlib import sha256
 import os
 from pathlib import Path
 
-from sqlalchemy import text
+import pytest
+from sqlalchemy import select, text
 
 from file_tagger.domain.contracts import ModelProfile
-from file_tagger.domain.errors import EmbeddingContextRejectedError
+from file_tagger.domain.errors import (
+    EmbeddingContextRejectedError,
+    IndexTransactionError,
+)
 from file_tagger.extraction.docling_adapter import ExtractedDocument, ExtractedPage
 from file_tagger.indexing.chunker import DocumentChunk
 from file_tagger.indexing.repository import IndexingRepository
 from file_tagger.indexing.service import IndexingService
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
+from file_tagger.persistence.models import Chunk
 
 
 @dataclass
@@ -89,6 +94,12 @@ class FailingExtractor:
         raise RuntimeError("credential=do-not-store-this-secret")
 
 
+class IdenticalExtractor:
+    def extract(self, file_path: str | Path) -> ExtractedDocument:
+        path = Path(file_path)
+        return extraction(path, marker="identical content", file_hash="unused")
+
+
 def extraction(path: Path, *, marker: str, file_hash: str) -> ExtractedDocument:
     del file_hash
     return ExtractedDocument(
@@ -107,6 +118,139 @@ def extraction(path: Path, *, marker: str, file_hash: str) -> ExtractedDocument:
             ),
         ),
     )
+
+
+def test_identical_files_receive_distinct_stable_chunk_ids(tmp_path: Path) -> None:
+    database = tmp_path / "identical-files.sqlite3"
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("same source", encoding="utf-8")
+    second.write_text("same source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    service = IndexingService(
+        IndexingRepository(session_factory),
+        extractor=IdenticalExtractor(),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+    )
+
+    assert service.reindex(first).status == "completed"
+    assert service.reindex(second).status == "completed"
+
+    with session_factory() as session:
+        stable_ids = list(session.scalars(select(Chunk.stable_id)))
+    assert len(stable_ids) == 2
+    assert len(set(stable_ids)) == 2
+
+
+def test_job_claim_is_exclusive_and_stale_owner_cannot_mutate_completion(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "claim.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    repository = IndexingRepository(create_session_factory(database))
+    service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="owned", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+    )
+    job_id = service.queue(source)
+
+    owner = repository.begin(job_id)
+
+    with pytest.raises(IndexTransactionError, match="already claimed"):
+        repository.begin(job_id)
+
+    assert owner.lease_token is not None
+    repository.pause(job_id, lease_token=owner.lease_token)
+    completed = service.resume(job_id)
+
+    with pytest.raises(IndexTransactionError, match="does not own"):
+        repository.checkpoint(
+            job_id,
+            lease_token=owner.lease_token,
+            processed_count=0,
+            total_count=1,
+        )
+    with pytest.raises(IndexTransactionError, match="does not own"):
+        repository.fail(
+            job_id,
+            {"code": "stale", "summary": "stale worker"},
+            lease_token=owner.lease_token,
+        )
+
+    assert completed.status == "completed"
+    assert repository.state(job_id).status == "completed"
+
+
+def test_changed_source_near_commit_preserves_previous_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "changed-at-commit.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    repository = IndexingRepository(session_factory)
+    extractor = MutableExtractor(
+        extraction(source, marker="previous", file_hash="unused")
+    )
+    service = IndexingService(
+        repository,
+        extractor=extractor,
+        embedding_gateway=FixedGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+    )
+    assert service.reindex(source).status == "completed"
+    extractor.document = extraction(
+        source,
+        marker="replacement",
+        file_hash="unused",
+    )
+    replace_revision = repository.replace_revision
+
+    def change_source_before_replace(*args, **kwargs):
+        source.write_text("changed at commit", encoding="utf-8")
+        return replace_revision(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "replace_revision", change_source_before_replace)
+
+    result = service.reindex(source)
+
+    assert result.status == "failed"
+    assert repository.current_revision(source) == 1
+    with session_factory() as session:
+        assert session.scalar(
+            text("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'previous'")
+        ) == 1
+        assert session.scalar(
+            text("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'replacement'")
+        ) == 0
 
 
 def test_vector_insert_failure_keeps_previous_revision_searchable(

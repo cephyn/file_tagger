@@ -107,18 +107,22 @@ class IndexingService:
     ) -> IndexingResult:
         try:
             state = self._repository.begin(job_id)
-        except Exception as exc:
+        except IndexTransactionError:
             current = self._repository.state(job_id)
-            if current.status == "completed":
+            if current.status in {"completed", "running"}:
                 return IndexingResult.from_state(current)
-            failure = self._safe_failure(exc)
-            return IndexingResult.from_state(self._repository.fail(current.id, failure))
+            raise
+        lease_token = state.lease_token
+        if lease_token is None:
+            raise IndexTransactionError("The indexing job claim has no lease token.")
 
         embedded: list[EmbeddedChunk] = []
         total_count = 0
         try:
             if self._cancelled(job_id, cancellation_check):
-                return IndexingResult.from_state(self._repository.pause(job_id))
+                return IndexingResult.from_state(
+                    self._pause_owned(job_id, lease_token)
+                )
 
             checkpoint = self._repository.load_checkpoint(job_id)
             if self._checkpoint_reusable(state, checkpoint):
@@ -158,6 +162,7 @@ class IndexingService:
                 first_unprocessed = 0
                 self._repository.checkpoint(
                     job_id,
+                    lease_token=lease_token,
                     processed_count=0,
                     total_count=total_count,
                     extracted=extracted,
@@ -178,11 +183,12 @@ class IndexingService:
                 if self._cancelled(job_id, cancellation_check):
                     self._repository.checkpoint(
                         job_id,
+                        lease_token=lease_token,
                         processed_count=processed_count - 1,
                         total_count=total_count,
                     )
                     return IndexingResult.from_state(
-                        self._repository.pause(job_id)
+                        self._pause_owned(job_id, lease_token)
                     )
                 result = self._run_embedding((chunk,))
                 if not result.complete_source_coverage:
@@ -203,6 +209,7 @@ class IndexingService:
                 checkpoint_vectors = embedded[-len(result.vectors) :] if result.vectors else ()
                 self._repository.checkpoint(
                     job_id,
+                    lease_token=lease_token,
                     processed_count=processed_count,
                     total_count=total_count,
                     embedded_chunks=checkpoint_vectors,
@@ -210,7 +217,9 @@ class IndexingService:
                 )
 
             if self._cancelled(job_id, cancellation_check):
-                return IndexingResult.from_state(self._repository.pause(job_id))
+                return IndexingResult.from_state(
+                    self._pause_owned(job_id, lease_token)
+                )
 
             dimensions = self._profile.dimensions
             assert dimensions is not None
@@ -226,17 +235,23 @@ class IndexingService:
                 job_id,
                 extracted,
                 embedded,
+                lease_token=lease_token,
                 extraction_version=self._extraction_version,
                 model_digest=self._profile.digest,
                 index_version=self._index_version,
                 dimensions=dimensions,
+                source_size=source_size,
+                source_mtime_ns=source_mtime_ns,
+                source_hash=source_hash,
             )
             return IndexingResult.from_state(completed)
         except asyncio.CancelledError:
-            return IndexingResult.from_state(self._repository.pause(job_id))
+            return IndexingResult.from_state(
+                self._pause_owned(job_id, lease_token)
+            )
         except Exception as exc:
             return IndexingResult.from_state(
-                self._repository.fail(job_id, self._safe_failure(exc))
+                self._fail_owned(job_id, lease_token, self._safe_failure(exc))
             )
 
     def cancel(self, job_id: int) -> IndexingResult:
@@ -299,6 +314,27 @@ class IndexingService:
         return self._repository.cancellation_requested(job_id) or bool(
             cancellation_check and cancellation_check()
         )
+
+    def _pause_owned(self, job_id: int, lease_token: str) -> JobState:
+        try:
+            return self._repository.pause(job_id, lease_token=lease_token)
+        except IndexTransactionError:
+            return self._repository.state(job_id)
+
+    def _fail_owned(
+        self,
+        job_id: int,
+        lease_token: str,
+        failure: dict[str, str],
+    ) -> JobState:
+        try:
+            return self._repository.fail(
+                job_id,
+                failure,
+                lease_token=lease_token,
+            )
+        except IndexTransactionError:
+            return self._repository.state(job_id)
 
     def _checkpoint_reusable(
         self,
