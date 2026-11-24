@@ -1,0 +1,373 @@
+from collections.abc import AsyncIterator, Mapping, Sequence
+import ipaddress
+from typing import Any, Literal
+from urllib.parse import urlsplit
+
+import httpx
+from ollama import AsyncClient, ResponseError
+
+from ...domain.contracts import ModelProfile, OllamaReadiness
+from ...domain.errors import (
+    EmbeddingContextRejectedError,
+    ModelIncompatibleError,
+    ModelMissingError,
+    OllamaTimeoutError,
+    OllamaUnavailableError,
+    RemoteOllamaHostError,
+)
+
+
+ModelRole = Literal["embedding", "decision", "generation"]
+DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+MINIMUM_OLLAMA_VERSION = (0, 35, 0)
+CLOUD_MARKERS = (":cloud", "-cloud", "cloud:", ".cloud")
+
+
+class OllamaGateway:
+    def __init__(
+        self,
+        host: str = DEFAULT_OLLAMA_HOST,
+        *,
+        client: Any | None = None,
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        self.host = self._validate_host(host)
+        self._client: Any = (
+            client
+            if client is not None
+            else AsyncClient(
+                host=self.host,
+                timeout=timeout_seconds,
+                follow_redirects=False,
+            )
+        )
+
+    @staticmethod
+    def _validate_host(host: str) -> str:
+        parsed = urlsplit(host)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise RemoteOllamaHostError("Ollama host must be an absolute loopback URL.")
+        if parsed.username or parsed.password:
+            raise RemoteOllamaHostError("Ollama host credentials are not supported.")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise RemoteOllamaHostError("Ollama host must not include a path or query.")
+
+        hostname = parsed.hostname.lower()
+        if hostname != "localhost":
+            try:
+                if not ipaddress.ip_address(hostname).is_loopback:
+                    raise RemoteOllamaHostError(
+                        "Remote Ollama hosts are not supported."
+                    )
+            except ValueError as exc:
+                raise RemoteOllamaHostError(
+                    "Remote Ollama hosts are not supported."
+                ) from exc
+        return host
+
+    @staticmethod
+    def _validate_model(model: str) -> None:
+        normalized = model.strip().lower()
+        if not normalized:
+            raise ModelMissingError("A local Ollama model name is required.")
+        if any(marker in normalized for marker in CLOUD_MARKERS):
+            raise ModelIncompatibleError("Cloud-hosted model variants are not supported.")
+
+    @staticmethod
+    def _translate_transport_error(exc: BaseException) -> OllamaUnavailableError:
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            return OllamaTimeoutError(f"Local Ollama request timed out: {exc.__class__.__name__}.")
+        return OllamaUnavailableError(f"Local Ollama is unavailable: {exc.__class__.__name__}.")
+
+    @staticmethod
+    def _version_tuple(version: str) -> tuple[int, int, int]:
+        values = version.split(".", 2)
+        try:
+            parsed = [int(part) for part in values[:3]]
+        except ValueError:
+            return (0, 0, 0)
+        padded = (parsed + [0, 0, 0])[:3]
+        return padded[0], padded[1], padded[2]
+
+    async def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+    async def server_version(self) -> str:
+        try:
+            request_raw = self._client._request_raw
+            response = await request_raw("GET", "/api/version")
+            payload = response.json()
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        except ResponseError as exc:
+            raise OllamaUnavailableError(
+                f"Local Ollama version probe failed with status {exc.status_code}."
+            ) from exc
+        except AttributeError as exc:
+            raise OllamaUnavailableError(
+                "The Ollama client does not support the version probe."
+            ) from exc
+
+        version = payload.get("version") if isinstance(payload, Mapping) else None
+        if not isinstance(version, str) or not version:
+            raise OllamaUnavailableError("Local Ollama returned no server version.")
+        return version
+
+    async def list_models(self) -> tuple[str, ...]:
+        try:
+            response = await self._client.list()
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        except ResponseError as exc:
+            raise OllamaUnavailableError(
+                f"Local Ollama model list failed with status {exc.status_code}."
+            ) from exc
+        return tuple(
+            model.model
+            for model in response.models
+            if isinstance(model.model, str) and model.model
+        )
+
+    @staticmethod
+    def _context_length(model_info: Mapping[str, Any] | None) -> int | None:
+        if not model_info:
+            return None
+        for key, value in model_info.items():
+            if key == "context_length" or str(key).endswith(".context_length"):
+                try:
+                    context_length = int(value)
+                except (TypeError, ValueError):
+                    return None
+                return context_length if context_length > 0 else None
+        return None
+
+    @staticmethod
+    def _dimensions(model_info: Mapping[str, Any] | None) -> int | None:
+        if not model_info:
+            return None
+        try:
+            dimensions = int(model_info.get("embedding_length", 0))
+        except (TypeError, ValueError):
+            return None
+        return dimensions if dimensions > 0 else None
+
+    async def model_profile(self, role: ModelRole, model: str) -> ModelProfile:
+        self._validate_model(model)
+        try:
+            response = await self._client.list()
+            installed = {
+                item.model: item.digest
+                for item in response.models
+                if isinstance(item.model, str) and item.model
+            }
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        except ResponseError as exc:
+            raise OllamaUnavailableError(
+                f"Local Ollama model lookup failed with status {exc.status_code}."
+            ) from exc
+
+        if model not in installed:
+            raise ModelMissingError(f"Local Ollama model is not installed: {model}.")
+        try:
+            details = await self._client.show(model)
+        except ResponseError as exc:
+            if exc.status_code == 404:
+                raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
+            raise OllamaUnavailableError(
+                f"Local Ollama model metadata failed with status {exc.status_code}."
+            ) from exc
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+
+        capabilities = tuple(details.capabilities or ())
+        required_capability = {
+            "embedding": "embedding",
+            "decision": "systemone",
+            "generation": "completion",
+        }[role]
+        if required_capability not in capabilities:
+            raise ModelIncompatibleError(
+                f"Model {model} lacks the required {required_capability} capability."
+            )
+        model_info = details.modelinfo if isinstance(details.modelinfo, Mapping) else None
+        context_length = self._context_length(model_info)
+        if context_length is None:
+            raise ModelIncompatibleError(f"Model {model} reports no context length.")
+        digest = installed[model]
+        if not isinstance(digest, str) or not digest:
+            raise ModelIncompatibleError(f"Model {model} reports no digest.")
+
+        return ModelProfile(
+            role=role,
+            model=model,
+            digest=digest,
+            context_length=context_length,
+            dimensions=self._dimensions(model_info) if role == "embedding" else None,
+            capabilities=capabilities,
+        )
+
+    async def readiness(
+        self, required_models: Mapping[ModelRole, str]
+    ) -> OllamaReadiness:
+        missing: list[str] = []
+        incompatible: list[str] = []
+        errors: list[str] = []
+        version: str | None = None
+        available = True
+
+        try:
+            version = await self.server_version()
+        except OllamaUnavailableError as exc:
+            available = False
+            errors.append(str(exc))
+
+        if version and self._version_tuple(version) < MINIMUM_OLLAMA_VERSION:
+            errors.append(
+                f"Ollama {version} is too old; version 0.35.0 or newer is required."
+            )
+
+        if available:
+            for role, model in required_models.items():
+                try:
+                    await self.model_profile(role, model)
+                except ModelMissingError:
+                    missing.append(model)
+                except ModelIncompatibleError:
+                    incompatible.append(model)
+                except OllamaUnavailableError as exc:
+                    available = False
+                    errors.append(str(exc))
+
+        return OllamaReadiness(
+            available=available,
+            version=version,
+            base_url=self.host,
+            missing_models=tuple(sorted(set(missing))),
+            incompatible_models=tuple(sorted(set(incompatible))),
+            errors=tuple(errors),
+        )
+
+    async def embed(
+        self,
+        model: str,
+        text: str | Sequence[str],
+        *,
+        dimensions: int | None = None,
+        keep_alive: float | str | None = "5m",
+    ) -> tuple[tuple[float, ...], ...]:
+        self._validate_model(model)
+        try:
+            response = await self._client.embed(
+                model=model,
+                input=text,
+                truncate=False,
+                dimensions=dimensions,
+                keep_alive=keep_alive,
+            )
+        except ResponseError as exc:
+            message = str(exc)
+            if exc.status_code == 400 and "context" in message.lower():
+                raise EmbeddingContextRejectedError(
+                    "Embedding input exceeded the model context without truncation."
+                ) from exc
+            if exc.status_code == 404:
+                raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
+            raise OllamaUnavailableError(
+                f"Local Ollama embedding failed with status {exc.status_code}."
+            ) from exc
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        return tuple(tuple(float(value) for value in vector) for vector in response.embeddings)
+
+    async def system_one(
+        self,
+        model: str,
+        *,
+        state: Any,
+        questions: Mapping[str, Any],
+        keep_alive: float | str | None = "5m",
+    ) -> Any:
+        self._validate_model(model)
+        try:
+            return await self._client.systemone(
+                model=model,
+                state=state,
+                questions=questions,
+                keep_alive=keep_alive,
+            )
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        except ResponseError as exc:
+            if exc.status_code == 404:
+                raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
+            raise OllamaUnavailableError(
+                f"Local Ollama decision failed with status {exc.status_code}."
+            ) from exc
+
+    async def chat(
+        self,
+        model: str,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        schema: Mapping[str, Any] | None = None,
+        keep_alive: float | str | None = "5m",
+    ) -> str:
+        self._validate_model(model)
+        try:
+            response = await self._client.chat(
+                model=model,
+                messages=messages,
+                format=dict(schema) if schema is not None else None,
+                stream=False,
+                keep_alive=keep_alive,
+            )
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        except ResponseError as exc:
+            if exc.status_code == 404:
+                raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
+            raise OllamaUnavailableError(
+                f"Local Ollama chat failed with status {exc.status_code}."
+            ) from exc
+        content = response.message.content
+        if not isinstance(content, str):
+            raise OllamaUnavailableError("Local Ollama returned an empty chat response.")
+        return content
+
+    async def chat_stream(
+        self,
+        model: str,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        schema: Mapping[str, Any] | None = None,
+        keep_alive: float | str | None = "5m",
+    ) -> AsyncIterator[str]:
+        self._validate_model(model)
+        try:
+            stream = await self._client.chat(
+                model=model,
+                messages=messages,
+                format=dict(schema) if schema is not None else None,
+                stream=True,
+                keep_alive=keep_alive,
+            )
+            async for response in stream:
+                content = response.message.content
+                if isinstance(content, str) and content:
+                    yield content
+        except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
+            raise self._translate_transport_error(exc) from exc
+        except ResponseError as exc:
+            if exc.status_code == 404:
+                raise ModelMissingError(
+                    f"Local Ollama model is not installed: {model}."
+                ) from exc
+            raise OllamaUnavailableError(
+                f"Local Ollama streaming chat failed with status {exc.status_code}."
+            ) from exc
+

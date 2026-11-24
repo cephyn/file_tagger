@@ -10,6 +10,14 @@ class OllamaUnavailableError(FileTaggerError):
     """Raised when the required local Ollama server is unavailable."""
 
 
+class OllamaTimeoutError(OllamaUnavailableError):
+    """Raised when a local Ollama operation exceeds its timeout."""
+
+
+class RemoteOllamaHostError(FileTaggerError):
+    """Raised when Ollama is configured with a non-loopback origin."""
+
+
 class ModelMissingError(FileTaggerError):
     """Raised when a required Ollama model is not installed."""
 
