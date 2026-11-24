@@ -1,10 +1,12 @@
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import inspect
+from sqlalchemy import event, inspect
 
 from file_tagger.domain.contracts import ModelProfile, TagDecision
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
@@ -180,9 +182,9 @@ def test_recommendations_are_cache_hits_without_repeating_model_requests() -> No
     assert len(search.calls) == 2
 
 
-def test_changed_tag_catalog_invalidates_cache_while_same_catalog_hits() -> None:
-    search = FakeSearch(["Research", "invoice"])
-    gateway = FakeGateway(["quarterly"])
+def test_candidate_digest_preserves_bounded_order_and_refreshes_exact_spelling() -> None:
+    search = FakeSearch(["Research", "invoice", "ignored"])
+    gateway = FakeGateway([])
     cache = InMemoryTagRecommendationCache()
     kwargs = {
         "file_hash": "abc123",
@@ -192,21 +194,21 @@ def test_changed_tag_catalog_invalidates_cache_while_same_catalog_hits() -> None
         "cache": cache,
         "candidate_model_digest": "generation-v1",
         "decision_model_digest": "decision-v1",
+        "max_candidates": 2,
     }
 
     first = recommend_tags("research invoice", **kwargs)
-    second = recommend_tags("research invoice", **kwargs)
-    search.tags = (" INVOICE ", "research")
-    normalized_duplicate = recommend_tags("research invoice", **kwargs)
-    search.tags = ("research", "finance")
-    changed_catalog = recommend_tags("research invoice", **kwargs)
+    search.tags = ("research", " INVOICE ", "ignored-change")
+    same_catalog = recommend_tags("research invoice", **kwargs)
+    search.tags = ("invoice", "Research", "ignored")
+    reordered_catalog = recommend_tags("research invoice", **kwargs)
 
-    assert second == first
-    assert normalized_duplicate == first
-    assert changed_catalog != first
-    assert changed_catalog.candidate_set_digest != first.candidate_set_digest
-    assert len(search.calls) == 4
-    assert len(gateway.chat_calls) == 2
+    assert [item.tag for item in first.decisions] == ["Research", "invoice"]
+    assert [item.tag for item in same_catalog.decisions] == ["research", "INVOICE"]
+    assert same_catalog.candidate_set_digest == first.candidate_set_digest
+    assert reordered_catalog.candidate_set_digest != first.candidate_set_digest
+    assert len(search.calls) == 3
+    assert len(gateway.chat_calls) == 0
     assert len(gateway.decision_calls) == 2
 
 
@@ -218,6 +220,8 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
         candidate_model_digest="candidate-v1",
         decision_model_digest="decision-v1",
         candidate_set_digest="catalog-v1",
+        max_candidates=4,
+        confirmation_threshold=0.7,
         decisions=(),
     )
     cache.store(stored)
@@ -229,6 +233,8 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
             candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
         )
         == stored
     )
@@ -239,6 +245,8 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
             candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
         )
         is None
     )
@@ -259,6 +267,32 @@ def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
             candidate_set_digest="catalog-v2",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=3,
+            confirmation_threshold=0.7,
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.6,
         )
         is None
     )
@@ -287,6 +321,8 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
                 candidate_model_digest="candidate-v1",
                 decision_model_digest="decision-v1",
                 candidate_set_digest="catalog-v1",
+                max_candidates=4,
+                confirmation_threshold=0.7,
                 decisions=(
                     TagDecision(
                         tag="research",
@@ -305,6 +341,8 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
             candidate_model_digest="candidate-v1",
             decision_model_digest="decision-v1",
             candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
         )
         columns = {column["name"] for column in inspect(session.get_bind()).get_columns(
             "tag_suggestion_cache"
@@ -324,7 +362,88 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
         "candidate_model_digest",
         "decision_model_digest",
         "candidate_set_digest",
+        "max_candidates",
+        "confirmation_threshold",
     } <= columns
+
+
+def test_database_cache_store_is_safe_across_separate_sessions(tmp_path: Path) -> None:
+    database_path = tmp_path / "concurrent-tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    with session_factory.begin() as session:
+        file = File(
+            canonical_path=r"C:\docs\concurrent.md",
+            content_hash="concurrent-hash",
+            size_bytes=10,
+            mtime_ns=1,
+            mime_type="text/markdown",
+        )
+        session.add(file)
+        session.flush()
+        file_id = file.id
+
+    insert_barrier = Barrier(2)
+    engine = session_factory.kw["bind"]
+
+    def synchronize_cache_inserts(
+        connection: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        del connection, cursor, parameters, context, executemany
+        if "insert into tag_suggestion_cache" in statement.lower():
+            insert_barrier.wait(timeout=5)
+
+    event.listen(engine, "before_cursor_execute", synchronize_cache_inserts)
+
+    def store(tag: str) -> None:
+        with session_factory.begin() as session:
+            DatabaseTagRecommendationCache(session).store(
+                CachedTagRecommendations(
+                    file_id=file_id,
+                    file_path=r"C:\docs\concurrent.md",
+                    file_hash="concurrent-hash",
+                    extraction_version="docling-v1",
+                    candidate_model_digest="candidate-v1",
+                    decision_model_digest="decision-v1",
+                    candidate_set_digest="catalog-v1",
+                    max_candidates=4,
+                    confirmation_threshold=0.7,
+                    decisions=(
+                        TagDecision(
+                            tag=tag,
+                            decision="accept",
+                            confidence=0.9,
+                        ),
+                    ),
+                )
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(store, tag) for tag in ("first", "second")]
+            for future in futures:
+                future.result(timeout=10)
+    finally:
+        event.remove(engine, "before_cursor_execute", synchronize_cache_inserts)
+
+    with session_factory() as session:
+        cached = DatabaseTagRecommendationCache(session).lookup(
+            "concurrent-hash",
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+
+    assert cached is not None
+    assert cached.decisions[0].tag in {"first", "second"}
 
 
 def test_generation_is_bounded_before_decision() -> None:

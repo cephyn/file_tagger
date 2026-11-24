@@ -126,14 +126,14 @@ def test_index_job_lease_migration_grants_preexisting_running_job_a_deadline(
     assert row[2]
 
 
-def test_tag_cache_candidate_set_migration_preserves_existing_rows(
+def test_tag_cache_parameter_migration_invalidates_existing_rows(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "tag-cache-v6.sqlite3"
     config_path = Path(__file__).resolve().parents[2] / "alembic.ini"
     config = Config(str(config_path))
     config.attributes["database_path"] = database_path
-    command.upgrade(config, "0006_typed_tag_cache")
+    command.upgrade(config, "0007_tag_cache_candidate_set")
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             "INSERT INTO files "
@@ -170,7 +170,10 @@ def test_tag_cache_candidate_set_migration_preserves_existing_rows(
             row[1] for row in connection.execute("PRAGMA table_info(tag_suggestion_cache)")
         }
         row = connection.execute(
-            "SELECT file_hash, candidate_set_digest FROM tag_suggestion_cache"
+            "SELECT file_hash, candidate_set_digest, max_candidates, "
+            "confirmation_threshold FROM tag_suggestion_cache"
         ).fetchone()
     assert "candidate_set_digest" in columns
-    assert row == ("abc123", None)
+    assert "max_candidates" in columns
+    assert "confirmation_threshold" in columns
+    assert row == ("abc123", None, None, None)

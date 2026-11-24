@@ -166,7 +166,8 @@ async def recommend_tags_async(
             embedding_index_version=embedding_index_version,
             embedding_profile=embedding_profile,
         )
-        candidate_set_digest = _candidate_set_digest(existing)
+        bounded_existing = existing[:max_candidates]
+        candidate_set_digest = _candidate_set_digest(bounded_existing)
         resolved_candidate_digest = await _model_digest(
             selected_gateway,
             role="generation",
@@ -186,11 +187,16 @@ async def recommend_tags_async(
                 candidate_model_digest=resolved_candidate_digest,
                 decision_model_digest=resolved_decision_digest,
                 candidate_set_digest=candidate_set_digest,
+                max_candidates=max_candidates,
+                confirmation_threshold=confirmation_threshold,
             )
             if cached is not None:
-                return cached
+                refreshed = _refresh_cached_spelling(cached, bounded_existing)
+                if refreshed != cached:
+                    cache.store(refreshed)
+                return refreshed
 
-        available_for_generation = max_candidates - len(existing)
+        available_for_generation = max_candidates - len(bounded_existing)
         generated: tuple[str, ...] = ()
         if available_for_generation > 0:
             generated = await _generate_candidates(
@@ -198,11 +204,11 @@ async def recommend_tags_async(
                 document_state=document_state,
                 model=candidate_model,
                 limit=available_for_generation,
-                existing=existing,
+                existing=bounded_existing,
             )
 
         candidates, generated_keys = _merge_candidates(
-            existing,
+            bounded_existing,
             generated,
             max_candidates=max_candidates,
         )
@@ -236,6 +242,8 @@ async def recommend_tags_async(
             candidate_model_digest=resolved_candidate_digest,
             decision_model_digest=resolved_decision_digest,
             candidate_set_digest=candidate_set_digest,
+            max_candidates=max_candidates,
+            confirmation_threshold=confirmation_threshold,
             decisions=decisions,
         )
         if cache is not None:
@@ -399,9 +407,27 @@ def _semantic_existing_tags(
 
 
 def _candidate_set_digest(tags: Sequence[str]) -> str:
-    normalized = sorted({_tag_key(tag) for tag in tags})
+    normalized = [_tag_key(tag) for tag in tags]
     canonical = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _refresh_cached_spelling(
+    cached: CachedTagRecommendations,
+    existing: Sequence[str],
+) -> CachedTagRecommendations:
+    current_spelling = {_tag_key(tag): tag for tag in existing}
+    changed = False
+    decisions: list[TagDecision] = []
+    for decision in cached.decisions:
+        current = current_spelling.get(_tag_key(decision.tag))
+        if not decision.is_new and current is not None and current != decision.tag:
+            decision = decision.model_copy(update={"tag": current})
+            changed = True
+        decisions.append(decision)
+    if not changed:
+        return cached
+    return cached.model_copy(update={"decisions": tuple(decisions)})
 
 
 async def _generate_candidates(

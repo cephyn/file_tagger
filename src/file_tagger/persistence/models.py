@@ -5,6 +5,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -104,6 +105,8 @@ class TagSuggestionCache(Base):
     candidate_model_digest: Mapped[str | None] = mapped_column(String(255))
     decision_model_digest: Mapped[str | None] = mapped_column(String(255))
     candidate_set_digest: Mapped[str | None] = mapped_column(String(64))
+    max_candidates: Mapped[int | None] = mapped_column(Integer)
+    confirmation_threshold: Mapped[float | None] = mapped_column(Float)
     suggestions: Mapped[dict[str, Any] | list[Any]] = mapped_column(
         JSON, nullable=False
     )

@@ -4,6 +4,7 @@ from typing import Any, Protocol
 
 from pydantic import AliasChoices, Field, model_validator
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from ..domain.contracts import DomainRecord, TagDecision
@@ -22,6 +23,8 @@ class CachedTagRecommendations(DomainRecord):
     candidate_model_digest: str | None = Field(default=None, min_length=1)
     decision_model_digest: str | None = Field(default=None, min_length=1)
     candidate_set_digest: str | None = Field(default=None, min_length=1)
+    max_candidates: int | None = Field(default=None, gt=0)
+    confirmation_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     model_digest: str | None = Field(default=None, min_length=1)
     decisions: tuple[TagDecision, ...] = Field(
         default=(),
@@ -86,6 +89,8 @@ class TagRecommendationCache(Protocol):
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
         candidate_set_digest: str | None = None,
+        max_candidates: int | None = None,
+        confirmation_threshold: float | None = None,
         model_digest: str | None = None,
     ) -> CachedTagRecommendations | None: ...
 
@@ -104,6 +109,8 @@ class InMemoryTagRecommendationCache:
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
         candidate_set_digest: str | None = None,
+        max_candidates: int | None = None,
+        confirmation_threshold: float | None = None,
         model_digest: str | None = None,
     ) -> CachedTagRecommendations | None:
         if not file_hash:
@@ -116,6 +123,8 @@ class InMemoryTagRecommendationCache:
                 candidate_model_digest=candidate_model_digest,
                 decision_model_digest=decision_model_digest,
                 candidate_set_digest=candidate_set_digest,
+                max_candidates=max_candidates,
+                confirmation_threshold=confirmation_threshold,
                 model_digest=model_digest,
             ):
                 return stored
@@ -143,6 +152,8 @@ class DatabaseTagRecommendationCache:
         candidate_model_digest: str | None = None,
         decision_model_digest: str | None = None,
         candidate_set_digest: str | None = None,
+        max_candidates: int | None = None,
+        confirmation_threshold: float | None = None,
         model_digest: str | None = None,
     ) -> CachedTagRecommendations | None:
         if not file_hash:
@@ -168,6 +179,15 @@ class DatabaseTagRecommendationCache:
             statement = statement.where(
                 TagSuggestionCache.candidate_set_digest == candidate_set_digest
             )
+        if max_candidates is not None:
+            statement = statement.where(
+                TagSuggestionCache.max_candidates == max_candidates
+            )
+        if confirmation_threshold is not None:
+            statement = statement.where(
+                TagSuggestionCache.confirmation_threshold
+                == confirmation_threshold
+            )
         row = self._session.scalars(
             statement.order_by(TagSuggestionCache.cached_at.desc()).limit(1)
         ).first()
@@ -183,32 +203,40 @@ class DatabaseTagRecommendationCache:
 
     def store(self, stored: CachedTagRecommendations) -> None:
         file_id = self._resolve_file_id(stored)
-        row = self._session.scalar(
-            select(TagSuggestionCache).where(TagSuggestionCache.file_id == file_id)
+        values = {
+            "file_id": file_id,
+            "file_path": stored.file_path or self._file_path(file_id),
+            "file_hash": stored.file_hash,
+            "extraction_version": stored.extraction_version,
+            "candidate_model_digest": stored.effective_candidate_model_digest,
+            "decision_model_digest": stored.effective_decision_model_digest,
+            "candidate_set_digest": stored.candidate_set_digest,
+            "max_candidates": stored.max_candidates,
+            "confirmation_threshold": stored.confirmation_threshold,
+            "cached_at": stored.cached_at,
+            "suggestions": stored.model_dump(mode="json", exclude_none=True),
+        }
+        statement = sqlite_insert(TagSuggestionCache).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[TagSuggestionCache.file_id],
+            set_={
+                "file_path": statement.excluded.file_path,
+                "file_hash": statement.excluded.file_hash,
+                "extraction_version": statement.excluded.extraction_version,
+                "candidate_model_digest": (
+                    statement.excluded.candidate_model_digest
+                ),
+                "decision_model_digest": statement.excluded.decision_model_digest,
+                "candidate_set_digest": statement.excluded.candidate_set_digest,
+                "max_candidates": statement.excluded.max_candidates,
+                "confirmation_threshold": (
+                    statement.excluded.confirmation_threshold
+                ),
+                "cached_at": statement.excluded.cached_at,
+                "suggestions": statement.excluded.suggestions,
+            },
         )
-        payload = stored.model_dump(mode="json", exclude_none=True)
-        if row is None:
-            row = TagSuggestionCache(
-                file_id=file_id,
-                file_path=stored.file_path or self._file_path(file_id),
-                file_hash=stored.file_hash,
-                extraction_version=stored.extraction_version,
-                candidate_model_digest=stored.effective_candidate_model_digest,
-                decision_model_digest=stored.effective_decision_model_digest,
-                candidate_set_digest=stored.candidate_set_digest,
-                cached_at=stored.cached_at,
-                suggestions=payload,
-            )
-            self._session.add(row)
-        else:
-            row.file_path = stored.file_path or row.file_path
-            row.file_hash = stored.file_hash
-            row.extraction_version = stored.extraction_version
-            row.candidate_model_digest = stored.effective_candidate_model_digest
-            row.decision_model_digest = stored.effective_decision_model_digest
-            row.candidate_set_digest = stored.candidate_set_digest
-            row.cached_at = stored.cached_at
-            row.suggestions = payload
+        self._session.execute(statement)
         self._session.flush()
 
     def save(self, stored: CachedTagRecommendations) -> None:
@@ -259,6 +287,8 @@ def _same_identity(
             left.effective_decision_model_digest
             == right.effective_decision_model_digest,
             left.candidate_set_digest == right.candidate_set_digest,
+            left.max_candidates == right.max_candidates,
+            left.confirmation_threshold == right.confirmation_threshold,
         )
     )
 
@@ -271,6 +301,8 @@ def _matches(
     candidate_model_digest: str | None,
     decision_model_digest: str | None,
     candidate_set_digest: str | None,
+    max_candidates: int | None,
+    confirmation_threshold: float | None,
     model_digest: str | None,
 ) -> bool:
     if stored.file_hash != file_hash:
@@ -289,6 +321,12 @@ def _matches(
     if candidate_set_digest is not None:
         if stored.candidate_set_digest != candidate_set_digest:
             return False
+    if max_candidates is not None:
+        if stored.max_candidates != max_candidates:
+            return False
+    if confirmation_threshold is not None:
+        if stored.confirmation_threshold != confirmation_threshold:
+            return False
     return True
 
 
@@ -305,6 +343,8 @@ def _database_payload(row: TagSuggestionCache) -> dict[str, Any] | None:
             "candidate_model_digest": row.candidate_model_digest,
             "decision_model_digest": row.decision_model_digest,
             "candidate_set_digest": row.candidate_set_digest,
+            "max_candidates": row.max_candidates,
+            "confirmation_threshold": row.confirmation_threshold,
             "cached_at": row.cached_at,
         }
     )
