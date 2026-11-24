@@ -32,8 +32,8 @@ Last updated: 2026-11-24
 | 13: selective PDF vision fallback | Complete | `ad941b0` |
 | 14: provenance-aware chunking | Complete | `a23e027` |
 | 15: complete embedding coverage | Complete | `89c7b34` |
-| 16: resumable transactional indexing | Complete | `a6bcb05`, `c8fe9f1`, `284bed4`, `cf7de50` |
-| 17: SQLite hybrid search | Complete | `ad05116`, `82c395e` |
+| 16: resumable transactional indexing | Complete | `a6bcb05`, `c8fe9f1`, `284bed4`, `cf7de50`, `fbdd6fd` |
+| 17: SQLite hybrid search | Complete | `ad05116`, `82c395e`, `fbdd6fd` |
 | 18: citation-first search results | Complete | `4f117a3`, `c3ec25a` |
 | 19-29 | Not started | — |
 
