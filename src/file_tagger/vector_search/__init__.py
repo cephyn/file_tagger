@@ -1,8 +1,14 @@
 """
 Vector search package for file tagging application.
-Provides semantic search capabilities using ChromaDB.
+Provides semantic search capabilities.
 """
 
-from .vector_search import VectorSearch
-
 __all__ = ["VectorSearch"]
+
+
+def __getattr__(name: str) -> object:
+    if name == "VectorSearch":
+        from .vector_search import VectorSearch
+
+        return VectorSearch
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
