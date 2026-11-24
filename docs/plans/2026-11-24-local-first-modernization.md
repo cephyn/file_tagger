@@ -23,7 +23,10 @@ Last updated: 2026-11-24
 | --- | --- | --- |
 | 1-3: Python toolchain, package layout, per-user paths | Complete | `7626340`, `32896c5`, `4da9b2e` |
 | 4-6: domain contracts, SQLite extensions, unified schema | Complete | `a00c206`, `49a25ea`, `b90fcfb` |
-| 7-29 | Not started | — |
+| 7: legacy SQLite/config migration | Complete | `894ddc8` |
+| 8: legacy Chroma inventory | Complete | `a5dfebb` |
+| 9: loopback-only Ollama gateway | Complete | `117de1e` |
+| 10-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -381,6 +384,8 @@ git commit -m "feat: add unified search database schema"
 
 ### Task 7: Migrate Existing Tags, Files, and Config
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/migration/sqlite_migration.py`
 - Create: `src/file_tagger/migration/config_migration.py`
@@ -424,6 +429,8 @@ git commit -m "feat: migrate legacy tags and settings"
 
 ### Task 8: Detect and Retire Legacy Chroma State
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/migration/legacy_chroma.py`
 - Create: `tests/migration/test_legacy_chroma.py`
@@ -465,6 +472,8 @@ git commit -m "feat: inventory legacy chroma content"
 ## Phase 2: Ollama and Hardware Readiness
 
 ### Task 9: Add the Loopback-Only Ollama Gateway
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/adapters/ollama/gateway.py`
