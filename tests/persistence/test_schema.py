@@ -1,5 +1,8 @@
 from pathlib import Path
+import sqlite3
 
+from alembic import command
+from alembic.config import Config
 import pytest
 from sqlalchemy import select, text
 
@@ -74,3 +77,50 @@ def test_file_deletion_cascades_to_documents(schema_database: Path) -> None:
 
     with session_factory() as session:
         assert session.scalar(select(Document)) is None
+
+
+def test_index_job_lease_migration_grants_preexisting_running_job_a_deadline(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-running.sqlite3"
+    config_path = Path(__file__).resolve().parents[2] / "alembic.ini"
+    config = Config(str(config_path))
+    config.attributes["database_path"] = database_path
+    command.upgrade(config, "0004_index_job_lease")
+    with sqlite3.connect(database_path) as connection:
+        cursor = connection.execute(
+            "INSERT INTO files "
+            "(canonical_path, indexing_state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (r"C:\docs\guide.md", "running", "2026-11-24 11:00:00", "2026-11-24 11:00:00"),
+        )
+        connection.execute(
+            "INSERT INTO index_jobs "
+            "(file_id, job_type, status, total_count, processed_count, "
+            "failed_count, retry_count, lease_token, started_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cursor.lastrowid,
+                "index",
+                "running",
+                1,
+                0,
+                0,
+                0,
+                "legacy-owner",
+                "2026-11-24 11:00:00",
+                "2026-11-24 11:00:00",
+                "2026-11-24 11:00:00",
+            ),
+        )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT status, lease_token, lease_expires_at FROM index_jobs"
+        ).fetchone()
+    assert row is not None
+    assert row[0:2] == ("running", "legacy-owner")
+    assert isinstance(row[2], str)
+    assert row[2]

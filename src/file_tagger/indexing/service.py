@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 import inspect
 from pathlib import Path
-from typing import Any, cast
+from threading import Event, Thread
+from typing import Any, TypeVar, cast
 
 from ..domain.contracts import ModelProfile
 from ..domain.errors import (
@@ -18,6 +19,7 @@ from .embedder import EmbeddedChunk, EmbeddingBatchResult, embed_document_chunks
 from .repository import IndexingRepository, JobCheckpoint, JobState
 
 CancellationCheck = Callable[[], bool]
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,7 @@ class IndexingService:
         extraction_version: str = "docling-v1",
         index_version: str | None = None,
         chunker: Callable[..., Sequence[DocumentChunk]] = chunk_document,
+        recover_on_startup: bool = True,
     ) -> None:
         selected_profile = embedding_profile or profile
         if selected_profile is None:
@@ -79,6 +82,8 @@ class IndexingService:
             f"{selected_profile.dimensions}"
         )
         self._chunker = chunker
+        if recover_on_startup:
+            self.recover_abandoned()
 
     @property
     def repository(self) -> IndexingRepository:
@@ -124,7 +129,11 @@ class IndexingService:
                     self._pause_owned(job_id, lease_token)
                 )
 
-            checkpoint = self._repository.load_checkpoint(job_id)
+            checkpoint = self._with_lease_heartbeat(
+                job_id,
+                lease_token,
+                lambda: self._repository.load_checkpoint(job_id),
+            )
             if self._checkpoint_reusable(state, checkpoint):
                 assert checkpoint is not None
                 extracted = checkpoint.extracted
@@ -136,8 +145,16 @@ class IndexingService:
                 source_hash = checkpoint.source_hash
                 first_unprocessed = checkpoint.processed_count
             else:
-                source_signature = self._source_signature(state.file_path)
-                extracted = self._extract(state.file_path)
+                source_signature = self._with_lease_heartbeat(
+                    job_id,
+                    lease_token,
+                    lambda: self._source_signature(state.file_path),
+                )
+                extracted = self._with_lease_heartbeat(
+                    job_id,
+                    lease_token,
+                    lambda: self._extract(state.file_path),
+                )
                 if not isinstance(extracted, ExtractedDocument):
                     raise IndexTransactionError(
                         "The extractor did not return an extracted document."
@@ -146,7 +163,11 @@ class IndexingService:
                     raise IndexTransactionError(
                         "Document extraction failed before indexing could continue."
                     )
-                after_extraction = self._source_signature(state.file_path)
+                after_extraction = self._with_lease_heartbeat(
+                    job_id,
+                    lease_token,
+                    lambda: self._source_signature(state.file_path),
+                )
                 if after_extraction != source_signature:
                     raise IndexTransactionError(
                         "The source file changed during document extraction."
@@ -156,7 +177,13 @@ class IndexingService:
                         "The extracted source hash does not match the checkpoint source."
                     )
 
-                chunks = list(self._chunker(extracted.pages))
+                chunks = list(
+                    self._with_lease_heartbeat(
+                        job_id,
+                        lease_token,
+                        lambda: self._chunker(extracted.pages),
+                    )
+                )
                 total_count = len(chunks)
                 source_size, source_mtime_ns, source_hash = after_extraction
                 first_unprocessed = 0
@@ -190,7 +217,11 @@ class IndexingService:
                     return IndexingResult.from_state(
                         self._pause_owned(job_id, lease_token)
                     )
-                result = self._run_embedding((chunk,))
+                result = self._with_lease_heartbeat(
+                    job_id,
+                    lease_token,
+                    lambda: self._run_embedding((chunk,)),
+                )
                 if not result.complete_source_coverage:
                     raise ModelIncompatibleError(
                         "Embedding output did not cover the complete source chunk."
@@ -223,7 +254,12 @@ class IndexingService:
 
             dimensions = self._profile.dimensions
             assert dimensions is not None
-            if self._source_signature(state.file_path) != (
+            current_signature = self._with_lease_heartbeat(
+                job_id,
+                lease_token,
+                lambda: self._source_signature(state.file_path),
+            )
+            if current_signature != (
                 source_size,
                 source_mtime_ns,
                 source_hash,
@@ -261,6 +297,32 @@ class IndexingService:
 
     def state(self, job_id: int) -> IndexingResult:
         return IndexingResult.from_state(self._repository.state(job_id))
+
+    def recover_abandoned(self) -> tuple[IndexingResult, ...]:
+        return tuple(self.resume(job_id) for job_id in self._repository.expired_job_ids())
+
+    def _with_lease_heartbeat(
+        self,
+        job_id: int,
+        lease_token: str,
+        operation: Callable[[], T],
+    ) -> T:
+        stop = Event()
+
+        def renew_lease() -> None:
+            while not stop.wait(self._repository.heartbeat_interval):
+                try:
+                    self._repository.heartbeat(job_id, lease_token=lease_token)
+                except IndexTransactionError:
+                    return
+
+        worker = Thread(target=renew_lease, name="indexing-lease-heartbeat", daemon=True)
+        worker.start()
+        try:
+            return operation()
+        finally:
+            stop.set()
+            worker.join()
 
     def _extract(self, file_path: str) -> ExtractedDocument:
         extract = getattr(self._extractor, "extract", self._extractor)

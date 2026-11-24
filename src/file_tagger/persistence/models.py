@@ -222,6 +222,9 @@ class IndexJob(Base):
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     lease_token: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     failure: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

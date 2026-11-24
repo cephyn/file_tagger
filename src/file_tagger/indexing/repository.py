@@ -1,6 +1,6 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -8,7 +8,7 @@ import struct
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import case, delete, func, select, text, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -26,12 +26,14 @@ from .chunker import DocumentChunk
 from .embedder import EmbeddedChunk
 
 VECTOR_DIMENSIONS = (256, 512, 768)
+DEFAULT_LEASE_DURATION = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
 class JobState:
     id: int
     lease_token: str | None
+    lease_expires_at: datetime | None
     file_path: str
     status: str
     total_count: int
@@ -59,9 +61,25 @@ class JobCheckpoint:
 
 
 class IndexingRepository:
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        *,
+        lease_duration: timedelta = DEFAULT_LEASE_DURATION,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if lease_duration <= timedelta(0):
+            raise ValueError("The indexing lease duration must be positive.")
         self._session_factory = session_factory
+        self._lease_duration = lease_duration
+        self._clock: Callable[[], datetime] = clock or (
+            lambda: datetime.now(UTC)
+        )
         self._fail_next_vector = False
+
+    @property
+    def heartbeat_interval(self) -> float:
+        return min(30.0, max(0.01, self._lease_duration.total_seconds() / 3))
 
     def queue(self, file_path: str | Path, *, job_type: str = "index") -> int:
         canonical_path = self._canonical_path(file_path)
@@ -93,7 +111,8 @@ class IndexingRepository:
 
     def begin(self, job_id: int) -> JobState:
         lease_token = uuid4().hex
-        claimed_at = datetime.now(UTC)
+        claimed_at = self._clock()
+        lease_expires_at = claimed_at + self._lease_duration
         with self._session_factory.begin() as session:
             result = cast(
                 CursorResult[Any],
@@ -101,12 +120,24 @@ class IndexingRepository:
                     update(IndexJob)
                     .where(
                         IndexJob.id == job_id,
-                        IndexJob.status.in_(("queued", "failed", "pending")),
-                        IndexJob.lease_token.is_(None),
+                        or_(
+                            and_(
+                                IndexJob.status.in_(
+                                    ("queued", "failed", "pending")
+                                ),
+                                IndexJob.lease_token.is_(None),
+                            ),
+                            and_(
+                                IndexJob.status == "running",
+                                IndexJob.lease_expires_at.is_not(None),
+                                IndexJob.lease_expires_at <= claimed_at,
+                            ),
+                        ),
                     )
                     .values(
                         status="running",
                         lease_token=lease_token,
+                        lease_expires_at=lease_expires_at,
                         retry_count=IndexJob.retry_count
                         + case(
                             (IndexJob.started_at.is_not(None), 1),
@@ -133,7 +164,7 @@ class IndexingRepository:
             session.execute(
                 update(File)
                 .where(File.id == job.file_id)
-                .values(indexing_state="running", updated_at=datetime.now(UTC))
+                .values(indexing_state="running", updated_at=claimed_at)
             )
             session.expire_all()
             job = self._job(session, job_id)
@@ -212,6 +243,27 @@ class IndexingRepository:
                         ],
                     )
                 )
+            session.flush()
+            return self._state(session, job)
+
+    def expired_job_ids(self) -> tuple[int, ...]:
+        now = self._clock()
+        with self._session_factory() as session:
+            return tuple(
+                session.scalars(
+                    select(IndexJob.id)
+                    .where(
+                        IndexJob.status == "running",
+                        IndexJob.lease_expires_at.is_not(None),
+                        IndexJob.lease_expires_at <= now,
+                    )
+                    .order_by(IndexJob.id)
+                )
+            )
+
+    def heartbeat(self, job_id: int, *, lease_token: str) -> JobState:
+        with self._session_factory.begin() as session:
+            job = self._owned_job(session, job_id, lease_token)
             session.flush()
             return self._state(session, job)
 
@@ -318,6 +370,7 @@ class IndexingRepository:
             job = self._owned_job(session, job_id, lease_token)
             job.status = "queued"
             job.lease_token = None
+            job.lease_expires_at = None
             job.failure = None
             job.completed_at = None
             if job.file is not None:
@@ -336,6 +389,7 @@ class IndexingRepository:
             job = self._owned_job(session, job_id, lease_token)
             job.status = "failed"
             job.lease_token = None
+            job.lease_expires_at = None
             job.failure = dict(failure)
             job.failed_count += 1
             job.completed_at = datetime.now(UTC)
@@ -511,6 +565,7 @@ class IndexingRepository:
 
             job.status = "completed"
             job.lease_token = None
+            job.lease_expires_at = None
             job.failure = None
             job.processed_count = job.total_count
             job.checkpoint = None
@@ -556,12 +611,13 @@ class IndexingRepository:
             raise IndexTransactionError("The requested indexing job was not found.")
         return job
 
-    @staticmethod
     def _owned_job(
+        self,
         session: Session,
         job_id: int,
         lease_token: str,
     ) -> IndexJob:
+        now = self._clock()
         result = cast(
             CursorResult[Any],
             session.execute(
@@ -570,8 +626,13 @@ class IndexingRepository:
                     IndexJob.id == job_id,
                     IndexJob.status == "running",
                     IndexJob.lease_token == lease_token,
+                    IndexJob.lease_expires_at.is_not(None),
+                    IndexJob.lease_expires_at > now,
                 )
-                .values(updated_at=datetime.now(UTC))
+                .values(
+                    updated_at=now,
+                    lease_expires_at=now + self._lease_duration,
+                )
             )
         )
         if result.rowcount != 1:
@@ -579,7 +640,7 @@ class IndexingRepository:
                 "The worker does not own the indexing job lease."
             )
         session.expire_all()
-        return IndexingRepository._job(session, job_id)
+        return self._job(session, job_id)
 
     def _state(self, session: Session, job: IndexJob) -> JobState:
         revision = None
@@ -593,6 +654,7 @@ class IndexingRepository:
         return JobState(
             id=int(job.id),
             lease_token=job.lease_token,
+            lease_expires_at=job.lease_expires_at,
             file_path=file_path,
             status=job.status,
             total_count=job.total_count,

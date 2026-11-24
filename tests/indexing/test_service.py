@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -67,6 +68,28 @@ class CountingGateway(FixedGateway):
         )
 
 
+class SlowGateway(FixedGateway):
+    async def embed(
+        self,
+        model: str,
+        text: str,
+        *,
+        dimensions: int | None = None,
+        truncate: bool = False,
+        keep_alive: str = "5m",
+    ) -> tuple[tuple[float, ...],]:
+        import asyncio
+
+        await asyncio.sleep(0.35)
+        return await super().embed(
+            model,
+            text,
+            dimensions=dimensions,
+            truncate=truncate,
+            keep_alive=keep_alive,
+        )
+
+
 class SplittingGateway(FixedGateway):
     async def embed(
         self,
@@ -92,6 +115,12 @@ class FailingExtractor:
     def extract(self, file_path: str | Path) -> ExtractedDocument:
         del file_path
         raise RuntimeError("credential=do-not-store-this-secret")
+
+
+class CrashingEmbedder:
+    def embed_document_chunks(self, chunks: tuple[DocumentChunk, ...]) -> None:
+        del chunks
+        raise KeyboardInterrupt
 
 
 class IdenticalExtractor:
@@ -199,6 +228,145 @@ def test_job_claim_is_exclusive_and_stale_owner_cannot_mutate_completion(
 
     assert completed.status == "completed"
     assert repository.state(job_id).status == "completed"
+
+
+def test_restarted_service_recovers_expired_job_without_cooperative_pause(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "crash-restart.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    now = [datetime(2026, 11, 24, 12, tzinfo=UTC)]
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=1_000,
+        dimensions=256,
+    )
+    crashed_repository = IndexingRepository(
+        session_factory,
+        lease_duration=timedelta(seconds=30),
+        clock=lambda: now[0],
+    )
+    extractor = MutableExtractor(
+        extraction(source, marker="recover me", file_hash="unused")
+    )
+    crashed_service = IndexingService(
+        crashed_repository,
+        extractor=extractor,
+        embedder=CrashingEmbedder(),
+        embedding_profile=profile,
+    )
+    job_id = crashed_service.queue(source)
+
+    with pytest.raises(KeyboardInterrupt):
+        crashed_service.resume(job_id)
+    abandoned = crashed_repository.state(job_id)
+    assert abandoned.status == "running"
+    assert abandoned.lease_token is not None
+
+    now[0] += timedelta(seconds=31)
+    restarted_extractor = MutableExtractor(
+        extraction(source, marker="recover me", file_hash="unused")
+    )
+    restarted_repository = IndexingRepository(
+        session_factory,
+        lease_duration=timedelta(seconds=30),
+        clock=lambda: now[0],
+    )
+    IndexingService(
+        restarted_repository,
+        extractor=restarted_extractor,
+        embedding_gateway=FixedGateway(),
+        embedding_profile=profile,
+    )
+
+    recovered = restarted_repository.state(job_id)
+    assert recovered.status == "completed"
+    assert recovered.processed_count == recovered.total_count == 1
+    assert restarted_extractor.calls == 0
+    assert restarted_repository.current_revision(source) == 1
+    with pytest.raises(IndexTransactionError, match="does not own"):
+        restarted_repository.checkpoint(
+            job_id,
+            lease_token=abandoned.lease_token,
+            processed_count=0,
+            total_count=1,
+        )
+
+
+def test_restarted_service_does_not_take_over_live_owner(tmp_path: Path) -> None:
+    database = tmp_path / "live-owner.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    now = [datetime(2026, 11, 24, 12, tzinfo=UTC)]
+    repository = IndexingRepository(
+        session_factory,
+        lease_duration=timedelta(seconds=30),
+        clock=lambda: now[0],
+    )
+    extractor = MutableExtractor(
+        extraction(source, marker="still working", file_hash="unused")
+    )
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=1_000,
+        dimensions=256,
+    )
+    job_id = repository.queue(source)
+    owner = repository.begin(job_id)
+
+    IndexingService(
+        IndexingRepository(
+            session_factory,
+            lease_duration=timedelta(seconds=30),
+            clock=lambda: now[0],
+        ),
+        extractor=extractor,
+        embedding_gateway=FixedGateway(),
+        embedding_profile=profile,
+    )
+
+    live = repository.state(job_id)
+    assert live.status == "running"
+    assert live.lease_token == owner.lease_token
+    assert extractor.calls == 0
+
+
+def test_live_worker_heartbeats_during_slow_embedding(tmp_path: Path) -> None:
+    database = tmp_path / "heartbeat.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    repository = IndexingRepository(
+        create_session_factory(database),
+        lease_duration=timedelta(seconds=0.2),
+    )
+    service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="long request", file_hash="unused")
+        ),
+        embedding_gateway=SlowGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+    )
+
+    result = service.reindex(source)
+
+    assert result.status == "completed"
 
 
 def test_changed_source_near_commit_preserves_previous_revision(
