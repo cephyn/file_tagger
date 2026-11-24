@@ -26,6 +26,10 @@ class ModelIncompatibleError(FileTaggerError):
     """Raised when an installed model lacks a required capability."""
 
 
+class ModelRecommendationError(FileTaggerError):
+    """Raised when local hardware cannot support a required model role."""
+
+
 class EmbeddingContextRejectedError(FileTaggerError):
     """Raised when content cannot fit the embedding model without truncation."""
 
