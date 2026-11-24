@@ -29,7 +29,10 @@ Last updated: 2026-11-24
 | 10: hardware-based model recommendations | Complete | `9ffdba5` |
 | 11: Ollama readiness benchmarks | Complete | `fe8adfd` |
 | 12: Docling extraction adapter | Complete | `eda16f8` |
-| 13-29 | Not started | — |
+| 13: selective PDF vision fallback | Complete | `ad941b0` |
+| 14: provenance-aware chunking | Complete | `a23e027` |
+| 15: complete embedding coverage | Complete | `89c7b34` |
+| 16-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -670,6 +673,8 @@ git commit -m "feat: extract documents with Docling"
 
 ### Task 13: Add Selective Vision Augmentation
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/extraction/vision_candidates.py`
 - Modify: `src/file_tagger/extraction/docling_adapter.py`
@@ -715,6 +720,8 @@ git commit -m "feat: add selective PDF vision fallback"
 
 ### Task 14: Make Chunking Structure- and Context-Aware
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/indexing/chunker.py`
 - Delete behavior in: `src/file_tagger/vector_search/document_chunker.py`
@@ -755,6 +762,8 @@ git commit -m "feat: add provenance-aware document chunking"
 ```
 
 ### Task 15: Enforce Full Coverage at the Embedding Boundary
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/indexing/embedder.py`
