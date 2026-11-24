@@ -26,7 +26,10 @@ Last updated: 2026-11-24
 | 7: legacy SQLite/config migration | Complete | `894ddc8` |
 | 8: legacy Chroma inventory | Complete | `a5dfebb` |
 | 9: loopback-only Ollama gateway | Complete | `117de1e` |
-| 10-29 | Not started | — |
+| 10: hardware-based model recommendations | Complete | `9ffdba5` |
+| 11: Ollama readiness benchmarks | Complete | `fe8adfd` |
+| 12: Docling extraction adapter | Complete | `eda16f8` |
+| 13-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -522,6 +525,8 @@ git commit -m "feat: add local Ollama gateway"
 
 ### Task 10: Recommend Models from Hardware
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/ollama/hardware.py`
 - Create: `src/file_tagger/ollama/model_recommender.py`
@@ -574,6 +579,8 @@ git commit -m "feat: recommend Ollama models from hardware"
 
 ### Task 11: Benchmark and Persist Model Profiles
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/ollama/benchmarks.py`
 - Create: `src/file_tagger/ollama/readiness.py`
@@ -617,6 +624,8 @@ git commit -m "feat: add Ollama readiness benchmarks"
 ## Phase 3: Extraction, Chunking, and Indexing
 
 ### Task 12: Replace PDF/Office Extraction with Docling
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/extraction/docling_adapter.py`
