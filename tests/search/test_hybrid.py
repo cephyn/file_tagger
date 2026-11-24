@@ -33,6 +33,7 @@ def _seed_chunk(
     mime_type: str = "text/markdown",
     page_number: int = 1,
     heading: str | None = None,
+    revision: int = 1,
 ) -> None:
     canonical_path = str(path.resolve())
     file = session.scalar(select(File).where(File.canonical_path == canonical_path))
@@ -46,7 +47,7 @@ def _seed_chunk(
         session.flush()
         document = Document(
             file_id=file.id,
-            revision=1,
+            revision=revision,
             file_hash=f"hash-{path.name}",
             extraction_version="test",
             parser="test",
@@ -58,10 +59,26 @@ def _seed_chunk(
         session.flush()
     else:
         existing_document = session.scalar(
-            select(Document).where(Document.file_id == file.id)
+            select(Document).where(
+                Document.file_id == file.id,
+                Document.revision == revision,
+            )
         )
-        assert existing_document is not None
-        document = existing_document
+        if existing_document is None:
+            document = Document(
+                file_id=file.id,
+                revision=revision,
+                file_hash=f"hash-{path.name}-revision-{revision}",
+                extraction_version="test",
+                parser="test",
+                page_count=page_number,
+                extraction_status="complete",
+                diagnostics=[],
+            )
+            session.add(document)
+            session.flush()
+        else:
+            document = existing_document
 
     page = session.scalar(
         select(Page).where(
@@ -137,6 +154,20 @@ def test_rrf_preserves_complementary_lexical_and_vector_hits() -> None:
 
     assert fused[0].chunk_id == "shared"
     assert {item.chunk_id for item in fused} == {"exact", "shared", "semantic"}
+
+
+def test_rrf_equal_rank_ties_do_not_depend_on_source_order() -> None:
+    forward = reciprocal_rank_fusion(
+        {"lexical": ("zeta",), "vector": ("alpha",)},
+    )
+    reversed_sources = reciprocal_rank_fusion(
+        {"vector": ("alpha",), "lexical": ("zeta",)},
+    )
+
+    assert [item.chunk_id for item in reversed_sources] == [
+        item.chunk_id for item in forward
+    ]
+    assert [item.chunk_id for item in forward] == ["alpha", "zeta"]
 
 
 def test_exact_term_recall_and_citation_metadata(
@@ -414,6 +445,59 @@ def test_vector_filters_are_applied_before_the_nearest_neighbor_limit(
     )
 
     assert [candidate.chunk_id for candidate in result] == ["eligible"]
+
+
+def test_search_pins_one_revision_snapshot_across_all_queries(
+    search_session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "revisioned.md"
+    _seed_chunk(
+        search_session,
+        path=file_path,
+        stable_id="revision-one",
+        text_value="needle from revision one",
+        vector=_vector(1.0, 0.0),
+    )
+    search_session.commit()
+
+    search = HybridSearch(search_session)
+    original_vector_rankings = search._vector_rankings
+    revision_swapped = False
+
+    def swap_revision_before_vector(
+        query_embedding: tuple[float, ...],
+        filters: SearchFilters,
+    ) -> tuple[str, ...]:
+        nonlocal revision_swapped
+        if not revision_swapped:
+            revision_swapped = True
+            with Session(bind=search_session.get_bind()) as writer:
+                _seed_chunk(
+                    writer,
+                    path=file_path,
+                    stable_id="revision-two",
+                    text_value="needle from revision two",
+                    vector=_vector(1.0, 0.0),
+                    revision=2,
+                )
+                writer.commit()
+        return original_vector_rankings(query_embedding, filters)
+
+    monkeypatch.setattr(search, "_vector_rankings", swap_revision_before_vector)
+
+    result = search.search("needle", _vector(1.0, 0.0))
+
+    assert revision_swapped
+    assert [candidate.chunk_id for candidate in result] == ["revision-one"]
+    with Session(bind=search_session.get_bind()) as verifier:
+        assert verifier.scalar(
+            select(Document.revision)
+            .where(Document.file_id == select(File.id).where(File.canonical_path == str(file_path.resolve())).scalar_subquery())
+            .order_by(Document.revision.desc())
+            .limit(1)
+        ) == 2
 
 
 def test_fts_query_is_safely_quoted_and_cannot_inject_sql(

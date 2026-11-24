@@ -273,3 +273,112 @@ def test_duplicate_results_merge_in_rank_order() -> None:
         "first",
         "first-detail",
     ]
+
+
+def test_duplicate_aggregate_ties_are_independent_of_input_order() -> None:
+    primary = _chunk_data(
+        file_path=r"C:\library\duplicates.pdf",
+        stable_id="primary",
+    )
+    alpha_aggregate = make_result(
+        [
+            primary,
+            _chunk_data(
+                file_path=r"C:\library\duplicates.pdf",
+                stable_id="alpha-section",
+                page_number=13,
+                section="Alpha section",
+            ),
+        ],
+        rank=1,
+        score=0.02,
+    )
+    zeta_aggregate = make_result(
+        [
+            primary,
+            _chunk_data(
+                file_path=r"C:\library\duplicates.pdf",
+                stable_id="zeta-section",
+                page_number=14,
+                section="Zeta section",
+            ),
+        ],
+        rank=1,
+        score=0.02,
+    )
+
+    forward = merge_results([alpha_aggregate, zeta_aggregate])
+    reversed_input = merge_results([zeta_aggregate, alpha_aggregate])
+
+    assert reversed_input == forward
+    assert [section.chunk_id for section in forward[0].matched_sections] == [
+        "primary",
+        "alpha-section",
+        "zeta-section",
+    ]
+
+
+def test_duplicate_aggregate_ties_distinguish_absent_and_empty_metadata() -> None:
+    absent = make_result(
+        _chunk_data(
+            file_path=r"C:\library\duplicates.pdf",
+            stable_id="shared",
+            heading=None,
+            section=None,
+        ),
+        rank=1,
+        score=0.02,
+    )
+    empty = make_result(
+        _chunk_data(
+            file_path=r"C:\library\duplicates.pdf",
+            stable_id="shared",
+            heading="",
+            section="",
+        ),
+        rank=1,
+        score=0.02,
+    )
+
+    forward = merge_results([absent, empty])
+    reversed_input = merge_results([empty, absent])
+
+    assert reversed_input == forward
+    assert forward[0].matched_sections == absent.matched_sections
+
+
+def test_merged_multi_file_citation_ids_are_unique_and_resolvable() -> None:
+    first = make_result(
+        _chunk_data(
+            file_path=r"C:\library\first.pdf",
+            stable_id="shared-stable-id",
+        )
+    )
+    second = make_result(
+        _chunk_data(
+            file_path=r"C:\library\second.pdf",
+            stable_id="shared-stable-id",
+        ),
+        rank=2,
+    )
+
+    merged = merge_results([second, first])
+    citations = tuple(
+        citation for result in merged for citation in result.citations
+    )
+    resolutions = {
+        citation.citation_id: (citation.path, citation.chunk_id)
+        for citation in citations
+    }
+
+    assert len(resolutions) == len(citations) == 2
+    assert resolutions == {
+        citation.citation_id: (result.file_path, citation.chunk_id)
+        for result in merged
+        for citation in result.citations
+    }
+    assert {
+        citation.citation_id: (citation.path, citation.chunk_id)
+        for result in merge_results([first, second])
+        for citation in result.citations
+    } == resolutions

@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import fsum
 
 
 @dataclass(frozen=True)
@@ -22,29 +23,30 @@ def reciprocal_rank_fusion(
     if k <= 0:
         raise ValueError("The reciprocal-rank constant must be positive.")
 
-    scores: dict[str, float] = {}
     source_ranks: dict[str, dict[str, int]] = {}
-    first_seen: dict[str, int] = {}
-    seen_at = 0
-    for source, chunk_ids in rankings.items():
+    for source in sorted(rankings):
+        chunk_ids = rankings[source]
         unique_in_source: set[str] = set()
         for rank, chunk_id in enumerate(chunk_ids, start=1):
             if chunk_id in unique_in_source:
                 continue
             unique_in_source.add(chunk_id)
-            if chunk_id not in first_seen:
-                first_seen[chunk_id] = seen_at
-                seen_at += 1
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
             source_ranks.setdefault(chunk_id, {})[source] = rank
 
+    scores = {
+        chunk_id: fsum(
+            1.0 / (k + source_ranks[chunk_id][source])
+            for source in sorted(source_ranks[chunk_id])
+        )
+        for chunk_id in source_ranks
+    }
     ordered = sorted(
         scores,
         key=lambda chunk_id: (
             -scores[chunk_id],
             min(source_ranks[chunk_id].values()),
-            first_seen[chunk_id],
             chunk_id,
+            tuple(sorted(source_ranks[chunk_id].items())),
         ),
     )
     return tuple(
@@ -52,7 +54,7 @@ def reciprocal_rank_fusion(
             chunk_id=chunk_id,
             rank=rank,
             score=scores[chunk_id],
-            source_ranks=source_ranks[chunk_id],
+            source_ranks=dict(sorted(source_ranks[chunk_id].items())),
         )
         for rank, chunk_id in enumerate(ordered, start=1)
     )

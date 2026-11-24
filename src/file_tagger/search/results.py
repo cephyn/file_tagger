@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Mapping
+from base64 import urlsafe_b64encode
 import json
 from typing import Literal, cast
 
@@ -118,7 +119,7 @@ def merge_results(
         return ()
     ordered_results = sorted(
         results,
-        key=lambda item: (item.rank, -item.score, item.path, item.chunk_id),
+        key=_result_order_key,
     )
     grouped: dict[str, list[SearchResult]] = {}
     for result in ordered_results:
@@ -187,7 +188,7 @@ def _result_from_sections(
     primary = sections[0]
     citations = tuple(
         SearchCitation(
-            citation_id=f"source-{index}",
+            citation_id=_citation_id(path, section.chunk_id),
             path=path,
             page_number=section.page_number,
             chunk_id=section.chunk_id,
@@ -195,7 +196,7 @@ def _result_from_sections(
             section=section.section,
             excerpt=section.snippet,
         )
-        for index, section in enumerate(sections, start=1)
+        for section in sections
     )
     return SearchResult(
         chunk_id=primary.chunk_id,
@@ -313,6 +314,60 @@ def _first_value(item: object | None, *names: str) -> object | None:
         if value is not None:
             return value
     return None
+
+
+def _result_order_key(
+    result: SearchResult,
+) -> tuple[
+    int,
+    float,
+    str,
+    str,
+    int,
+    tuple[bool, str],
+    str,
+    str,
+    str,
+    tuple[str, ...],
+    bool,
+    tuple[tuple[str, int, tuple[bool, str], tuple[bool, str], str], ...],
+]:
+    return (
+        result.rank,
+        -result.score,
+        result.path,
+        result.chunk_id,
+        result.page_number,
+        _optional_order_key(result.heading),
+        result.text,
+        result.source,
+        result.summary,
+        result.tags,
+        result.stale,
+        tuple(_section_order_key(section) for section in result.matched_sections),
+    )
+
+
+def _section_order_key(
+    section: MatchedSection,
+) -> tuple[str, int, tuple[bool, str], tuple[bool, str], str]:
+    return (
+        section.chunk_id,
+        section.page_number,
+        _optional_order_key(section.heading),
+        _optional_order_key(section.section),
+        section.snippet,
+    )
+
+
+def _optional_order_key(value: str | None) -> tuple[bool, str]:
+    return value is not None, value or ""
+
+
+def _citation_id(path: str, chunk_id: str) -> str:
+    encoded_path = urlsafe_b64encode(path.encode("utf-8")).rstrip(b"=").decode()
+    encoded_chunk = urlsafe_b64encode(chunk_id.encode("utf-8")).rstrip(b"=").decode()
+    return f"source-{encoded_path}.{encoded_chunk}"
 
 
 def _merge_sources(sources: set[SearchSource]) -> SearchSource:

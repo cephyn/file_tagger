@@ -1,5 +1,7 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+import sqlite3
 import struct
 from typing import Literal
 
@@ -87,25 +89,26 @@ class HybridSearch:
         lexical_query = normalize_fts_query(query)
         if not lexical_query:
             return ()
-        rankings: dict[str, tuple[str, ...]] = {
-            "lexical": self._lexical_rankings(
-                lexical_query,
-                selected_filters,
-            )
-        }
+        with _sqlite_read_snapshot(self._session):
+            rankings: dict[str, tuple[str, ...]] = {
+                "lexical": self._lexical_rankings(
+                    lexical_query,
+                    selected_filters,
+                )
+            }
 
-        embedding = tuple(query_embedding or ())
-        if embedding:
-            rankings["vector"] = self._vector_rankings(
-                embedding,
-                selected_filters,
-            )
+            embedding = tuple(query_embedding or ())
+            if embedding:
+                rankings["vector"] = self._vector_rankings(
+                    embedding,
+                    selected_filters,
+                )
 
-        fused = reciprocal_rank_fusion(rankings, k=self._rrf_k)
-        if not fused:
-            return ()
-        hydrated = self._hydrate_candidates(fused, selected_filters)
-        return self._group_by_file(fused, hydrated, limit)
+            fused = reciprocal_rank_fusion(rankings, k=self._rrf_k)
+            if not fused:
+                return ()
+            hydrated = self._hydrate_candidates(fused, selected_filters)
+            return self._group_by_file(fused, hydrated, limit)
 
     def _lexical_rankings(
         self,
@@ -317,6 +320,29 @@ def _merge_filters(
             dict.fromkeys(item.strip() for item in merged_types if item.strip())
         ),
     )
+
+
+@contextmanager
+def _sqlite_read_snapshot(session: Session) -> Iterator[None]:
+    owns_transaction = not session.in_transaction()
+    if owns_transaction:
+        with session.begin():
+            _begin_sqlite_snapshot(session)
+            yield
+        return
+
+    _begin_sqlite_snapshot(session)
+    yield
+
+
+def _begin_sqlite_snapshot(session: Session) -> None:
+    connection = session.connection()
+    dbapi_connection = connection.connection.driver_connection
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        raise TypeError("Hybrid search requires a SQLite database.")
+    if not dbapi_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN")
+    connection.exec_driver_sql("SELECT count(*) FROM files").scalar_one()
 
 
 def _filter_sql(
