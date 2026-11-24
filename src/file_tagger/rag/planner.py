@@ -314,14 +314,14 @@ def _parse_plan(
             {
                 **plan.model_dump(),
                 "exact_terms": _merge_terms(
-                    plan.exact_terms,
                     context.entities,
+                    plan.exact_terms,
                     max_items=MAX_EXACT_TERM_ITEMS,
                     max_length=MAX_TERM_LENGTH,
                 ),
                 "normalized_constraints": _merge_terms(
-                    plan.normalized_constraints,
                     context.constraints,
+                    plan.normalized_constraints,
                     max_items=MAX_AUXILIARY_ITEMS,
                     max_length=MAX_AUXILIARY_LENGTH,
                 ),

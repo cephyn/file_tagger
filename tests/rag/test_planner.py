@@ -208,7 +208,35 @@ def test_planner_deduplicates_model_and_markdown_exact_terms() -> None:
         gateway=FakePlannerGateway(payload),
     )
 
-    assert plan.exact_terms == ("Shared Heading", "Unique Heading")
+    assert plan.exact_terms == ("shared heading", "Unique Heading")
+
+
+def test_planner_preserves_at_capacity_markdown_context() -> None:
+    model_terms = ["sunken vault", *(f"model term {index}" for index in range(15))]
+    model_constraints = [f"constraint {index}" for index in range(16)]
+    payload = json.dumps(
+        {
+            **json.loads(VALID_PLAN_JSON),
+            "exact_terms": model_terms,
+            "normalized_constraints": model_constraints,
+        }
+    )
+
+    plan = build_search_plan(
+        question="Find encounters",
+        markdown_context="The [[Sunken Vault]] supports a level 3 party.",
+        gateway=FakePlannerGateway(payload),
+    )
+
+    assert plan.exact_terms == (
+        "Sunken Vault",
+        "Level 3",
+        *model_terms[1:15],
+    )
+    assert plan.normalized_constraints == (
+        "level 3",
+        *model_constraints[:15],
+    )
 
 
 @pytest.mark.parametrize(
