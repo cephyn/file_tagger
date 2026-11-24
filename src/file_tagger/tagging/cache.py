@@ -1,0 +1,299 @@
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any, Protocol
+
+from pydantic import AliasChoices, Field, model_validator
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..domain.contracts import DomainRecord, TagDecision
+from ..persistence.models import File, TagSuggestionCache
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class CachedTagRecommendations(DomainRecord):
+    file_id: int | None = Field(default=None, gt=0)
+    file_path: str | None = Field(default=None, min_length=1)
+    file_hash: str = Field(min_length=1)
+    extraction_version: str | None = Field(default=None, min_length=1)
+    candidate_model_digest: str | None = Field(default=None, min_length=1)
+    decision_model_digest: str | None = Field(default=None, min_length=1)
+    model_digest: str | None = Field(default=None, min_length=1)
+    decisions: tuple[TagDecision, ...] = Field(
+        default=(),
+        validation_alias=AliasChoices("decisions", "recommendations", "suggestions"),
+    )
+    cached_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def require_model_identity(self) -> "CachedTagRecommendations":
+        if not any(
+            (
+                self.candidate_model_digest,
+                self.decision_model_digest,
+                self.model_digest,
+            )
+        ):
+            raise ValueError("At least one tag model digest is required.")
+        return self
+
+    @property
+    def effective_candidate_model_digest(self) -> str | None:
+        return self.candidate_model_digest or self.model_digest
+
+    @property
+    def effective_decision_model_digest(self) -> str | None:
+        return self.decision_model_digest or self.model_digest
+
+    @property
+    def recommendations(self) -> tuple[TagDecision, ...]:
+        return self.decisions
+
+    @property
+    def suggestions(self) -> tuple[TagDecision, ...]:
+        return self.decisions
+
+    @property
+    def accepted(self) -> tuple[TagDecision, ...]:
+        return tuple(item for item in self.decisions if item.decision == "accept")
+
+    @property
+    def rejected(self) -> tuple[TagDecision, ...]:
+        return tuple(item for item in self.decisions if item.decision == "reject")
+
+    @property
+    def review(self) -> tuple[TagDecision, ...]:
+        return tuple(item for item in self.decisions if item.decision == "review")
+
+    @property
+    def requires_confirmation(self) -> tuple[str, ...]:
+        return tuple(item.tag for item in self.review)
+
+
+StoredTagRecommendations = CachedTagRecommendations
+
+
+class TagRecommendationCache(Protocol):
+    def lookup(
+        self,
+        file_hash: str,
+        *,
+        extraction_version: str | None = None,
+        candidate_model_digest: str | None = None,
+        decision_model_digest: str | None = None,
+        model_digest: str | None = None,
+    ) -> CachedTagRecommendations | None: ...
+
+    def store(self, stored: CachedTagRecommendations) -> None: ...
+
+
+class InMemoryTagRecommendationCache:
+    def __init__(self) -> None:
+        self._entries: list[CachedTagRecommendations] = []
+
+    def lookup(
+        self,
+        file_hash: str,
+        *,
+        extraction_version: str | None = None,
+        candidate_model_digest: str | None = None,
+        decision_model_digest: str | None = None,
+        model_digest: str | None = None,
+    ) -> CachedTagRecommendations | None:
+        if not file_hash:
+            return None
+        for stored in reversed(self._entries):
+            if _matches(
+                stored,
+                file_hash=file_hash,
+                extraction_version=extraction_version,
+                candidate_model_digest=candidate_model_digest,
+                decision_model_digest=decision_model_digest,
+                model_digest=model_digest,
+            ):
+                return stored
+        return None
+
+    def store(self, stored: CachedTagRecommendations) -> None:
+        self._entries = [
+            entry for entry in self._entries if not _same_identity(entry, stored)
+        ]
+        self._entries.append(stored)
+
+    def save(self, stored: CachedTagRecommendations) -> None:
+        self.store(stored)
+
+
+class DatabaseTagRecommendationCache:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def lookup(
+        self,
+        file_hash: str,
+        *,
+        extraction_version: str | None = None,
+        candidate_model_digest: str | None = None,
+        decision_model_digest: str | None = None,
+        model_digest: str | None = None,
+    ) -> CachedTagRecommendations | None:
+        if not file_hash:
+            return None
+        statement = select(TagSuggestionCache).where(
+            TagSuggestionCache.file_hash == file_hash
+        )
+        if extraction_version is not None:
+            statement = statement.where(
+                TagSuggestionCache.extraction_version == extraction_version
+            )
+        selected_candidate = candidate_model_digest or model_digest
+        selected_decision = decision_model_digest or model_digest
+        if selected_candidate is not None:
+            statement = statement.where(
+                TagSuggestionCache.candidate_model_digest == selected_candidate
+            )
+        if selected_decision is not None:
+            statement = statement.where(
+                TagSuggestionCache.decision_model_digest == selected_decision
+            )
+        row = self._session.scalars(
+            statement.order_by(TagSuggestionCache.cached_at.desc()).limit(1)
+        ).first()
+        if row is None:
+            return None
+        payload = _database_payload(row)
+        if payload is None:
+            return None
+        try:
+            return CachedTagRecommendations.model_validate(payload)
+        except (TypeError, ValueError):
+            return None
+
+    def store(self, stored: CachedTagRecommendations) -> None:
+        file_id = self._resolve_file_id(stored)
+        row = self._session.scalar(
+            select(TagSuggestionCache).where(TagSuggestionCache.file_id == file_id)
+        )
+        payload = stored.model_dump(mode="json", exclude_none=True)
+        if row is None:
+            row = TagSuggestionCache(
+                file_id=file_id,
+                file_path=stored.file_path or self._file_path(file_id),
+                file_hash=stored.file_hash,
+                extraction_version=stored.extraction_version,
+                candidate_model_digest=stored.effective_candidate_model_digest,
+                decision_model_digest=stored.effective_decision_model_digest,
+                cached_at=stored.cached_at,
+                suggestions=payload,
+            )
+            self._session.add(row)
+        else:
+            row.file_path = stored.file_path or row.file_path
+            row.file_hash = stored.file_hash
+            row.extraction_version = stored.extraction_version
+            row.candidate_model_digest = stored.effective_candidate_model_digest
+            row.decision_model_digest = stored.effective_decision_model_digest
+            row.cached_at = stored.cached_at
+            row.suggestions = payload
+        self._session.flush()
+
+    def save(self, stored: CachedTagRecommendations) -> None:
+        self.store(stored)
+
+    def _resolve_file_id(self, stored: CachedTagRecommendations) -> int:
+        if stored.file_id is not None:
+            exact = self._session.get(File, stored.file_id)
+            if exact is None:
+                raise ValueError("The cache entry references an unknown file.")
+            if exact.content_hash != stored.file_hash:
+                raise ValueError("The cache file identity does not match its content hash.")
+            if stored.file_path and exact.canonical_path != stored.file_path:
+                raise ValueError("The cache file identity does not match its path.")
+            return exact.id
+        if stored.file_path:
+            exact = self._session.scalar(
+                select(File).where(File.canonical_path == stored.file_path)
+            )
+            if exact is not None and exact.content_hash == stored.file_hash:
+                return exact.id
+        matches = self._session.scalars(
+            select(File).where(File.content_hash == stored.file_hash)
+        ).all()
+        if len(matches) == 1:
+            return matches[0].id
+        raise ValueError(
+            "A tag recommendation cache entry requires a unique indexed file identity."
+        )
+
+    def _file_path(self, file_id: int) -> str:
+        file = self._session.get(File, file_id)
+        if file is None:
+            raise ValueError("The cache entry references an unknown file.")
+        return file.canonical_path
+
+
+def _same_identity(
+    left: CachedTagRecommendations,
+    right: CachedTagRecommendations,
+) -> bool:
+    return all(
+        (
+            left.file_hash == right.file_hash,
+            left.extraction_version == right.extraction_version,
+            left.effective_candidate_model_digest
+            == right.effective_candidate_model_digest,
+            left.effective_decision_model_digest
+            == right.effective_decision_model_digest,
+        )
+    )
+
+
+def _matches(
+    stored: CachedTagRecommendations,
+    *,
+    file_hash: str,
+    extraction_version: str | None,
+    candidate_model_digest: str | None,
+    decision_model_digest: str | None,
+    model_digest: str | None,
+) -> bool:
+    if stored.file_hash != file_hash:
+        return False
+    if extraction_version is not None:
+        if stored.extraction_version != extraction_version:
+            return False
+    selected_candidate = candidate_model_digest or model_digest
+    selected_decision = decision_model_digest or model_digest
+    if selected_candidate is not None:
+        if stored.effective_candidate_model_digest != selected_candidate:
+            return False
+    if selected_decision is not None:
+        if stored.effective_decision_model_digest != selected_decision:
+            return False
+    return True
+
+
+def _database_payload(row: TagSuggestionCache) -> dict[str, Any] | None:
+    if not isinstance(row.suggestions, Mapping):
+        return None
+    payload = dict(row.suggestions)
+    payload.update(
+        {
+            "file_id": row.file_id,
+            "file_path": row.file_path,
+            "file_hash": row.file_hash,
+            "extraction_version": row.extraction_version,
+            "candidate_model_digest": row.candidate_model_digest,
+            "decision_model_digest": row.decision_model_digest,
+            "cached_at": row.cached_at,
+        }
+    )
+    return payload
+
+
+InMemoryCache = InMemoryTagRecommendationCache
+DatabaseCache = DatabaseTagRecommendationCache
+Cache = InMemoryTagRecommendationCache

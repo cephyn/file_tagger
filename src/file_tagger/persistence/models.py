@@ -100,6 +100,9 @@ class TagSuggestionCache(Base):
     cached_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    extraction_version: Mapped[str | None] = mapped_column(String(64))
+    candidate_model_digest: Mapped[str | None] = mapped_column(String(255))
+    decision_model_digest: Mapped[str | None] = mapped_column(String(255))
     suggestions: Mapped[dict[str, Any] | list[Any]] = mapped_column(
         JSON, nullable=False
     )
