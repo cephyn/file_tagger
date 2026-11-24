@@ -4,15 +4,15 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 import logging
 import traceback
-import os
 from .initialization import InitializationWorker
+from .infrastructure.app_paths import AppPaths
 
 # Configure additional logging for login process
 logger = logging.getLogger("Login")
-# Make sure we have a logs directory
-os.makedirs('logs', exist_ok=True)
 # Add a file handler for login-specific issues
-login_log_handler = logging.FileHandler('login_debug.log')
+log_dir = AppPaths.discover().logs_dir
+log_dir.mkdir(parents=True, exist_ok=True)
+login_log_handler = logging.FileHandler(log_dir / 'login_debug.log')
 login_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.setLevel(logging.DEBUG)
 logger.addHandler(login_log_handler)

@@ -4,13 +4,14 @@ import logging
 import traceback
 from datetime import datetime
 from PySide6.QtWidgets import QApplication
+from .infrastructure.app_paths import AppPaths
 
 # Set up error logging to file
 def setup_logging():
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = AppPaths.discover().logs_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
     
-    log_file = os.path.join(log_dir, f'file_tagger_{datetime.now().strftime("%Y%m%d")}.log')
+    log_file = log_dir / f'file_tagger_{datetime.now().strftime("%Y%m%d")}.log'
     
     # Configure logging
     logging.basicConfig(

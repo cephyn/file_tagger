@@ -10,11 +10,13 @@ import secrets
 import string
 from typing import Optional
 from .ai_service import AIService
+from .infrastructure.app_paths import AppPaths
 
-CONFIG_FILE = "config.encrypted"
-SALT_FILE = ".salt"
-PASS_HASH_FILE = ".passhash"
-RECOVERY_FILE = ".recovery"
+
+def _get_app_paths() -> AppPaths:
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    return paths
 
 # Default system message for AI interactions
 DEFAULT_SYSTEM_MESSAGE = """You are a helpful AI assistant for tagging and organizing files.
@@ -23,10 +25,11 @@ Suggest both existing tags that match and new tags that might be useful."""
 
 def generate_key(password: str, salt: bytes = None) -> bytes:
     """Generate an encryption key from password and salt."""
+    salt_file = _get_app_paths().salt_file
     if salt is None:
         salt = os.urandom(16)
         # Save salt for future use
-        with open(SALT_FILE, 'wb') as f:
+        with open(salt_file, 'wb') as f:
             f.write(salt)
     
     kdf = PBKDF2HMAC(
@@ -40,8 +43,9 @@ def generate_key(password: str, salt: bytes = None) -> bytes:
 
 def get_encryption_key(password: str) -> Fernet:
     """Get or create an encryption key."""
-    if os.path.exists(SALT_FILE):
-        with open(SALT_FILE, 'rb') as f:
+    salt_file = _get_app_paths().salt_file
+    if os.path.exists(salt_file):
+        with open(salt_file, 'rb') as f:
             salt = f.read()
     else:
         salt = None
@@ -63,11 +67,12 @@ def hash_password(password: str, salt: bytes = None) -> tuple[str, bytes]:
 
 def verify_password(password: str) -> bool:
     """Verify if the password matches the stored hash."""
-    if not os.path.exists(PASS_HASH_FILE):
+    password_hash_file = _get_app_paths().password_hash_file
+    if not os.path.exists(password_hash_file):
         return True  # First time setup
     
     try:
-        with open(PASS_HASH_FILE, 'rb') as f:
+        with open(password_hash_file, 'rb') as f:
             stored_data = json.load(f)
             stored_hash = stored_data['hash']
             salt = base64.b64decode(stored_data['salt'])
@@ -79,8 +84,9 @@ def verify_password(password: str) -> bool:
 
 def store_password_hash(password: str):
     """Store the hashed password."""
+    password_hash_file = _get_app_paths().password_hash_file
     password_hash, salt = hash_password(password)
-    with open(PASS_HASH_FILE, 'w') as f:
+    with open(password_hash_file, 'w') as f:
         json.dump({
             'hash': password_hash,
             'salt': base64.b64encode(salt).decode('utf-8')
@@ -93,18 +99,20 @@ def generate_recovery_key() -> str:
 
 def store_recovery_key(recovery_key: str, password: str):
     """Store an encrypted recovery key."""
+    recovery_file = _get_app_paths().recovery_file
     fernet = get_encryption_key(password)
     encrypted_key = fernet.encrypt(recovery_key.encode())
-    with open(RECOVERY_FILE, 'wb') as f:
+    with open(recovery_file, 'wb') as f:
         f.write(encrypted_key)
 
 def get_recovery_key(password: str) -> str:
     """Get the recovery key using the current password."""
-    if not os.path.exists(RECOVERY_FILE):
+    recovery_file = _get_app_paths().recovery_file
+    if not os.path.exists(recovery_file):
         return None
     try:
         fernet = get_encryption_key(password)
-        with open(RECOVERY_FILE, 'rb') as f:
+        with open(recovery_file, 'rb') as f:
             encrypted_key = f.read()
         decrypted_key = fernet.decrypt(encrypted_key)
         return decrypted_key.decode()
@@ -114,11 +122,12 @@ def get_recovery_key(password: str) -> str:
 class Config:
     def __init__(self, password: str):
         """Initialize config with password verification."""
+        self.paths = _get_app_paths()
         if not verify_password(password):
             raise ValueError("Invalid password")
             
         # Store password hash if this is first time setup
-        if not os.path.exists(PASS_HASH_FILE):
+        if not os.path.exists(self.paths.password_hash_file):
             store_password_hash(password)
             
         self.password = password
@@ -126,13 +135,13 @@ class Config:
         self.config_data = self._load_config()
         
         # Generate recovery key on first setup
-        if not os.path.exists(RECOVERY_FILE):
+        if not os.path.exists(self.paths.recovery_file):
             recovery_key = generate_recovery_key()
             store_recovery_key(recovery_key, password)
     
     def _load_config(self) -> dict:
         """Load and decrypt configuration file."""
-        if not os.path.exists(CONFIG_FILE):
+        if not os.path.exists(self.paths.config_file):
             return {
                 'api_keys': {
                     'openai': '',
@@ -150,7 +159,7 @@ class Config:
             }
         
         try:
-            with open(CONFIG_FILE, 'rb') as f:
+            with open(self.paths.config_file, 'rb') as f:
                 encrypted_data = f.read()
             decrypted_data = self.fernet.decrypt(encrypted_data)
             config = json.loads(decrypted_data)
@@ -195,7 +204,7 @@ class Config:
     def save(self):
         """Encrypt and save configuration."""
         encrypted_data = self.fernet.encrypt(json.dumps(self.config_data).encode())
-        with open(CONFIG_FILE, 'wb') as f:
+        with open(self.paths.config_file, 'wb') as f:
             f.write(encrypted_data)
     
     def set_api_key(self, provider: str, key: str):
@@ -227,17 +236,17 @@ class Config:
             new_fernet = get_encryption_key(new_password)
             
             # Re-encrypt config file
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'rb') as f:
+            if os.path.exists(self.paths.config_file):
+                with open(self.paths.config_file, 'rb') as f:
                     encrypted_data = f.read()
                 decrypted_data = old_fernet.decrypt(encrypted_data)
                 new_encrypted_data = new_fernet.encrypt(decrypted_data)
-                with open(CONFIG_FILE, 'wb') as f:
+                with open(self.paths.config_file, 'wb') as f:
                     f.write(new_encrypted_data)
             
             # Re-encrypt recovery key
-            if os.path.exists(RECOVERY_FILE):
-                with open(RECOVERY_FILE, 'rb') as f:
+            if os.path.exists(self.paths.recovery_file):
+                with open(self.paths.recovery_file, 'rb') as f:
                     encrypted_key = f.read()
                 recovery_key = old_fernet.decrypt(encrypted_key).decode()
                 store_recovery_key(recovery_key, new_password)
@@ -256,17 +265,17 @@ class Config:
         """Recover access using recovery key and set new password."""
         try:
             # Try each possible encryption key until we find one that works
-            if not os.path.exists(RECOVERY_FILE):
+            if not os.path.exists(self.paths.recovery_file):
                 return False
                 
-            with open(RECOVERY_FILE, 'rb') as f:
+            with open(self.paths.recovery_file, 'rb') as f:
                 stored_encrypted_key = f.read()
             
             # First verify the recovery key by trying to decrypt stored key
             old_passwords = []  # We'll collect working passwords
             
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'rb') as f:
+            if os.path.exists(self.paths.config_file):
+                with open(self.paths.config_file, 'rb') as f:
                     config_data = f.read()
             
             for password in self._get_recent_passwords():
@@ -292,7 +301,7 @@ class Config:
         # This is a placeholder - in a real implementation, you might want to
         # keep a secure log of recent password hashes or implement a more
         # sophisticated recovery mechanism
-        if os.path.exists(SALT_FILE):
+        if os.path.exists(self.paths.salt_file):
             return [self.password]  # Current password
         return []
 

@@ -7,16 +7,19 @@ from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QPixmap
 from .models import init_db
 from .config import Config
+from .infrastructure.app_paths import AppPaths
 
 # Set ONNX environment variable here too for the worker thread
 os.environ["CHROMADB_DISABLE_ONNX"] = "1"
 
 # Log initialization steps
+log_dir = AppPaths.discover().logs_dir
+log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('initialization_debug.log'),
+        logging.FileHandler(log_dir / 'initialization_debug.log'),
         logging.StreamHandler()
     ]
 )

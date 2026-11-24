@@ -52,6 +52,7 @@ from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
 from .search import ChatWithResultsDialog
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
+from .infrastructure.app_paths import AppPaths
 
 
 class HTMLDelegate(QStyledItemDelegate):
@@ -196,10 +197,10 @@ class FileTagManager(QMainWindow):
     def __init__(self, db_session, config, vector_search):
         # Set up logging for the main window
         self.logger = logging.getLogger("FileTagManager")
-        # Make sure we have a logs directory
-        os.makedirs("logs", exist_ok=True)
         # Add a file handler for main window-specific issues
-        file_handler = logging.FileHandler("main_window_debug.log")
+        log_dir = AppPaths.discover().logs_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_dir / "main_window_debug.log")
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
