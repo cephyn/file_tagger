@@ -7,8 +7,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
-from ..domain.contracts import SearchCandidate
 from ..infrastructure.database import normalize_unicode_key
+from .results import SearchResult, make_result, merge_results
 from .rrf import FusedHit, reciprocal_rank_fusion
 
 VECTOR_DIMENSIONS = frozenset({256, 512, 768})
@@ -71,7 +71,7 @@ class HybridSearch:
         file_types: Sequence[str] = (),
         filters: SearchFilters | None = None,
         limit: int = 10,
-    ) -> tuple[SearchCandidate, ...]:
+    ) -> tuple[SearchResult, ...]:
         if limit < 0:
             raise ValueError("The result limit cannot be negative.")
         if limit == 0:
@@ -206,9 +206,24 @@ class HybridSearch:
                 SELECT
                     c.stable_id AS chunk_id,
                     f.canonical_path AS file_path,
+                    f.indexing_state,
                     p.page_number,
                     c.heading,
-                    c.text
+                    c.section,
+                    c.text,
+                    COALESCE(
+                        (
+                            SELECT json_group_array(ordered.name)
+                            FROM (
+                                SELECT t.name
+                                FROM file_tags AS ft
+                                JOIN tags AS t ON t.id = ft.tag_id
+                                WHERE ft.file_id = f.id
+                                ORDER BY unicode_normalize(t.name), t.id
+                            ) AS ordered
+                        ),
+                        '[]'
+                    ) AS tags
                 FROM chunks AS c
                 JOIN pages AS p ON p.id = c.page_id
                 JOIN documents AS d ON d.id = c.document_id
@@ -226,15 +241,11 @@ class HybridSearch:
         fused: tuple[FusedHit, ...],
         hydrated: Mapping[str, RowMapping],
         limit: int,
-    ) -> tuple[SearchCandidate, ...]:
-        candidates: list[SearchCandidate] = []
-        seen_files: set[str] = set()
+    ) -> tuple[SearchResult, ...]:
+        candidates: list[SearchResult] = []
         for hit in fused:
             row = hydrated.get(hit.chunk_id)
             if row is None:
-                continue
-            file_path = str(row["file_path"])
-            if file_path in seen_files:
                 continue
             source: Literal["fts", "vector", "hybrid"] = (
                 "hybrid"
@@ -244,23 +255,14 @@ class HybridSearch:
                 else "vector"
             )
             candidates.append(
-                SearchCandidate(
-                    chunk_id=hit.chunk_id,
-                    file_path=file_path,
-                    page_number=int(row["page_number"]),
-                    heading=(
-                        str(row["heading"]) if row["heading"] is not None else None
-                    ),
-                    text=str(row["text"]),
+                make_result(
+                    row,
                     source=source,
-                    rank=len(candidates) + 1,
+                    rank=hit.rank,
                     score=hit.score,
                 )
             )
-            seen_files.add(file_path)
-            if len(candidates) >= limit:
-                break
-        return tuple(candidates)
+        return merge_results(candidates, limit=limit)
 
 
 def hybrid_search(
@@ -276,7 +278,7 @@ def hybrid_search(
     limit: int = 10,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
     rrf_k: int = DEFAULT_RRF_K,
-) -> tuple[SearchCandidate, ...]:
+) -> tuple[SearchResult, ...]:
     return HybridSearch(
         session,
         candidate_limit=candidate_limit,
