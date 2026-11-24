@@ -1,9 +1,9 @@
 # File Tagger Local-First Modernization Design
 
-**Status:** Approved  
-**Date:** 2026-11-24  
-**Implementation scope:** Planning only  
-**Platform baseline:** Windows 10 22H2 and Windows 11  
+**Status:** Approved
+**Date:** 2026-11-24
+**Implementation scope:** Planning only
+**Platform baseline:** Windows 10 22H2 and Windows 11
 **Python baseline:** 3.13+
 
 ## Goal
