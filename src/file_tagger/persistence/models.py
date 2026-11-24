@@ -51,6 +51,9 @@ class File(Base):
     index_jobs: Mapped[list["IndexJob"]] = relationship(
         back_populates="file", cascade="all, delete-orphan", passive_deletes=True
     )
+    suggestion_cache: Mapped["TagSuggestionCache | None"] = relationship(
+        back_populates="file", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class Tag(Base):
@@ -83,6 +86,25 @@ class FileTag(Base):
 
     file: Mapped[File] = relationship(back_populates="tags")
     tag: Mapped[Tag] = relationship(back_populates="files")
+
+
+class TagSuggestionCache(Base):
+    __tablename__ = "tag_suggestion_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    file_id: Mapped[int] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    cached_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    suggestions: Mapped[dict[str, Any] | list[Any]] = mapped_column(
+        JSON, nullable=False
+    )
+
+    file: Mapped[File] = relationship(back_populates="suggestion_cache")
 
 
 class Document(Base):
