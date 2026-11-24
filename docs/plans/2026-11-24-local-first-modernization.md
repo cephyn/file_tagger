@@ -35,7 +35,10 @@ Last updated: 2026-11-24
 | 16: resumable transactional indexing | Complete | `a6bcb05`, `c8fe9f1`, `284bed4`, `cf7de50`, `fbdd6fd` |
 | 17: SQLite hybrid search | Complete | `ad05116`, `82c395e`, `fbdd6fd` |
 | 18: citation-first search results | Complete | `4f117a3`, `c3ec25a` |
-| 19-29 | Not started | — |
+| 19: typed Ollama tag decisions | Complete | `eae8b89`, `862df67`, `50e588c`, `3ab3ebe` |
+| 20: cached typed tag recommendations | Complete | `b1bd9bc`, `1b3e677`, `d2e1681` |
+| 21: Markdown-context search planning | Complete | `43f17f4`, `37c8aaf`, `89fba5a`, `321f312` |
+| 22-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -950,6 +953,8 @@ git commit -m "feat: add cited hybrid search results"
 
 ### Task 19: Replace Free-Form Tag Parsing with Nimble/Tev1
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/tagging/decision_service.py`
 - Delete: `src/file_tagger/ai_service.py`
@@ -995,6 +1000,8 @@ git commit -m "feat: add typed Ollama tag decisions"
 
 ### Task 20: Generate and Cache Tag Candidates
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/tagging/candidate_service.py`
 - Create: `src/file_tagger/tagging/cache.py`
@@ -1036,6 +1043,8 @@ git commit -m "feat: cache typed tag recommendations"
 ## Phase 6: Contextual RAG
 
 ### Task 21: Build a Typed Search Plan from Question Plus Markdown
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/rag/planner.py`
