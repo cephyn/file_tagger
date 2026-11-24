@@ -173,10 +173,15 @@ class OllamaGateway:
                 f"Local Ollama model lookup failed with status {exc.status_code}."
             ) from exc
 
-        if model not in installed:
+        installed_model = model
+        if installed_model not in installed and ":" not in model.rsplit("/", 1)[-1]:
+            latest_model = f"{model}:latest"
+            if latest_model in installed:
+                installed_model = latest_model
+        if installed_model not in installed:
             raise ModelMissingError(f"Local Ollama model is not installed: {model}.")
         try:
-            details = await self._client.show(model)
+            details = await self._client.show(installed_model)
         except ResponseError as exc:
             if exc.status_code == 404:
                 raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
@@ -200,7 +205,7 @@ class OllamaGateway:
         context_length = self._context_length(model_info)
         if context_length is None:
             raise ModelIncompatibleError(f"Model {model} reports no context length.")
-        digest = installed[model]
+        digest = installed[installed_model]
         if not isinstance(digest, str) or not digest:
             raise ModelIncompatibleError(f"Model {model} reports no digest.")
 

@@ -121,6 +121,47 @@ def test_readiness_reports_local_models_and_profiles() -> None:
     assert readiness.missing_models == ()
 
 
+def test_model_profile_resolves_untagged_model_to_latest_metadata() -> None:
+    class LatestTagClient(FakeAsyncClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.show_calls = []
+
+        async def list(self):
+            return SimpleNamespace(
+                models=[
+                    SimpleNamespace(
+                        model="inkling-2-mini:latest",
+                        digest="sha256:inkling-latest",
+                    )
+                ]
+            )
+
+        async def show(self, model):
+            self.show_calls.append(model)
+            return SimpleNamespace(
+                capabilities=["completion"],
+                modelinfo={"inkling-2-mini.context_length": 32_768},
+            )
+
+    client = LatestTagClient()
+    gateway = OllamaGateway(client=client)
+
+    profile = asyncio.run(gateway.model_profile("generation", "inkling-2-mini"))
+    asyncio.run(
+        gateway.chat(
+            "inkling-2-mini",
+            messages=[{"role": "user", "content": "Create a search plan"}],
+        )
+    )
+
+    assert profile.model == "inkling-2-mini"
+    assert profile.digest == "sha256:inkling-latest"
+    assert profile.context_length == 32_768
+    assert client.show_calls == ["inkling-2-mini:latest"]
+    assert client.chat_calls[0]["model"] == "inkling-2-mini"
+
+
 def test_old_server_and_missing_model_are_not_ready() -> None:
     old = OllamaGateway(client=FakeAsyncClient(version="0.34.9"))
     readiness = asyncio.run(old.readiness({"generation": "missing:model"}))

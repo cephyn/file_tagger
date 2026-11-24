@@ -313,10 +313,17 @@ def _parse_plan(
         return SearchPlan.model_validate(
             {
                 **plan.model_dump(),
-                "exact_terms": _merge_terms(plan.exact_terms, context.entities),
+                "exact_terms": _merge_terms(
+                    plan.exact_terms,
+                    context.entities,
+                    max_items=MAX_EXACT_TERM_ITEMS,
+                    max_length=MAX_TERM_LENGTH,
+                ),
                 "normalized_constraints": _merge_terms(
                     plan.normalized_constraints,
                     context.constraints,
+                    max_items=MAX_AUXILIARY_ITEMS,
+                    max_length=MAX_AUXILIARY_LENGTH,
                 ),
             }
         )
@@ -390,8 +397,19 @@ def _estimate_token_count(text: str) -> int:
     )
 
 
-def _merge_terms(first: Sequence[str], second: Sequence[str]) -> tuple[str, ...]:
-    return _unique_nonempty((*first, *second))
+def _merge_terms(
+    first: Sequence[str],
+    second: Sequence[str],
+    *,
+    max_items: int | None = None,
+    max_length: int | None = None,
+) -> tuple[str, ...]:
+    merged = _unique_nonempty((*first, *second))
+    if max_length is not None:
+        merged = tuple(term for term in merged if len(term) <= max_length)
+    if max_items is not None:
+        merged = merged[:max_items]
+    return merged
 
 
 def _unique_nonempty(values: Sequence[str]) -> tuple[str, ...]:

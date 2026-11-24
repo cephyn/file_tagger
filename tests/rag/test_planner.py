@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Mapping, Sequence
+import json
 from typing import Any
 
 import pytest
@@ -160,6 +161,76 @@ def test_planner_merges_local_markdown_constraints_into_model_plan() -> None:
     )
 
     assert plan.normalized_constraints == ("level 3",)
+
+
+def test_planner_caps_markdown_entities_added_to_exact_terms() -> None:
+    headings = [f"Section {index}" for index in range(17)]
+    payload = VALID_PLAN_JSON.replace(
+        '"exact_terms": ["flooded temple", "encounters"]',
+        '"exact_terms": []',
+    )
+
+    plan = build_search_plan(
+        question="Find encounters",
+        markdown_context="\n".join(f"# {heading}" for heading in headings),
+        gateway=FakePlannerGateway(payload),
+    )
+
+    assert len(plan.exact_terms) == 16
+    assert plan.exact_terms == tuple(headings[:16])
+
+
+def test_planner_omits_oversized_markdown_entities_from_exact_terms() -> None:
+    oversized = "x" * 129
+    payload = VALID_PLAN_JSON.replace(
+        '"exact_terms": ["flooded temple", "encounters"]',
+        '"exact_terms": []',
+    )
+
+    plan = build_search_plan(
+        question="Find encounters",
+        markdown_context=f"# Valid Heading\n# {oversized}",
+        gateway=FakePlannerGateway(payload),
+    )
+
+    assert plan.exact_terms == ("Valid Heading",)
+
+
+def test_planner_deduplicates_model_and_markdown_exact_terms() -> None:
+    payload = VALID_PLAN_JSON.replace(
+        '"exact_terms": ["flooded temple", "encounters"]',
+        '"exact_terms": ["Shared Heading"]',
+    )
+
+    plan = build_search_plan(
+        question="Find encounters",
+        markdown_context="# shared heading\n# Unique Heading",
+        gateway=FakePlannerGateway(payload),
+    )
+
+    assert plan.exact_terms == ("Shared Heading", "Unique Heading")
+
+
+@pytest.mark.parametrize(
+    "terms",
+    [
+        [f"term {index}" for index in range(17)],
+        ["x" * 129],
+    ],
+)
+def test_model_generated_exact_terms_keep_structured_bounds(
+    terms: list[str],
+) -> None:
+    payload = VALID_PLAN_JSON.replace(
+        '"exact_terms": ["flooded temple", "encounters"]',
+        f'"exact_terms": {json.dumps(terms)}',
+    )
+
+    with pytest.raises(ValueError, match="structured"):
+        build_search_plan(
+            question="Find encounters",
+            gateway=FakePlannerGateway(payload),
+        )
 
 
 def test_plan_canonicalizes_intents_constraints_and_evidence_categories() -> None:
