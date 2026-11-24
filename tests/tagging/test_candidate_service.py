@@ -2,15 +2,26 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import struct
 from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import event, inspect
+import pytest
+from sqlalchemy import event, inspect, text
 
 from file_tagger.domain.contracts import ModelProfile, TagDecision
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
-from file_tagger.persistence.models import File
+from file_tagger.infrastructure.app_paths import AppPaths
+from file_tagger.persistence.models import (
+    Chunk,
+    Document,
+    File,
+    FileTag,
+    ModelProfileRecord,
+    Page,
+    Tag,
+)
 from file_tagger.tagging.cache import (
     CachedTagRecommendations,
     DatabaseTagRecommendationCache,
@@ -633,3 +644,228 @@ def test_low_confidence_rejection_still_requires_confirmation() -> None:
 
     assert result.decisions[0].decision == "review"
     assert result.requires_confirmation == ("possibly-relevant",)
+
+
+def _seed_production_chunk(
+    session: Any,
+    *,
+    path: Path,
+    stable_id: str,
+    text_value: str,
+    vector: tuple[float, ...],
+    tags: Sequence[str],
+    model_digest: str,
+    index_version: str,
+) -> None:
+    file = File(
+        canonical_path=str(path.resolve()),
+        mime_type="text/markdown",
+        indexing_state="indexed",
+    )
+    session.add(file)
+    session.flush()
+    document = Document(
+        file_id=file.id,
+        revision=1,
+        file_hash=f"hash-{stable_id}",
+        extraction_version="test",
+        parser="test",
+        page_count=1,
+        extraction_status="complete",
+        diagnostics=[],
+    )
+    session.add(document)
+    session.flush()
+    page = Page(
+        document_id=document.id,
+        page_number=1,
+        ordinal=0,
+        text=text_value,
+        markdown=text_value,
+        headings=[],
+        quality="good",
+    )
+    session.add(page)
+    session.flush()
+    chunk = Chunk(
+        stable_id=stable_id,
+        document_id=document.id,
+        page_id=page.id,
+        ordinal=0,
+        text=text_value,
+        content_hash=f"content-{stable_id}",
+        model_digest=model_digest,
+        index_version=index_version,
+    )
+    session.add(chunk)
+    session.flush()
+    session.execute(
+        text(
+            "INSERT INTO chunk_embeddings_256 "
+            "(chunk_id, embedding) VALUES (:chunk_id, :embedding)"
+        ),
+        {
+            "chunk_id": chunk.id,
+            "embedding": struct.pack("<256f", *vector),
+        },
+    )
+    for tag_name in tags:
+        tag = Tag(name=tag_name)
+        session.add(tag)
+        session.flush()
+        session.add(FileTag(file_id=file.id, tag_id=tag.id))
+
+
+def test_production_tag_suggester_uses_semantic_hybrid_search_and_new_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=32_768,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    assert profile.default_index_version is not None
+    relevant_vector = (1.0, 0.0, *((0.0,) * 254))
+    irrelevant_vector = (0.0, 1.0, *((0.0,) * 254))
+    factory = create_session_factory(paths.database)
+    with factory.begin() as session:
+        session.add(
+            ModelProfileRecord(
+                role=profile.role,
+                model=profile.model,
+                digest=profile.digest,
+                dimensions=profile.dimensions,
+                context_length=profile.context_length,
+                index_version=profile.default_index_version,
+                capabilities=list(profile.capabilities),
+                benchmark_data={},
+            )
+        )
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "semantic-map.md",
+            stable_id="semantic-map",
+            text_value="A catalog of subterranean cartography.",
+            vector=relevant_vector,
+            tags=tuple(f"existing-{index:02d}" for index in range(26)),
+            model_digest=profile.digest,
+            index_version=profile.default_index_version,
+        )
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "unrelated-ledger.md",
+            stable_id="unrelated-ledger",
+            text_value="Quarterly invoices and account balances.",
+            vector=irrelevant_vector,
+            tags=("invoice-only",),
+            model_digest=profile.digest,
+            index_version=profile.default_index_version,
+        )
+
+    source = tmp_path / "friendly-woodland-animal.txt"
+    source.write_text("friendly woodland animal habitat", encoding="utf-8")
+
+    class EmbeddingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([f"new-{index:02d}" for index in range(12)])
+            self.embedding_calls: list[dict[str, Any]] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            self.embedding_calls.append(
+                {
+                    "model": model,
+                    "text": text,
+                    "dimensions": dimensions,
+                    "truncate": truncate,
+                    "keep_alive": keep_alive,
+                }
+            )
+            return (relevant_vector,)
+
+    gateway = EmbeddingGateway()
+    result = TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=gateway,
+        cache=InMemoryTagRecommendationCache(),
+    ).recommend_tags_for_file(str(source))
+
+    assert len(result.decisions) == 24
+    assert sum(not item.is_new for item in result.decisions) == 12
+    assert sum(item.is_new for item in result.decisions) == 12
+    assert "invoice-only" not in {item.tag for item in result.decisions}
+    assert {item.tag for item in result.decisions if item.is_new} == {
+        f"new-{index:02d}" for index in range(12)
+    }
+    assert len(gateway.embedding_calls) == 1
+    assert "friendly woodland animal habitat" in str(gateway.embedding_calls[0]["text"])
+
+
+def test_production_tag_suggester_uses_query_aware_fts_without_embedding_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    model_digest = "sha256:index-only"
+    index_version = f"embeddinggemma-2:270m@{model_digest}:256"
+    relevant_vector = (1.0, 0.0, *((0.0,) * 254))
+    factory = create_session_factory(paths.database)
+    with factory.begin() as session:
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "cathedral-budget.md",
+            stable_id="cathedral-budget",
+            text_value="Cathedral restoration project budget and masonry.",
+            vector=relevant_vector,
+            tags=tuple(f"architecture-{index:02d}" for index in range(26)),
+            model_digest=model_digest,
+            index_version=index_version,
+        )
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "garden-notes.md",
+            stable_id="garden-notes",
+            text_value="Seasonal planting notes and compost.",
+            vector=relevant_vector,
+            tags=("gardening-only",),
+            model_digest=model_digest,
+            index_version=index_version,
+        )
+
+    source = tmp_path / "cathedral-budget.txt"
+    source.write_text("Cathedral restoration budget", encoding="utf-8")
+    gateway = FakeGateway([f"new-{index:02d}" for index in range(12)])
+
+    result = TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=gateway,
+        cache=InMemoryTagRecommendationCache(),
+    ).recommend_tags_for_file(str(source))
+
+    selected = {item.tag for item in result.decisions}
+    assert len(selected) == 24
+    assert "gardening-only" not in selected
+    assert sum(not item.is_new for item in result.decisions) == 12
+    assert sum(item.is_new for item in result.decisions) == 12

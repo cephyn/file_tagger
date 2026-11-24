@@ -24,6 +24,7 @@ decide_tags = decide_tags_async
 DEFAULT_CANDIDATE_MODEL = "inkling-2-mini"
 DEFAULT_MAX_TAG_CANDIDATES = 24
 DEFAULT_SEMANTIC_RESULT_LIMIT = 12
+DEFAULT_GENERATION_CANDIDATE_QUOTA = 12
 DEFAULT_CONFIRMATION_THRESHOLD = 0.7
 
 T = TypeVar("T")
@@ -34,7 +35,11 @@ class CandidateSearch(Protocol):
         self,
         query: str,
         query_embedding: Sequence[float] | None = None,
-        **kwargs: Any,
+        *,
+        limit: int = 10,
+        model_digest: str | None = None,
+        index_version: str | None = None,
+        embedding_profile: ModelProfile | None = None,
     ) -> Sequence[object]: ...
 
 
@@ -161,16 +166,30 @@ async def recommend_tags_async(
     selected_decision_gateway = decision_gateway or selected_gateway
     document_state_digest = hashlib.sha256(document_state.encode("utf-8")).hexdigest()
     try:
+        resolved_query_embedding = query_embedding
+        if resolved_query_embedding is None and embedding_profile is not None:
+            resolved_query_embedding = await _embed_document_query(
+                selected_gateway,
+                document_state,
+                embedding_profile,
+            )
         existing = _semantic_existing_tags(
             search,
             document_state,
             limit=semantic_limit,
-            query_embedding=query_embedding,
+            query_embedding=resolved_query_embedding,
             embedding_model_digest=embedding_model_digest,
             embedding_index_version=embedding_index_version,
             embedding_profile=embedding_profile,
         )
-        bounded_existing = existing[:max_candidates]
+        existing_limit = min(max_candidates, semantic_limit)
+        bounded_existing = existing[:existing_limit]
+        reserved_generation_limit = max_candidates - existing_limit
+        generation_limit = (
+            min(DEFAULT_GENERATION_CANDIDATE_QUOTA, reserved_generation_limit)
+            if reserved_generation_limit
+            else max_candidates
+        )
         candidate_set_digest = _candidate_set_digest(bounded_existing)
         resolved_candidate_digest = await _model_digest(
             selected_gateway,
@@ -203,7 +222,10 @@ async def recommend_tags_async(
                     cache.store(refreshed)
                 return refreshed
 
-        available_for_generation = max_candidates - len(bounded_existing)
+        available_for_generation = min(
+            max_candidates - len(bounded_existing),
+            generation_limit,
+        )
         generated: tuple[str, ...] = ()
         if available_for_generation > 0:
             generated = await _generate_candidates(
@@ -372,6 +394,35 @@ async def _model_digest(
     return profile.digest
 
 
+async def _embed_document_query(
+    gateway: CandidateGateway,
+    document_state: str,
+    profile: ModelProfile,
+) -> tuple[float, ...]:
+    if profile.role != "embedding" or profile.dimensions is None:
+        raise ValueError("Semantic tag search requires an embedding model profile.")
+    embed = getattr(gateway, "embed", None)
+    if not callable(embed):
+        raise ValueError("The configured gateway cannot embed tag search queries.")
+    result = embed(
+        profile.model,
+        document_state,
+        dimensions=profile.dimensions,
+        truncate=False,
+    )
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, Sequence) or len(result) != 1:
+        raise ValueError("The embedding gateway returned an invalid query vector.")
+    vector = result[0]
+    if not isinstance(vector, Sequence) or isinstance(vector, (str, bytes)):
+        raise ValueError("The embedding gateway returned an invalid query vector.")
+    embedding = tuple(float(value) for value in vector)
+    if len(embedding) != profile.dimensions:
+        raise ValueError("The query embedding dimension does not match its profile.")
+    return embedding
+
+
 def _semantic_existing_tags(
     search: CandidateSearch,
     document_state: str,
@@ -411,6 +462,8 @@ def _semantic_existing_tags(
                 continue
             seen.add(key)
             tags.append(normalized)
+            if len(tags) >= limit:
+                return tuple(tags)
     return tuple(tags)
 
 

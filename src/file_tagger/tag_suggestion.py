@@ -4,16 +4,20 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QTextEdit)
 from PySide6.QtCore import Qt, QSize, Signal, QEvent
 from PySide6.QtGui import QColor
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from collections.abc import Sequence
 from hashlib import sha256
 import mimetypes
 import os
 import random
-from types import SimpleNamespace
-from typing import Protocol, cast
+from typing import Any, Protocol
 
+from .domain.contracts import ModelProfile
+from .infrastructure.app_paths import AppPaths
+from .infrastructure.database import create_session_factory, upgrade_database
 from .models import File, Tag, TagSuggestionCache as LegacySuggestionCache
+from .persistence.models import ModelProfileRecord
+from .search.hybrid import HybridSearch, VECTOR_DIMENSIONS
 from .tagging.cache import CachedTagRecommendations, TagRecommendationCache
 from .tagging.candidate_service import CandidateService
 from .vector_search.content_extractor import ContentExtractor
@@ -87,6 +91,8 @@ class TagSuggester:
         *,
         candidate_service: CandidateService | None = None,
         cache: TagRecommendationCache | None = None,
+        gateway: Any | None = None,
+        decision_gateway: Any | None = None,
     ):
         """
         Initialize the tag suggester with configuration.
@@ -98,6 +104,8 @@ class TagSuggester:
         self.db_session = db_session
         self._candidate_service = candidate_service
         self._cache = cache
+        self._gateway = gateway
+        self._decision_gateway = decision_gateway
 
     def recommend_tags_for_file(
         self,
@@ -120,18 +128,24 @@ class TagSuggester:
 
         from .models import init_db
 
-        catalog_session = self.db_session
-        owns_catalog_session = catalog_session is None
+        paths = AppPaths.discover()
+        paths.ensure_directories()
+        upgrade_database(paths.database)
+        search_session = create_session_factory(paths.database)()
         cache_session = None
         selected_cache = self._cache
         try:
-            if catalog_session is None:
-                catalog_session = cast(Session, init_db())
             if selected_cache is None:
-                cache_session = cast(Session, init_db())
+                cache_session = init_db()  # type: ignore[no-untyped-call]
                 selected_cache = _LegacyTagRecommendationCache(cache_session)
+            embedding_profile = _latest_embedding_profile(search_session)
             service = CandidateService(
-                _LegacyCandidateSearch(catalog_session),
+                HybridSearch(
+                    search_session,
+                    embedding_profile=embedding_profile,
+                ),
+                gateway=self._gateway,
+                decision_gateway=self._decision_gateway,
                 cache=selected_cache,
             )
             result = service.recommend(
@@ -140,6 +154,7 @@ class TagSuggester:
                 extraction_version=TAG_SUGGESTION_EXTRACTION_VERSION,
                 file_path=canonical_path,
                 force_refresh=force_refresh,
+                embedding_profile=embedding_profile,
             )
             if cache_session is not None:
                 cache_session.commit()
@@ -151,8 +166,7 @@ class TagSuggester:
         finally:
             if cache_session is not None:
                 cache_session.close()
-            if owns_catalog_session and catalog_session is not None:
-                catalog_session.close()
+            search_session.close()
 
     def suggest_tags_for_file(
         self,
@@ -183,19 +197,29 @@ class TagSuggester:
             return {}
 
 
-class _LegacyCandidateSearch:
-    def __init__(self, session: Session) -> None:
-        self._session = session
-
-    def search(
-        self,
-        query: str,
-        query_embedding: Sequence[float] | None = None,
-        **kwargs: object,
-    ) -> tuple[SimpleNamespace, ...]:
-        del query, query_embedding, kwargs
-        tags = tuple(str(tag.name) for tag in self._session.query(Tag).all())
-        return (SimpleNamespace(tags=tags),)
+def _latest_embedding_profile(session: Session) -> ModelProfile | None:
+    record = session.scalar(
+        select(ModelProfileRecord)
+        .where(
+            ModelProfileRecord.role == "embedding",
+            ModelProfileRecord.dimensions.in_(VECTOR_DIMENSIONS),
+        )
+        .order_by(
+            ModelProfileRecord.updated_at.desc(),
+            ModelProfileRecord.id.desc(),
+        )
+        .limit(1)
+    )
+    if record is None or record.dimensions is None:
+        return None
+    return ModelProfile(
+        role="embedding",
+        model=record.model,
+        digest=record.digest,
+        context_length=record.context_length,
+        dimensions=record.dimensions,
+        capabilities=tuple(record.capabilities),
+    )
 
 
 class _LegacyTagRecommendationCache:
