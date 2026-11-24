@@ -15,6 +15,19 @@ while replacing Chroma and cloud/direct model loading with one SQLite database,
 SQLite FTS5, `sqlite-vec 0.1.9`, Docling 2.152.0, Ollama 0.6.3, Pydantic
 2.14.4, pytest 9.2.0, Ruff 0.17.6, Mypy 2.4.1.
 
+## Implementation Status
+
+Last updated: 2026-11-24
+
+| Tasks | Status | Commits |
+| --- | --- | --- |
+| 1-3: Python toolchain, package layout, per-user paths | Complete | `7626340`, `32896c5`, `4da9b2e` |
+| 4-6: domain contracts, SQLite extensions, unified schema | Complete | `a00c206`, `49a25ea`, `b90fcfb` |
+| 7-29 | Not started | — |
+
+Completed work is marked below with `Status: Complete`. Any task without that
+marker remains unimplemented unless this table is updated.
+
 ---
 
 ## Execution Rules
@@ -47,6 +60,8 @@ SQLite FTS5, `sqlite-vec 0.1.9`, Docling 2.152.0, Ollama 0.6.3, Pydantic
 ## Phase 0: Project Foundation
 
 ### Task 1: Lock the Modern Python Toolchain
+
+**Status: Complete**
 
 **Files:**
 - Modify: `pyproject.toml`
@@ -104,6 +119,8 @@ git commit -m "build: lock modern Python toolchain"
 
 ### Task 2: Create the Importable Application Package
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/__init__.py`
 - Create: `src/file_tagger/__main__.py`
@@ -155,6 +172,8 @@ git commit -m "refactor: create file_tagger package"
 
 ### Task 3: Define Per-User Application Paths
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/infrastructure/app_paths.py`
 - Modify: `src/file_tagger/main.py`
@@ -200,6 +219,8 @@ git commit -m "feat: isolate application data paths"
 ```
 
 ### Task 4: Add Typed Domain Records and Explicit Errors
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/domain/errors.py`
@@ -252,6 +273,8 @@ git commit -m "feat: add typed local AI contracts"
 
 ### Task 5: Load FTS5 and sqlite-vec on Every Connection
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/infrastructure/database.py`
 - Test: `tests/infrastructure/test_database.py`
@@ -294,6 +317,8 @@ git commit -m "feat: bootstrap sqlite search extensions"
 ```
 
 ### Task 6: Create the Versioned Unified Schema
+
+**Status: Complete**
 
 **Files:**
 - Create: `alembic.ini`
