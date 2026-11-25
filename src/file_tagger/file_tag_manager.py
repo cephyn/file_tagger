@@ -2,6 +2,7 @@ import os
 import logging
 import traceback
 from collections.abc import Iterable
+from typing import cast
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -43,7 +44,9 @@ from .models import File, Tag
 from .ollama.readiness import ReadinessReport
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
+from .ui.indexing_status import IndexingStatus
 from .ui.ollama_settings import OllamaSettingsDialog
+from .migration.legacy_chroma import cleanup_legacy_chroma, inspect_legacy_chroma
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
 from .modern_context import ModernIndexingUnavailable
@@ -254,6 +257,27 @@ class FileTagManager(QMainWindow):
             status_label.setText(message)
 
     def _index_modern_file(self, file_path: str) -> bool:
+        indexing_status = getattr(self, "indexing_status", None)
+        if indexing_status is not None:
+            try:
+                indexing_status.start(file_path)
+                self._set_modern_index_status("Modern indexing started.")
+                return True
+            except ModernIndexingUnavailable as exc:
+                self._set_modern_index_status(
+                    f"Modern indexing unavailable: {exc}"
+                )
+                return False
+            except Exception as exc:
+                self._set_modern_index_status(
+                    f"Modern indexing failed: {exc.__class__.__name__}."
+                )
+                self.logger.warning(
+                    "Modern indexing failed for a requested file (%s).",
+                    exc.__class__.__name__,
+                )
+                return False
+
         runtime = getattr(self, "modern_runtime", None)
         if runtime is None:
             self._set_modern_index_status(
@@ -392,6 +416,12 @@ class FileTagManager(QMainWindow):
                 else "Modern index: unavailable."
             )
             main_layout.addWidget(self.modern_index_status_label)
+            self.indexing_status = IndexingStatus(runtime, self)
+            self.indexing_status.status_changed.connect(
+                lambda message, _value: self._set_modern_index_status(message)
+            )
+            self.indexing_status.setVisible(runtime is not None)
+            main_layout.addWidget(self.indexing_status)
 
             # Set initial directory from config
             self.logger.debug("Setting initial directory")
@@ -449,6 +479,7 @@ class FileTagManager(QMainWindow):
         """Set up the application menus."""
         menubar = self.menuBar()
         settings_menu = menubar.addMenu("Settings")
+        indexing_menu = menubar.addMenu("Indexing")
         help_menu = menubar.addMenu("Help")
 
         # Add settings menu actions
@@ -493,6 +524,15 @@ class FileTagManager(QMainWindow):
         # Add scan directory action
         scan_action = menubar.addAction("Scan Directory")
         scan_action.triggered.connect(self.scan_directory_for_untagged)
+
+        reindex_action = indexing_menu.addAction("Reindex All Files")
+        reindex_action.triggered.connect(self.reindex_files)
+        resume_action = indexing_menu.addAction("Resume Indexing")
+        resume_action.triggered.connect(self.resume_indexing)
+        migration_action = indexing_menu.addAction("Migration Inventory")
+        migration_action.triggered.connect(self.show_migration_inventory)
+        cleanup_action = indexing_menu.addAction("Clean Legacy Search Data")
+        cleanup_action.triggered.connect(self.cleanup_legacy_search_data)
 
         # Add help menu actions
         about_action = help_menu.addAction("About")
@@ -934,7 +974,7 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(self, "Error", str(e))
 
     def _remove_from_vector_db(self, file_path):
-        """Remove a file from the vector database and tag database."""
+        """Remove a file from the modern index and tag database."""
         reply = QMessageBox.question(
             self,
             "Remove File",
@@ -946,16 +986,15 @@ class FileTagManager(QMainWindow):
         )
 
         if reply == QMessageBox.Yes:
-            # Remove from vector database
-            success_vector = self.vector_search.remove_file(file_path)
-
-            # Remove from tag database
             success_tags = False
+            success_modern = False
             try:
                 file_obj = self.db_session.query(File).filter_by(path=file_path).first()
                 if file_obj:
                     self.db_session.delete(file_obj)
-                    self._commit_legacy_changes(file_deletes=[file_path])
+                    success_modern = self._commit_legacy_changes(
+                        file_deletes=[file_path]
+                    )
                     success_tags = True
             except Exception as e:
                 print(f"Error removing file from tag database: {str(e)}")
@@ -963,33 +1002,26 @@ class FileTagManager(QMainWindow):
 
                 traceback.print_exc()
 
-            if success_vector and success_tags:
+            if success_modern and success_tags:
                 QMessageBox.information(
                     self,
                     "Success",
-                    "File removed from search index and tag database successfully.\n\n"
+                    "File removed from the modern index and tag database successfully.\n\n"
                     "The file is still on your computer.",
-                )
-                self._remove_item_from_results(file_path)
-            elif success_vector:
-                QMessageBox.warning(
-                    self,
-                    "Partial Success",
-                    "File was removed from search index but could not be removed from tag database.",
                 )
                 self._remove_item_from_results(file_path)
             elif success_tags:
                 QMessageBox.warning(
                     self,
                     "Partial Success",
-                    "File was removed from tag database but could not be removed from search index.",
+                    "File was removed from the tag database but the modern index could not be updated.",
                 )
                 self._remove_item_from_results(file_path)
             else:
                 QMessageBox.warning(
                     self,
                     "Error",
-                    "Could not remove file from search index or tag database. See console for details.",
+                    "Could not remove the file from the tag database. See console for details.",
                 )
 
     def _remove_item_from_results(self, file_path):
@@ -1182,92 +1214,7 @@ class FileTagManager(QMainWindow):
         )
         print("DEBUGGING: Database commit completed")
 
-        # IMPORTANT: Check if this triggers vector indexing
-        print("DEBUGGING: Checking if file should be indexed")
-        if is_new_file or not had_tags_before:
-            print("DEBUGGING: File should be indexed (new file or first tags)")
-            try:
-                from .vector_search.content_extractor import ContentExtractor
-
-                # Extract content from the file
-                print(f"DEBUGGING: Extracting content from: {self.current_file_path}")
-                # Get the PDF extractor setting from config
-                pdf_extractor = self.config.get_pdf_extractor()
-                print(f"DEBUGGING: Using PDF extractor mode: {pdf_extractor}")
-                content = ContentExtractor.extract_file_content(
-                    self.current_file_path, pdf_extractor=pdf_extractor
-                )
-
-                if content:
-                    content_preview = (
-                        content[:100] + "..." if len(content) > 100 else content
-                    )
-                    print(
-                        f"DEBUGGING: Content extracted, length: {len(content)} characters"
-                    )
-                    print(f"DEBUGGING: Content preview: {content_preview}")
-
-                    # Add file to vector database - this is the critical step!
-                    print(
-                        f"DEBUGGING: Calling vector_search.index_file for: {self.current_file_path}"
-                    )
-                    try:
-                        self.vector_search.index_file(self.current_file_path, content)
-                        print(
-                            f"DEBUGGING: Successfully indexed file in vector search: {self.current_file_path}"
-                        )
-
-                        # Verify the file was actually indexed
-                        try:
-                            results = self.vector_search.collection.get(
-                                ids=[self.current_file_path], include=["metadatas"]
-                            )
-                            if results and results["ids"] and len(results["ids"]) > 0:
-                                print(
-                                    "DEBUGGING: Verification successful - file found in vector store"
-                                )
-                                print(
-                                    f"DEBUGGING: File metadata: {results['metadatas'][0]}"
-                                )
-                            else:
-                                print(
-                                    "DEBUGGING: VERIFICATION FAILED - file not found in vector store after indexing!"
-                                )
-                        except Exception as verify_err:
-                            print(
-                                f"DEBUGGING: Error verifying file in vector store: {str(verify_err)}"
-                            )
-                    except Exception as index_err:
-                        print(
-                            f"DEBUGGING: Error in index_file method: {str(index_err)}"
-                        )
-                        import traceback
-
-                        traceback.print_exc()
-                else:
-                    print(
-                        f"DEBUGGING: WARNING - No content could be extracted from file: {self.current_file_path}"
-                    )
-            except Exception as e:
-                import traceback
-
-                print(f"DEBUGGING: Error adding file to vector search: {str(e)}")
-                print("DEBUGGING: Detailed error information:")
-                traceback.print_exc()
-            self._index_modern_file(self.current_file_path)
-        else:
-            # If the file was already tagged before, just update the tags metadata
-            print("DEBUGGING: File already had tags, updating metadata only")
-            try:
-                self.vector_search.update_metadata(self.current_file_path)
-                print(
-                    f"DEBUGGING: Updated tags metadata for file in vector search: {self.current_file_path}"
-                )
-            except Exception as e:
-                import traceback
-
-                print(f"DEBUGGING: Error updating vector search metadata: {str(e)}")
-                traceback.print_exc()
+        self._index_modern_file(self.current_file_path)
 
         # Refresh file tags display
         self.refresh_file_tags()
@@ -1513,7 +1460,7 @@ class FileTagManager(QMainWindow):
             self.result_document_items = {}
 
     def reindex_files(self):
-        """Reindex all files in the vector database."""
+        """Queue all known files through the resumable modern indexing service."""
         reply = QMessageBox.question(
             self,
             "Reindex Files",
@@ -1525,22 +1472,54 @@ class FileTagManager(QMainWindow):
         )
 
         if reply == QMessageBox.Yes:
-            progress = QProgressDialog("Reindexing files...", "Cancel", 0, 100, self)
-            progress.setWindowModality(Qt.WindowModal)
+            file_paths = [
+                file_obj.path for file_obj in self.db_session.query(File).all()
+            ]
+            indexing_status = getattr(self, "indexing_status", None)
+            if indexing_status is None:
+                for file_path in file_paths:
+                    if not self._index_modern_file(file_path):
+                        return
+            else:
+                try:
+                    if callable(getattr(indexing_status, "setVisible", None)):
+                        indexing_status.setVisible(True)
+                    indexing_status.start_many(file_paths)
+                except Exception as exc:
+                    logger = getattr(self, "logger", logging.getLogger(__name__))
+                    logger.warning(
+                        "Could not queue modern reindexing (%s).",
+                        exc.__class__.__name__,
+                    )
+                    QMessageBox.warning(
+                        self,
+                        "Error",
+                        f"Modern indexing is unavailable: {exc}",
+                    )
+                    return
+            self._set_modern_index_status(
+                f"Modern indexing queued for {len(file_paths)} file(s)."
+            )
 
-            try:
-                self.vector_search.reindex_all(
-                    progress_callback=lambda msg, p: progress.setValue(p)
-                )
-                for file_obj in self.db_session.query(File).all():
-                    self._index_modern_file(file_obj.path)
-                QMessageBox.information(
-                    self, "Success", "Files reindexed successfully!"
-                )
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Reindexing failed: {str(e)}")
-            finally:
-                progress.close()
+    def resume_indexing(self) -> bool:
+        """Resume the most recent failed or cancelled modern indexing job."""
+        indexing_status = getattr(self, "indexing_status", None)
+        if indexing_status is None:
+            self._set_modern_index_status(
+                "Modern indexing resume is unavailable."
+            )
+            return False
+        try:
+            if callable(getattr(indexing_status, "setVisible", None)):
+                indexing_status.setVisible(True)
+            return indexing_status.resume() is not None
+        except Exception as exc:
+            logger = getattr(self, "logger", logging.getLogger(__name__))
+            logger.warning(
+                "Could not resume modern indexing (%s).",
+                exc.__class__.__name__,
+            )
+            return False
 
     def chat_with_results(self):
         """Open the chat dialog with selected documents (up to 3)."""
@@ -1606,6 +1585,148 @@ class FileTagManager(QMainWindow):
                 "Error",
                 f"Could not start chat: {str(e)}\nPlease check Ollama readiness and try again.",
             )
+
+    def migration_inventory(self) -> dict[str, object]:
+        """Return a safe inventory of migrated and still-legacy search data."""
+        runtime = getattr(self, "modern_runtime", None)
+        paths = getattr(runtime, "paths", None) or getattr(
+            getattr(self, "config", None),
+            "paths",
+            None,
+        )
+        legacy_chroma = getattr(paths, "legacy_chroma", None)
+        chroma_found = bool(
+            legacy_chroma is not None and legacy_chroma.exists()
+        )
+        chroma_paths: tuple[str, ...] = ()
+        chroma_warnings: tuple[str, ...] = ()
+        if legacy_chroma is not None:
+            try:
+                plan = inspect_legacy_chroma(legacy_chroma)
+                chroma_found = plan.found
+                chroma_paths = plan.paths
+                chroma_warnings = plan.warnings
+            except (OSError, ValueError) as exc:
+                chroma_warnings = (
+                    f"Legacy search inventory failed: {exc.__class__.__name__}.",
+                )
+
+        sqlite = getattr(runtime, "sqlite_migration", None)
+        config = getattr(runtime, "config_migration", None)
+        return {
+            "legacy_chroma_found": chroma_found,
+            "legacy_chroma_path_count": len(chroma_paths),
+            "legacy_chroma_warnings": chroma_warnings,
+            "requires_full_reindex": bool(chroma_paths),
+            "files_seen": int(getattr(sqlite, "files_seen", 0)),
+            "files_migrated": int(getattr(sqlite, "files_migrated", 0)),
+            "tags_migrated": int(getattr(sqlite, "tags_migrated", 0)),
+            "associations_migrated": int(
+                getattr(sqlite, "associations_migrated", 0)
+            ),
+            "suggestions_preserved": int(
+                getattr(sqlite, "suggestions_preserved", 0)
+            ),
+            "cloud_fields_removed": int(
+                getattr(config, "cloud_fields_removed", 0)
+            ),
+            "migration_errors": (
+                tuple(getattr(sqlite, "errors", ()))
+                + tuple(getattr(config, "errors", ()))
+            ),
+        }
+
+    def show_migration_inventory(self) -> None:
+        inventory = self.migration_inventory()
+        warnings = cast(tuple[str, ...], inventory["legacy_chroma_warnings"])
+        errors = cast(tuple[str, ...], inventory["migration_errors"])
+        details = [
+            (
+                f"Legacy search data found: "
+                f"{'yes' if inventory['legacy_chroma_found'] else 'no'}"
+            ),
+            (
+                "Legacy paths requiring full reindex: "
+                f"{inventory['legacy_chroma_path_count']}"
+            ),
+            f"Files inspected: {inventory['files_seen']}",
+            f"Files migrated: {inventory['files_migrated']}",
+            f"Tags migrated: {inventory['tags_migrated']}",
+            (
+                "File/tag associations migrated: "
+                f"{inventory['associations_migrated']}"
+            ),
+            (
+                "Tag suggestions preserved: "
+                f"{inventory['suggestions_preserved']}"
+            ),
+            (
+                "Removed legacy cloud fields: "
+                f"{inventory['cloud_fields_removed']}"
+            ),
+        ]
+        if warnings:
+            details.append("Legacy search warnings: " + "; ".join(warnings))
+        if errors:
+            details.append("Migration warnings: " + "; ".join(errors))
+        QMessageBox.information(
+            self,
+            "Migration Inventory",
+            "\n".join(details),
+        )
+
+    def cleanup_legacy_search_data(self) -> bool:
+        """Delete only the inspected legacy Chroma directory after confirmation."""
+        runtime = getattr(self, "modern_runtime", None)
+        paths = getattr(runtime, "paths", None) or getattr(
+            getattr(self, "config", None),
+            "paths",
+            None,
+        )
+        legacy_chroma = getattr(paths, "legacy_chroma", None)
+        if legacy_chroma is None or not legacy_chroma.exists():
+            QMessageBox.information(
+                self,
+                "Legacy Search Cleanup",
+                "No legacy search directory is available to remove.",
+            )
+            return False
+
+        inventory = self.migration_inventory()
+        reply = QMessageBox.question(
+            self,
+            "Clean Legacy Search Data",
+            "Remove the legacy .chroma search data?\n\n"
+            f"{inventory['legacy_chroma_path_count']} file path(s) were inventoried. "
+            "Legacy embeddings are not reused, and the modern index must be rebuilt. "
+            "Migration backups remain untouched.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            QMessageBox.information(
+                self,
+                "Legacy Search Cleanup",
+                "Legacy search cleanup was cancelled; no data was removed.",
+            )
+            return False
+        try:
+            removed = cleanup_legacy_chroma(legacy_chroma, confirmed=True)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(
+                self,
+                "Legacy Search Cleanup",
+                f"Cleanup failed safely: {exc}",
+            )
+            return False
+        QMessageBox.information(
+            self,
+            "Legacy Search Cleanup",
+            "Legacy search data was removed."
+            if removed
+            else "The legacy search data was already absent.",
+        )
+        return removed
 
     def show_ollama_settings(self) -> None:
         """Show the local Ollama readiness and installed-model dialog."""
@@ -2041,15 +2162,10 @@ class FileTagManager(QMainWindow):
 
         # Get or create file record
         file_obj = self.db_session.query(File).filter_by(path=file_path).first()
-        is_new_file = False
 
         if not file_obj:
             file_obj = File(path=file_path)
             self.db_session.add(file_obj)
-            is_new_file = True
-
-        # Check if file already had tags before
-        had_tags_before = len(file_obj.tags) > 0
 
         # Add tags (create them if they don't exist)
         for tag_name in tag_names:
@@ -2070,50 +2186,7 @@ class FileTagManager(QMainWindow):
             if tag not in file_obj.tags:
                 file_obj.tags.append(tag)
 
-        # Don't commit here - we commit in the calling function
-
-        # If this is the first time the file has been tagged, add it to the vector database
-        if is_new_file or not had_tags_before:
-            try:
-                from .vector_search.content_extractor import ContentExtractor
-
-                # Extract content from the file
-                print(f"Attempting to extract content from: {file_path}")
-                # Get the PDF extractor setting from config
-                pdf_extractor = self.config.get_pdf_extractor()
-                print(f"Using PDF extractor mode: {pdf_extractor}")
-                content = ContentExtractor.extract_file_content(
-                    file_path, pdf_extractor=pdf_extractor
-                )
-
-                if content:
-                    print(f"Content extracted, length: {len(content)} characters")
-                    # Add file to vector database
-                    print(f"Sending to vector search index: {file_path}")
-                    self.vector_search.index_file(file_path, content)
-                    print(
-                        f"Added newly tagged file to vector search index: {file_path}"
-                    )
-                else:
-                    print(
-                        f"Warning: No content could be extracted from file: {file_path}"
-                    )
-            except Exception as e:
-                import traceback
-
-                print(f"Error adding file to vector search: {str(e)}")
-                print("Detailed error information:")
-                traceback.print_exc()
-        else:
-            # If the file was already tagged before, just update the tags metadata
-            try:
-                self.vector_search.update_metadata(file_path)
-                print(f"Updated tags metadata for file in vector search: {file_path}")
-            except Exception as e:
-                import traceback
-
-                print(f"Error updating vector search metadata: {str(e)}")
-                traceback.print_exc()
+        # The caller commits the legacy snapshot and queues modern indexing.
 
     def apply_tags_to_files(self, file_paths, tag_names):
         """Apply selected tags to multiple files."""
@@ -2174,7 +2247,7 @@ class FileTagManager(QMainWindow):
         return selected_files
 
     def force_reindex_file(self, file_path):
-        """Force a file to be reindexed in the vector search database."""
+        """Queue one file for atomic, resumable modern indexing."""
         if not file_path or not os.path.isfile(file_path):
             QMessageBox.warning(
                 self,
@@ -2192,118 +2265,7 @@ class FileTagManager(QMainWindow):
                 )
                 return False
 
-            print(f"\n=== Force reindexing file: {file_path} ===")
-            self._index_modern_file(file_path)
-
-            from .vector_search.content_extractor import ContentExtractor
-
-            # Create progress dialog for extraction
-            progress = QProgressDialog("Extracting content...", "Cancel", 0, 0, self)
-            progress.setWindowTitle("Extracting Content")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-            progress.setAutoClose(False)
-            progress.setAutoReset(False)
-            progress.setCancelButton(None)  # No cancel button
-            progress.setRange(0, 0)  # Show busy indicator (spinner)
-            progress.show()
-
-            # Variable to store extracted content
-            extracted_content = None
-
-            # Define callbacks for the async extraction
-            def on_progress(message):
-                progress.setLabelText(message)
-                QApplication.processEvents()
-
-            def on_extraction_complete(result):
-                nonlocal extracted_content
-                progress.close()
-
-                if result.get("success", False):
-                    extracted_content = result.get("content", "")
-                    print(
-                        f"Content extraction completed successfully, length: {len(extracted_content)} characters"
-                    )
-                    finish_reindexing(extracted_content)
-                else:
-                    error = result.get("error", "Unknown error")
-                    print(f"Content extraction failed: {error}")
-                    QMessageBox.warning(
-                        self, "Error", f"Content extraction failed: {error}"
-                    )
-
-            def finish_reindexing(content):
-                if not content:
-                    QMessageBox.warning(
-                        self,
-                        "Error",
-                        f"Could not extract content from {os.path.basename(file_path)}.\n\n"
-                        "This file type may not be supported for content extraction.",
-                    )
-                    return False
-
-                try:
-                    # Remove existing entries before reindexing
-                    print(f"Removing existing document entries for: {file_path}")
-                    self.vector_search.remove_file(file_path)
-
-                    # Index the file with extracted content
-                    print(f"Reindexing file: {file_path}")
-                    self.vector_search.index_file(file_path, content)
-
-                    # Verify that the file was indexed with a summary
-                    try:
-                        results = self.vector_search.collection.get(
-                            ids=[file_path], include=["metadatas"]
-                        )
-                        if results and results["ids"] and len(results["ids"]) > 0:
-                            metadata = results["metadatas"][0]
-                            print(
-                                "Verification successful - file found in vector store"
-                            )
-                            if "summary" in metadata and metadata["summary"]:
-                                print(
-                                    f"Document summary generated: {metadata['summary']}"
-                                )
-                            else:
-                                print("No document summary was generated")
-                    except Exception as verify_err:
-                        print(
-                            f"Error verifying file in vector store: {str(verify_err)}"
-                        )
-
-                    QMessageBox.information(
-                        self,
-                        "Success",
-                        f"The file {os.path.basename(file_path)} has been successfully reindexed.",
-                    )
-                    return True
-                except Exception as e:
-                    print(f"Error during finishing reindexing: {str(e)}")
-                    traceback.print_exc()
-                    QMessageBox.warning(
-                        self, "Error", f"Failed to complete reindexing: {str(e)}"
-                    )
-                    return False
-
-            # Get the PDF extractor preference from config
-            pdf_extractor = self.config.get_pdf_extractor()
-            print(
-                f"Starting async content extraction from: {file_path} (using {pdf_extractor} extraction mode)"
-            )
-
-            # Start the async extraction process with the specified extractor mode
-            ContentExtractor.extract_file_content_async(
-                file_path,
-                on_extraction_complete,
-                on_progress,
-                pdf_extractor=pdf_extractor,
-            )
-            return (
-                True  # Return true immediately, the actual work happens asynchronously
-            )
+            return self._index_modern_file(file_path)
 
         except Exception as e:
             print(f"Error during force reindex: {str(e)}")

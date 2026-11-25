@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QPixmap
 from .models import init_db
 from .config import Config
 from .infrastructure.app_paths import AppPaths
+from .migration.legacy_chroma import inspect_legacy_chroma
 from .modern_context import initialize_modern_runtime
 
 # Set ONNX environment variable here too for the worker thread
@@ -82,10 +83,34 @@ class InitializationWorker(QThread):
                 self.password,
             )
             logger.debug("Modern sidecar initialization completed")
-            
-            # Initialize vector search
+
+            # Inventory legacy search data without deleting or reusing it.
+            self.progress_signal.emit(
+                "Checking legacy migration inventory...", 52
+            )
+            legacy_chroma = getattr(config.paths, "legacy_chroma", None)
+            if legacy_chroma is not None:
+                try:
+                    inventory = inspect_legacy_chroma(legacy_chroma)
+                    setattr(
+                        modern_runtime,
+                        "legacy_chroma_inventory",
+                        inventory,
+                    )
+                    logger.debug(
+                        "Legacy Chroma inventory completed (paths=%d, warnings=%d).",
+                        len(inventory.paths),
+                        len(inventory.warnings),
+                    )
+                except Exception as inventory_error:
+                    logger.warning(
+                        "Legacy Chroma inventory failed (%s).",
+                        inventory_error.__class__.__name__,
+                    )
+
+            # Keep the compatibility search engine available during Task 25 migration.
             logger.debug("Starting vector search initialization")
-            self.progress_signal.emit("Setting up search engine...", 50)
+            self.progress_signal.emit("Setting up search compatibility layer...", 58)
             try:
                 from .vector_search import VectorSearch
 
