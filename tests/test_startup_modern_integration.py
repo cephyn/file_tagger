@@ -387,28 +387,28 @@ def test_manager_never_falls_back_to_synchronous_modern_index(
     assert calls == []
 
 
-def test_manager_queues_modern_index_work_without_calling_sync_path(
+def test_manager_never_calls_runtime_async_when_status_widget_is_missing(
     tmp_path, monkeypatch
 ) -> None:
-    queued: list[str] = []
+    calls: list[str] = []
 
-    class Queued:
+    class AsyncOnly:
         def index_file_async(self, path: str) -> None:
-            queued.append(path)
-
-        def index_file(self, path: str) -> None:
-            raise AssertionError("the UI thread must not perform modern indexing")
+            calls.append(path)
+            raise AssertionError("the manager must use the IndexingStatus QThread")
 
     manager_class = _manager_class(monkeypatch)
     manager = manager_class.__new__(manager_class)
-    manager.modern_runtime = Queued()
-    manager.logger = logging.getLogger("startup-reindex-queued-test")
+    manager.modern_runtime = AsyncOnly()
+    manager.logger = logging.getLogger("startup-reindex-missing-status-test")
     manager.modern_index_status_text = ""
     path = str(tmp_path / "file.txt")
 
-    assert manager._index_modern_file(path) is True
-    assert queued == [path]
-    assert manager.modern_index_status_text == "Modern indexing queued."
+    assert manager._index_modern_file(path) is False
+    assert calls == []
+    assert manager.modern_index_status_text == (
+        "Modern indexing unavailable: indexing status UI is not initialized."
+    )
 
 
 @pytest.mark.parametrize("had_existing_tags", [False, True])

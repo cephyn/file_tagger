@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..modern_context import ModernIndexingUnavailable
+
 
 class _IndexingWorker(QThread):
     result_ready = Signal(object)
@@ -120,6 +122,10 @@ class IndexingStatus(QWidget):
             return None
         self._active_path = path
         self._active_service = self._resolved_service()
+        if self._active_service is None:
+            raise ModernIndexingUnavailable(
+                "the modern indexing service is not initialized."
+            )
         setattr(self._active_service, "cancel_requested", False)
         setattr(self.service, "cancel_requested", False)
 
@@ -129,16 +135,10 @@ class IndexingStatus(QWidget):
             self._run_job(job_id)
             return job_id
 
-        queue_async = getattr(self._active_service, "index_file_async", None)
-        if callable(queue_async):
-            queue_async(path)
-            self._set_progress("Queued", 0, "Waiting for the indexing worker.")
-            return None
-
         if callable(getattr(self._active_service, "index_file", None)):
             self._run_job(None)
             return None
-        raise RuntimeError("Modern indexing is not available.")
+        raise ModernIndexingUnavailable("Modern indexing is not available.")
 
     def start_many(self, file_paths: Iterable[str | Path]) -> None:
         self._pending.extend(str(path) for path in file_paths)

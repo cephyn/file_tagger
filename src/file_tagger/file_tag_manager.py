@@ -258,48 +258,21 @@ class FileTagManager(QMainWindow):
 
     def _index_modern_file(self, file_path: str) -> bool:
         indexing_status = getattr(self, "indexing_status", None)
-        if indexing_status is not None:
-            try:
-                if callable(getattr(indexing_status, "setVisible", None)):
-                    indexing_status.setVisible(True)
-                indexing_status.start(file_path)
-                self._set_modern_index_status("Modern indexing started.")
-                return True
-            except ModernIndexingUnavailable as exc:
-                self._set_modern_index_status(
-                    f"Modern indexing unavailable: {exc}"
-                )
-                return False
-            except Exception as exc:
-                self._set_modern_index_status(
-                    f"Modern indexing failed: {exc.__class__.__name__}."
-                )
-                self.logger.warning(
-                    "Modern indexing failed for a requested file (%s).",
-                    exc.__class__.__name__,
-                )
-                return False
-
-        runtime = getattr(self, "modern_runtime", None)
-        if runtime is None:
+        if indexing_status is None:
             self._set_modern_index_status(
-                "Modern indexing unavailable: modern runtime is not initialized."
+                "Modern indexing unavailable: indexing status UI is not initialized."
             )
             return False
         try:
-            queue_index = getattr(runtime, "index_file_async", None)
-            if not callable(queue_index):
-                raise ModernIndexingUnavailable(
-                    "the modern indexing background queue is unavailable."
-                )
-            queue_index(file_path)
-            self._set_modern_index_status("Modern indexing queued.")
+            if callable(getattr(indexing_status, "setVisible", None)):
+                indexing_status.setVisible(True)
+            indexing_status.start(file_path)
+            self._set_modern_index_status("Modern indexing started.")
             return True
         except ModernIndexingUnavailable as exc:
             self._set_modern_index_status(
                 f"Modern indexing unavailable: {exc}"
             )
-            self.logger.warning("Modern indexing unavailable for a requested file.")
             return False
         except Exception as exc:
             self._set_modern_index_status(
@@ -307,6 +280,37 @@ class FileTagManager(QMainWindow):
             )
             self.logger.warning(
                 "Modern indexing failed for a requested file (%s).",
+                exc.__class__.__name__,
+            )
+            return False
+
+    def _index_modern_files(self, file_paths: Iterable[str]) -> bool:
+        paths = list(file_paths)
+        indexing_status = getattr(self, "indexing_status", None)
+        if indexing_status is None:
+            self._set_modern_index_status(
+                "Modern indexing unavailable: indexing status UI is not initialized."
+            )
+            return False
+        try:
+            if callable(getattr(indexing_status, "setVisible", None)):
+                indexing_status.setVisible(True)
+            indexing_status.start_many(paths)
+            self._set_modern_index_status(
+                f"Modern indexing queued for {len(paths)} file(s)."
+            )
+            return True
+        except ModernIndexingUnavailable as exc:
+            self._set_modern_index_status(
+                f"Modern indexing unavailable: {exc}"
+            )
+            return False
+        except Exception as exc:
+            self._set_modern_index_status(
+                f"Modern indexing failed: {exc.__class__.__name__}."
+            )
+            self.logger.warning(
+                "Modern indexing failed for requested files (%s).",
                 exc.__class__.__name__,
             )
             return False
@@ -1479,31 +1483,12 @@ class FileTagManager(QMainWindow):
             file_paths = [
                 file_obj.path for file_obj in self.db_session.query(File).all()
             ]
-            indexing_status = getattr(self, "indexing_status", None)
-            if indexing_status is None:
-                for file_path in file_paths:
-                    if not self._index_modern_file(file_path):
-                        return
-            else:
-                try:
-                    if callable(getattr(indexing_status, "setVisible", None)):
-                        indexing_status.setVisible(True)
-                    indexing_status.start_many(file_paths)
-                except Exception as exc:
-                    logger = getattr(self, "logger", logging.getLogger(__name__))
-                    logger.warning(
-                        "Could not queue modern reindexing (%s).",
-                        exc.__class__.__name__,
-                    )
-                    QMessageBox.warning(
-                        self,
-                        "Error",
-                        f"Modern indexing is unavailable: {exc}",
-                    )
-                    return
-            self._set_modern_index_status(
-                f"Modern indexing queued for {len(file_paths)} file(s)."
-            )
+            if not self._index_modern_files(file_paths):
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    self.modern_index_status_text,
+                )
 
     def resume_indexing(self) -> bool:
         """Resume the most recent failed or cancelled modern indexing job."""
@@ -2142,8 +2127,7 @@ class FileTagManager(QMainWindow):
                     for file_path in applied_paths
                 ]
             )
-            for file_path in applied_paths:
-                self._index_modern_file(file_path)
+            self._index_modern_files(applied_paths)
 
         # Show success message
         if applied_count > 0:
@@ -2224,8 +2208,7 @@ class FileTagManager(QMainWindow):
                 for file_path in file_paths
             ]
         )
-        for file_path in file_paths:
-            self._index_modern_file(file_path)
+        self._index_modern_files(file_paths)
 
         # Refresh tag lists
         self.refresh_tags()

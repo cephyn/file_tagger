@@ -2,6 +2,7 @@ import logging
 from threading import Event
 from types import SimpleNamespace
 
+import pytest
 from PySide6.QtWidgets import QMessageBox
 
 from file_tagger.ui.indexing_status import IndexingStatus
@@ -125,6 +126,25 @@ def test_indexing_queues_a_second_ui_request_while_worker_is_running(qtbot) -> N
     qtbot.waitUntil(lambda: resumed == [1, 2])
 
 
+def test_indexing_status_does_not_call_runtime_async_queue(qtbot) -> None:
+    calls: list[str] = []
+
+    class AsyncOnlyService:
+        def index_file_async(self, path: str) -> None:
+            calls.append(path)
+            raise AssertionError("indexing must run in the QThread worker")
+
+    status = IndexingStatus(AsyncOnlyService())
+    qtbot.addWidget(status)
+
+    with pytest.raises(
+        RuntimeError, match="Modern indexing is not available"
+    ):
+        status.start("C:\\library\\guide.md")
+
+    assert calls == []
+
+
 def test_failed_job_is_resumable_without_losing_previous_revision(qtbot) -> None:
     attempts = 0
 
@@ -228,6 +248,140 @@ def test_manager_reindex_all_uses_modern_status_only(qtbot, monkeypatch) -> None
     ]]
 
 
+def test_manager_reindex_all_reports_missing_status_without_runtime_fallback(
+    qtbot, monkeypatch
+) -> None:
+    from file_tagger import file_tag_manager
+
+    calls: list[str] = []
+
+    class Runtime:
+        def index_file_async(self, path: str) -> None:
+            calls.append(path)
+            raise AssertionError("the manager must not queue runtime indexing")
+
+    manager = file_tag_manager.FileTagManager.__new__(
+        file_tag_manager.FileTagManager
+    )
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.logger = logging.getLogger("indexing-status-test")
+    manager.db_session = SimpleNamespace(
+        query=lambda model: SimpleNamespace(
+            all=lambda: [SimpleNamespace(path="C:\\library\\one.md")]
+        )
+    )
+    manager.modern_runtime = Runtime()
+    manager.modern_index_status_text = ""
+    shown: list[str] = []
+    monkeypatch.setattr(
+        file_tag_manager.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        file_tag_manager.QMessageBox,
+        "warning",
+        lambda parent, title, message: shown.append(message),
+    )
+
+    manager.reindex_files()
+
+    assert calls == []
+    assert manager.modern_index_status_text == (
+        "Modern indexing unavailable: indexing status UI is not initialized."
+    )
+    assert shown == [manager.modern_index_status_text]
+
+
+def test_batch_tagging_queues_paths_as_one_indexing_status_job(
+    qtbot, monkeypatch
+) -> None:
+    from file_tagger import file_tag_manager
+
+    manager = file_tag_manager.FileTagManager.__new__(
+        file_tag_manager.FileTagManager
+    )
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.logger = logging.getLogger("indexing-status-test")
+    paths = ["C:\\library\\one.md", "C:\\library\\two.md"]
+    queued: list[list[str]] = []
+    manager.db_session = SimpleNamespace(
+        query=lambda model: SimpleNamespace(
+            filter_by=lambda **kwargs: SimpleNamespace(
+                one=lambda: SimpleNamespace(tags=[])
+            )
+        )
+    )
+    manager.apply_tags_to_file = lambda path, tags: None
+    manager._commit_legacy_changes = lambda **kwargs: None
+    manager.indexing_status = SimpleNamespace(
+        start_many=lambda values: queued.append(list(values))
+    )
+    manager.modern_runtime = SimpleNamespace(
+        index_file_async=lambda path: (_ for _ in ()).throw(
+            AssertionError("the manager must use the IndexingStatus QThread")
+        )
+    )
+    manager.refresh_tags = lambda: None
+    manager.refresh_file_tags = lambda: None
+    monkeypatch.setattr(
+        file_tag_manager.QMessageBox,
+        "information",
+        lambda *args, **kwargs: None,
+    )
+
+    manager.apply_tags_to_files(paths, ["research"])
+
+    assert queued == [paths]
+
+
+def test_suggestion_batching_queues_paths_as_one_indexing_status_job(
+    qtbot, monkeypatch
+) -> None:
+    from file_tagger import file_tag_manager
+
+    manager = file_tag_manager.FileTagManager.__new__(
+        file_tag_manager.FileTagManager
+    )
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.logger = logging.getLogger("indexing-status-test")
+    paths = ["C:\\library\\one.md", "C:\\library\\two.md"]
+    queued: list[list[str]] = []
+    manager.file_suggestions_map = {
+        path: {"research": 0.9}
+        for path in paths
+    }
+    manager.db_session = SimpleNamespace(
+        query=lambda model: SimpleNamespace(
+            filter_by=lambda **kwargs: SimpleNamespace(
+                one=lambda: SimpleNamespace(tags=[])
+            )
+        )
+    )
+    manager.apply_tags_to_file = lambda path, tags: None
+    manager._commit_legacy_changes = lambda **kwargs: None
+    manager.indexing_status = SimpleNamespace(
+        start_many=lambda values: queued.append(list(values))
+    )
+    manager.modern_runtime = SimpleNamespace(
+        index_file_async=lambda path: (_ for _ in ()).throw(
+            AssertionError("the manager must use the IndexingStatus QThread")
+        )
+    )
+    monkeypatch.setattr(
+        file_tag_manager.QMessageBox,
+        "information",
+        lambda *args, **kwargs: None,
+    )
+
+    manager.apply_all_suggestions_to_files(paths)
+
+    assert queued == [paths]
+
+
 def test_safe_legacy_cleanup_requires_confirmation(qtbot, monkeypatch, tmp_path) -> None:
     from file_tagger import file_tag_manager
 
@@ -328,6 +482,43 @@ def test_single_file_reindex_does_not_require_legacy_vector_search(
 
     assert manager.force_reindex_file(str(source)) is True
     assert started == [str(source)]
+
+
+def test_single_file_reindex_requires_status_without_runtime_fallback(
+    qtbot, tmp_path
+) -> None:
+    from file_tagger import file_tag_manager
+
+    source = tmp_path / "guide.md"
+    source.write_text("guide", encoding="utf-8")
+    calls: list[str] = []
+
+    class Runtime:
+        def index_file_async(self, path: str) -> None:
+            calls.append(path)
+            raise AssertionError("the manager must not queue runtime indexing")
+
+    manager = file_tag_manager.FileTagManager.__new__(
+        file_tag_manager.FileTagManager
+    )
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.logger = logging.getLogger("indexing-status-test")
+    manager.db_session = SimpleNamespace(
+        query=lambda model: SimpleNamespace(
+            filter_by=lambda **kwargs: SimpleNamespace(
+                first=lambda: object()
+            )
+        )
+    )
+    manager.modern_runtime = Runtime()
+    manager.modern_index_status_text = ""
+
+    assert manager.force_reindex_file(str(source)) is False
+    assert calls == []
+    assert manager.modern_index_status_text == (
+        "Modern indexing unavailable: indexing status UI is not initialized."
+    )
 
 
 def test_indexing_menu_exposes_resume_inventory_and_safe_cleanup(qtbot) -> None:
