@@ -1,11 +1,17 @@
 import asyncio
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Coroutine,
     Mapping,
     Sequence,
 )
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from hashlib import sha256
+import inspect
 import json
+import threading
 from typing import Any, Callable, Protocol, TypeAlias, TypeVar, cast
 
 from pydantic import ValidationError
@@ -41,6 +47,7 @@ MAX_QUESTION_LENGTH = 1_024
 T = TypeVar("T")
 JsonMapping: TypeAlias = Mapping[str, Any]
 ChatHistory: TypeAlias = tuple[tuple[str, str], ...]
+IndexIdentity: TypeAlias = tuple[str | None, str | None, int | None, str | None]
 EvidenceInput: TypeAlias = (
     SearchResult
     | SearchCitation
@@ -53,8 +60,12 @@ class SearchGateway(Protocol):
     def search(
         self,
         query: str,
+        query_embedding: Sequence[float] | None = None,
         *,
         limit: int = 10,
+        model_digest: str | None = None,
+        index_version: str | None = None,
+        embedding_profile: ModelProfile | None = None,
     ) -> Sequence[SearchResult]: ...
 
 
@@ -69,16 +80,49 @@ class GenerationGateway(Protocol):
     ) -> str: ...
 
 
+class EmbeddingGateway(Protocol):
+    async def embed(
+        self,
+        model: str,
+        text: str | Sequence[str],
+        *,
+        dimensions: int | None = None,
+        truncate: bool = False,
+        keep_alive: float | str | None = "5m",
+    ) -> tuple[tuple[float, ...], ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionStateKey:
+    session_id: str
+    original_question: str
+    markdown_context: str
+    index_identity: IndexIdentity
+    evidence_identity: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionState:
+    key: _SessionStateKey
+    version: int
+    evidence: tuple[SearchResult, ...]
+    history: ChatHistory
+
+
 class RagService:
     def __init__(
         self,
         search: SearchGateway | None = None,
         gateway: GenerationGateway | None = None,
+        embedding_gateway: Any | None = None,
         planner: Planner = build_search_plan_async,
         model: str = DEFAULT_GENERATION_MODEL,
         evidence_limit: int = DEFAULT_EVIDENCE_LIMIT,
         per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
         max_sections_per_file: int = DEFAULT_MAX_SECTIONS_PER_FILE,
+        embedding_profile: ModelProfile | None = None,
+        model_digest: str | None = None,
+        index_version: str | None = None,
     ) -> None:
         if evidence_limit <= 0:
             raise ValueError("The evidence limit must be positive.")
@@ -95,16 +139,22 @@ class RagService:
         self.evidence_limit = evidence_limit
         self.per_query_limit = per_query_limit
         self.max_sections_per_file = max_sections_per_file
-        self._evidence_cache: dict[tuple[str, str], tuple[SearchResult, ...]] = {}
-        self._history: dict[tuple[str, str], ChatHistory] = {}
+        self._embedding_gateway = embedding_gateway or gateway or self._gateway
+        self._embedding_profile = embedding_profile
+        self._model_digest = model_digest
+        self._index_version = index_version
+        self._session_states: dict[str, _SessionState] = {}
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_registry_lock = threading.Lock()
 
     @property
     def evidence(self) -> tuple[SearchResult, ...]:
-        return tuple(
-            result
-            for cached in self._evidence_cache.values()
-            for result in cached
-        )
+        with self._session_registry_lock:
+            return tuple(
+                result
+                for state in self._session_states.values()
+                for result in state.evidence
+            )
 
     def answer_question(
         self,
@@ -115,6 +165,9 @@ class RagService:
         rerank: bool = False,
         rerank_top_k: int = DEFAULT_RERANK_TOP_K,
         max_context_retries: int = MAX_CONTEXT_RETRIES,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        retrieval_question: str | None = None,
     ) -> CitedAnswer:
         return _run_sync(
             self.answer_question_async(
@@ -124,6 +177,9 @@ class RagService:
                 rerank=rerank,
                 rerank_top_k=rerank_top_k,
                 max_context_retries=max_context_retries,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                retrieval_question=retrieval_question,
             )
         )
 
@@ -136,6 +192,9 @@ class RagService:
         rerank: bool = False,
         rerank_top_k: int = DEFAULT_RERANK_TOP_K,
         max_context_retries: int = MAX_CONTEXT_RETRIES,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        retrieval_question: str | None = None,
     ) -> CitedAnswer:
         checked_question = _validate_question(question)
         if not isinstance(markdown_context, str):
@@ -147,58 +206,147 @@ class RagService:
             checked_context = ""
         else:
             checked_context = markdown_context.strip()
-        key = (checked_question, checked_context)
-
-        if evidence is not None:
-            selected = _bounded_evidence(
+        checked_session = _validate_session_identity(session_id, conversation_id)
+        if session_id is None and conversation_id is None:
+            checked_session = (
+                "default:"
+                + sha256(
+                    f"{checked_question}\0{checked_context}".encode("utf-8")
+                ).hexdigest()
+            )
+        explicit_retrieval_question = (
+            _validate_question(retrieval_question)
+            if retrieval_question is not None
+            else None
+        )
+        supplied_evidence = (
+            _bounded_evidence(
                 _coerce_evidence(evidence),
                 limit=self.evidence_limit,
                 max_sections_per_file=self.max_sections_per_file,
             )
-            self._evidence_cache[key] = selected
-        elif key in self._evidence_cache:
-            selected = self._evidence_cache[key]
-        else:
-            if self._search is None:
-                raise ValueError(
-                    "Search evidence or a HybridSearch service is required."
-                )
-            planned = self._planner(
-                checked_question,
-                checked_context,
-                gateway=self._gateway,
-            )
-            plan = (
-                planned
-                if isinstance(planned, SearchPlan)
-                else await planned
-            )
-            selected = execute_search_plan(
-                plan,
-                self._search,
-                per_query_limit=self.per_query_limit,
-                limit=self.evidence_limit,
-                max_sections_per_file=self.max_sections_per_file,
-            )
-            self._evidence_cache[key] = selected
+            if evidence is not None
+            else None
+        )
 
-        previous = self._history.get(key, ())
-        answer = await _generate_answer_async(
-            checked_question,
-            selected,
-            model=self.model,
-            gateway=self._gateway,
-            markdown_context=checked_context,
-            rerank=rerank,
-            rerank_top_k=rerank_top_k,
-            max_context_retries=max_context_retries,
-            history=previous,
-        )
-        self._history[key] = (
-            *previous[-4:],
-            (checked_question, answer.text),
-        )
-        return answer
+        async with self._session_guard(checked_session):
+            with self._session_registry_lock:
+                previous_state = self._session_states.get(checked_session)
+            profile = _embedding_profile(self._search, self._embedding_profile)
+            identity = _index_identity(
+                self._search,
+                profile,
+                model_digest=self._model_digest,
+                index_version=self._index_version,
+            )
+            can_reuse_retrieval = (
+                previous_state is not None
+                and previous_state.key.markdown_context == checked_context
+                and previous_state.key.index_identity == identity
+            )
+            original_question = (
+                explicit_retrieval_question
+                or (
+                    previous_state.key.original_question
+                    if can_reuse_retrieval and previous_state is not None
+                    else checked_question
+                )
+            )
+            supplied_identity = (
+                _evidence_identity(supplied_evidence)
+                if supplied_evidence is not None
+                else None
+            )
+            evidence_identity = (
+                supplied_identity
+                if supplied_evidence is not None
+                else (
+                    previous_state.key.evidence_identity
+                    if can_reuse_retrieval and previous_state is not None
+                    else None
+                )
+            )
+            key = _SessionStateKey(
+                session_id=checked_session,
+                original_question=original_question,
+                markdown_context=checked_context,
+                index_identity=identity,
+                evidence_identity=evidence_identity,
+            )
+            reuse = previous_state is not None and previous_state.key == key
+            if reuse:
+                assert previous_state is not None
+                selected = previous_state.evidence
+                previous_history = previous_state.history
+                version = previous_state.version
+            else:
+                if supplied_evidence is not None:
+                    selected = supplied_evidence
+                else:
+                    if self._search is None:
+                        raise ValueError(
+                            "Search evidence or a HybridSearch service is required."
+                        )
+                    planned = self._planner(
+                        original_question,
+                        checked_context,
+                        gateway=self._gateway,
+                    )
+                    plan = (
+                        planned
+                        if isinstance(planned, SearchPlan)
+                        else await planned
+                    )
+                    selected = await execute_search_plan_async(
+                        plan,
+                        self._search,
+                        embedding_gateway=self._embedding_gateway,
+                        embedding_profile=profile,
+                        model_digest=self._model_digest,
+                        index_version=self._index_version,
+                        per_query_limit=self.per_query_limit,
+                        limit=self.evidence_limit,
+                        max_sections_per_file=self.max_sections_per_file,
+                    )
+                previous_history = ()
+                version = previous_state.version if previous_state is not None else 0
+
+            answer = await _generate_answer_async(
+                checked_question,
+                selected,
+                model=self.model,
+                gateway=self._gateway,
+                markdown_context=checked_context,
+                rerank=rerank,
+                rerank_top_k=rerank_top_k,
+                max_context_retries=max_context_retries,
+                history=previous_history,
+            )
+            updated = _SessionState(
+                key=key,
+                version=version + 1,
+                evidence=selected,
+                history=(*previous_history[-4:], (checked_question, answer.text)),
+            )
+            with self._session_registry_lock:
+                self._session_states[checked_session] = updated
+            return answer
+
+    @asynccontextmanager
+    async def _session_guard(self, session_id: str) -> AsyncIterator[None]:
+        with self._session_registry_lock:
+            lock = self._session_locks.setdefault(session_id, threading.Lock())
+        acquired = asyncio.create_task(asyncio.to_thread(lock.acquire))
+        try:
+            await asyncio.shield(acquired)
+        except asyncio.CancelledError:
+            await asyncio.shield(acquired)
+            lock.release()
+            raise
+        try:
+            yield
+        finally:
+            lock.release()
 
     async def answer_plan_async(
         self,
@@ -206,14 +354,24 @@ class RagService:
         markdown_context: str = "",
         *,
         rerank: bool = False,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        retrieval_question: str | None = None,
     ) -> CitedAnswer:
         if not isinstance(plan, SearchPlan):
             raise TypeError("plan must be a SearchPlan.")
         if self._search is None:
             raise ValueError("A HybridSearch service is required.")
-        evidence = execute_search_plan(
+        evidence = await execute_search_plan_async(
             plan,
             self._search,
+            embedding_gateway=self._embedding_gateway,
+            embedding_profile=_embedding_profile(
+                self._search,
+                self._embedding_profile,
+            ),
+            model_digest=self._model_digest,
+            index_version=self._index_version,
             per_query_limit=self.per_query_limit,
             limit=self.evidence_limit,
             max_sections_per_file=self.max_sections_per_file,
@@ -223,6 +381,9 @@ class RagService:
             markdown_context,
             evidence,
             rerank=rerank,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            retrieval_question=retrieval_question or plan.question,
         )
 
     def answer_plan(
@@ -231,12 +392,18 @@ class RagService:
         markdown_context: str = "",
         *,
         rerank: bool = False,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        retrieval_question: str | None = None,
     ) -> CitedAnswer:
         return _run_sync(
             self.answer_plan_async(
                 plan,
                 markdown_context,
                 rerank=rerank,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                retrieval_question=retrieval_question,
             )
         )
 
@@ -245,6 +412,37 @@ def execute_search_plan(
     plan: SearchPlan,
     search: SearchGateway,
     *,
+    embedding_gateway: Any | None = None,
+    embedding_profile: ModelProfile | None = None,
+    model_digest: str | None = None,
+    index_version: str | None = None,
+    per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
+    limit: int = DEFAULT_EVIDENCE_LIMIT,
+    max_sections_per_file: int = DEFAULT_MAX_SECTIONS_PER_FILE,
+) -> tuple[SearchResult, ...]:
+    return _run_sync(
+        execute_search_plan_async(
+            plan,
+            search,
+            embedding_gateway=embedding_gateway,
+            embedding_profile=embedding_profile,
+            model_digest=model_digest,
+            index_version=index_version,
+            per_query_limit=per_query_limit,
+            limit=limit,
+            max_sections_per_file=max_sections_per_file,
+        )
+    )
+
+
+async def execute_search_plan_async(
+    plan: SearchPlan,
+    search: SearchGateway,
+    *,
+    embedding_gateway: Any | None = None,
+    embedding_profile: ModelProfile | None = None,
+    model_digest: str | None = None,
+    index_version: str | None = None,
     per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
     limit: int = DEFAULT_EVIDENCE_LIMIT,
     max_sections_per_file: int = DEFAULT_MAX_SECTIONS_PER_FILE,
@@ -260,15 +458,185 @@ def execute_search_plan(
     if limit == 0:
         return ()
 
-    queries = tuple(dict.fromkeys(plan.paraphrase_queries))
+    queries = tuple(dict.fromkeys((*plan.exact_terms, *plan.paraphrase_queries)))
+    selected_profile = _embedding_profile(search, embedding_profile)
+    identity = _index_identity(
+        search,
+        selected_profile,
+        model_digest=model_digest,
+        index_version=index_version,
+    )
+    embeddings: tuple[tuple[float, ...], ...] | None = None
+    if selected_profile is not None:
+        embeddings = await _embed_queries(
+            embedding_gateway,
+            selected_profile,
+            queries,
+        )
+
     candidates: list[SearchResult] = []
-    for query in queries:
-        candidates.extend(search.search(query, limit=per_query_limit))
+    for index, query in enumerate(queries):
+        if embeddings is None:
+            candidates.extend(search.search(query, limit=per_query_limit))
+            continue
+        candidates.extend(
+            search.search(
+                query,
+                embeddings[index],
+                limit=per_query_limit,
+                model_digest=identity[1],
+                index_version=identity[3],
+            )
+        )
     return _bounded_evidence(
         candidates,
         limit=limit,
         max_sections_per_file=max_sections_per_file,
     )
+
+
+def _embedding_profile(
+    search: SearchGateway | None,
+    explicit: ModelProfile | None,
+) -> ModelProfile | None:
+    selected = explicit
+    if selected is None and search is not None:
+        raw = getattr(search, "embedding_profile", None)
+        if raw is None:
+            raw = getattr(search, "profile", None)
+        selected = raw
+    if selected is None:
+        return None
+    if not isinstance(selected, ModelProfile):
+        raise ModelIncompatibleError(
+            "The active indexed embedding profile is invalid."
+        )
+    if selected.role != "embedding" or selected.dimensions is None:
+        raise ModelIncompatibleError(
+            "The active indexed profile is not a dimensioned embedding model."
+        )
+    return selected
+
+
+def _index_identity(
+    search: SearchGateway | None,
+    profile: ModelProfile | None,
+    *,
+    model_digest: str | None,
+    index_version: str | None,
+) -> IndexIdentity:
+    digest = model_digest
+    version = index_version
+    if search is not None:
+        digest = digest or cast(str | None, getattr(search, "model_digest", None))
+        version = version or cast(
+            str | None,
+            getattr(search, "index_version", None),
+        )
+    if profile is None:
+        return (None, digest, None, version)
+    if digest is not None and digest != profile.digest:
+        raise ModelIncompatibleError(
+            "The active indexed model digest does not match its embedding profile."
+        )
+    profile_version = profile.default_index_version
+    selected_version = version or profile_version
+    if selected_version is None:
+        raise ModelIncompatibleError(
+            "The active indexed embedding profile has no index version."
+        )
+    return (
+        profile.model,
+        profile.digest,
+        profile.dimensions,
+        selected_version,
+    )
+
+
+async def _embed_queries(
+    gateway: Any | None,
+    profile: ModelProfile,
+    queries: Sequence[str],
+) -> tuple[tuple[float, ...], ...]:
+    dimensions = profile.dimensions
+    assert dimensions is not None
+    embed = getattr(gateway, "embed", None)
+    if not callable(embed):
+        raise ModelIncompatibleError(
+            "The configured gateway cannot embed retrieval queries for the active index."
+        )
+    result = embed(
+        profile.model,
+        tuple(queries),
+        dimensions=dimensions,
+        truncate=False,
+    )
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, Sequence) or isinstance(result, (str, bytes)):
+        raise ModelIncompatibleError(
+            "The embedding gateway returned invalid retrieval query vectors."
+        )
+    if len(result) != len(queries):
+        raise ModelIncompatibleError(
+            "The embedding gateway did not return one vector per retrieval query."
+        )
+    vectors: list[tuple[float, ...]] = []
+    for raw_vector in result:
+        if not isinstance(raw_vector, Sequence) or isinstance(
+            raw_vector,
+            (str, bytes),
+        ):
+            raise ModelIncompatibleError(
+                "The embedding gateway returned an invalid retrieval query vector."
+            )
+        vector = tuple(float(value) for value in raw_vector)
+        if len(vector) != dimensions:
+            raise ModelIncompatibleError(
+                "The retrieval query embedding dimensions do not match the active index."
+            )
+        vectors.append(vector)
+    return tuple(vectors)
+
+
+def _evidence_identity(evidence: Sequence[SearchResult]) -> str:
+    canonical = json.dumps(
+        [
+            {
+                "path": result.file_path,
+                "chunk_id": result.chunk_id,
+                "text": [
+                    section.snippet for section in result.matched_sections
+                ],
+            }
+            for result in evidence
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_session_identity(
+    session_id: str | None,
+    conversation_id: str | None,
+) -> str:
+    for identity in (session_id, conversation_id):
+        if identity is not None and (
+            not isinstance(identity, str) or not identity.strip()
+        ):
+            raise ValueError(
+                "A nonempty conversation or session identity is required."
+            )
+    if session_id is not None and conversation_id is not None:
+        if session_id != conversation_id:
+            raise ValueError(
+                "session_id and conversation_id must identify the same conversation."
+            )
+        conversation_id = None
+    selected = session_id or conversation_id or "default"
+    return selected.strip()
 
 
 def answer_question(
@@ -618,7 +986,9 @@ def _answer_messages(
             "content": (
                 "Answer only from the indexed evidence below. Return JSON only in the "
                 "requested schema. Every factual claim must include one or more chunk_ids "
-                "from the evidence. Never invent chunk IDs, citations, facts, or files. "
+                "and an evidence_quote copied exactly from the cited chunk text. The claim "
+                "must be directly supported by that quote. Never invent chunk IDs, quotes, "
+                "citations, facts, or files. "
                 f'If the evidence is insufficient, answer "{NOT_FOUND_ANSWER}" with no '
                 "claims."
             ),
@@ -806,4 +1176,5 @@ __all__ = (
     "answer_question",
     "answer_question_async",
     "execute_search_plan",
+    "execute_search_plan_async",
 )

@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Mapping, Sequence
 import json
 from typing import Any
@@ -16,6 +17,7 @@ from file_tagger.rag.service import (
     UncitedAnswerError,
     answer_question,
     execute_search_plan,
+    execute_search_plan_async,
 )
 from file_tagger.search.results import SearchResult, make_result
 
@@ -96,6 +98,7 @@ def test_structured_claim_resolves_to_known_evidence() -> None:
                 "claims": [
                     {
                         "text": "A dragon guards the flooded temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
                         "chunk_ids": [evidence[0].chunk_id],
                     }
                 ],
@@ -113,6 +116,7 @@ def test_structured_claim_resolves_to_known_evidence() -> None:
     assert answer.claims[0].chunk_ids == (evidence[0].chunk_id,)
     assert answer.citations == (citation,)
     assert '"chunk_ids"' in json.dumps(fake_model.chat_calls[0]["schema"])
+    assert '"evidence_quote"' in json.dumps(fake_model.chat_calls[0]["schema"])
     assert "claims" in fake_model.chat_calls[0]["schema"]["required"]
 
 
@@ -124,6 +128,7 @@ def test_structured_claim_referencing_unknown_chunk_is_rejected() -> None:
                 "claims": [
                     {
                         "text": "A dragon guards the temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
                         "chunk_ids": ["invented"],
                     }
                 ],
@@ -144,6 +149,7 @@ def test_structured_answer_with_invented_source_marker_is_rejected() -> None:
                 "claims": [
                     {
                         "text": "A dragon guards the temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
                         "chunk_ids": [evidence[0].chunk_id],
                     }
                 ],
@@ -167,6 +173,7 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
                 "claims": [
                     {
                         "text": "A dragon guards the temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
                         "chunk_ids": [evidence[0].chunk_id],
                     }
                 ],
@@ -181,6 +188,125 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     )
 
     assert answer.citations == evidence[0].citations
+
+
+def test_structured_claim_without_verifiable_quote_is_rejected() -> None:
+    evidence = _evidence()
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "A dragon guards the flooded temple.",
+                "claims": [
+                    {
+                        "text": "A dragon guards the flooded temple.",
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="evidence quote"):
+        answer_question("Find suitable encounters", evidence, gateway=fake_model)
+
+
+def test_structured_claim_with_quote_not_in_cited_chunk_is_rejected() -> None:
+    evidence = _evidence()
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "A dragon guards the flooded temple.",
+                "claims": [
+                    {
+                        "text": "A dragon guards the flooded temple.",
+                        "evidence_quote": "The dragon has three heads.",
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="quoted span"):
+        answer_question("Find suitable encounters", evidence, gateway=fake_model)
+
+
+def test_structured_claim_unrelated_to_quoted_span_is_rejected() -> None:
+    evidence = _evidence()
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The moon is a silver coin.",
+                "claims": [
+                    {
+                        "text": "The moon is a silver coin.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("Describe the moon", evidence, gateway=fake_model)
+
+
+def test_structured_answer_cannot_append_an_uncited_claim() -> None:
+    evidence = _evidence()
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": (
+                    "A dragon guards the flooded temple. "
+                    "The moon is a silver coin."
+                ),
+                "claims": [
+                    {
+                        "text": "A dragon guards the flooded temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="unsupported"):
+        answer_question("Summarize the evidence", evidence, gateway=fake_model)
+
+
+def test_structured_claim_cannot_change_a_fact_in_the_quoted_span() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\release.md",
+                "stable_id": "release-date",
+                "page_number": 1,
+                "text": "The release is scheduled for July 4, 2026.",
+            },
+            source="hybrid",
+            rank=1,
+            score=0.9,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The release is scheduled for August 2, 2026.",
+                "claims": [
+                    {
+                        "text": "The release is scheduled for August 2, 2026.",
+                        "evidence_quote": "The release is scheduled for July 4, 2026.",
+                        "chunk_ids": ["release-date"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("When is the release?", evidence, gateway=fake_model)
 
 
 def test_empty_evidence_returns_not_found_without_model_call() -> None:
@@ -200,6 +326,38 @@ class FakeSearch:
         self.queries: list[str] = []
 
     def search(self, query: str, limit: int = 10) -> tuple[SearchResult, ...]:
+        self.queries.append(query)
+        return tuple(self.by_query.get(query, ()))[:limit]
+
+
+class HybridRecordingSearch(FakeSearch):
+    def __init__(
+        self,
+        by_query: Mapping[str, Sequence[SearchResult]],
+        profile: ModelProfile,
+    ) -> None:
+        super().__init__(by_query)
+        self.embedding_profile = profile
+        self.calls: list[dict[str, Any]] = []
+
+    def search(
+        self,
+        query: str,
+        query_embedding: Sequence[float] | None = None,
+        *,
+        limit: int = 10,
+        model_digest: str | None = None,
+        index_version: str | None = None,
+    ) -> tuple[SearchResult, ...]:
+        self.calls.append(
+            {
+                "query": query,
+                "embedding": tuple(query_embedding or ()),
+                "limit": limit,
+                "model_digest": model_digest,
+                "index_version": index_version,
+            }
+        )
         self.queries.append(query)
         return tuple(self.by_query.get(query, ()))[:limit]
 
@@ -238,6 +396,79 @@ def test_search_plan_subqueries_are_merged_and_diversified() -> None:
     assert len({result.chunk_id for result in evidence}) == len(evidence)
 
 
+def test_search_plan_executes_exact_terms_and_paraphrases_as_hybrid() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:indexed",
+        context_length=32_768,
+        dimensions=3,
+        capabilities=("embedding",),
+    )
+    exact = _result("exact", r"C:\campaign\exact.md", 1, 0.9)
+    paraphrase = _result("semantic", r"C:\campaign\semantic.md", 1, 0.8)
+    search = HybridRecordingSearch(
+        {"flooded temple": (exact,), "temple guardians": (paraphrase,)},
+        profile,
+    )
+
+    class EmbeddingGateway:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[str, ...], int | None]] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            del truncate, keep_alive
+            queries = (text,) if isinstance(text, str) else tuple(text)
+            self.calls.append((model, queries, dimensions))
+            return tuple((float(index), 1.0, 0.5) for index, _ in enumerate(queries))
+
+    gateway = EmbeddingGateway()
+    plan = SearchPlan(
+        question="Find temple guardians",
+        intent_names=("encounters",),
+        exact_terms=("flooded temple",),
+        paraphrase_queries=("temple guardians", "flooded temple"),
+        evidence_categories=("encounters",),
+    )
+
+    evidence = asyncio.run(
+        execute_search_plan_async(
+            plan,
+            search,
+            embedding_gateway=gateway,
+            per_query_limit=4,
+            limit=3,
+        )
+    )
+
+    assert [result.chunk_id for result in evidence] == ["exact", "semantic"]
+    assert gateway.calls == [
+        (
+            "embeddinggemma-2:270m",
+            ("flooded temple", "temple guardians"),
+            3,
+        )
+    ]
+    assert [call["query"] for call in search.calls] == [
+        "flooded temple",
+        "temple guardians",
+    ]
+    assert all(call["embedding"] for call in search.calls)
+    assert all(call["model_digest"] == "sha256:indexed" for call in search.calls)
+    assert all(
+        call["index_version"] == profile.default_index_version
+        for call in search.calls
+    )
+
+
 def test_optional_rerank_uses_bounded_structured_chat() -> None:
     evidence = (
         _result("first", r"C:\campaign\first.md", 1, 0.9),
@@ -246,10 +477,11 @@ def test_optional_rerank_uses_bounded_structured_chat() -> None:
     fake_model = FakeModel(
         json.dumps(
             {
-                "answer": "Second comes first.",
+                "answer": "Evidence from second.",
                 "claims": [
                     {
-                        "text": "Second comes first.",
+                        "text": "Evidence from second.",
+                        "evidence_quote": "Evidence from second.",
                         "chunk_ids": ["second"],
                     }
                 ],
@@ -338,9 +570,13 @@ def test_context_rejection_retries_with_less_evidence() -> None:
     model = OverflowThenSucceed(
         json.dumps(
             {
-                "answer": "The first chunk is relevant.",
+                "answer": "Evidence from chunk-0.",
                 "claims": [
-                    {"text": "The first chunk is relevant.", "chunk_ids": ["chunk-0"]}
+                    {
+                        "text": "Evidence from chunk-0.",
+                        "evidence_quote": "Evidence from chunk-0.",
+                        "chunk_ids": ["chunk-0"],
+                    }
                 ],
             }
         )
@@ -384,10 +620,11 @@ def test_context_rejection_reduces_already_budgeted_evidence_again() -> None:
     model = BudgetOverflow(
         json.dumps(
             {
-                "answer": "The first budgeted chunk is relevant.",
+                "answer": "Evidence from budgeted-0.",
                 "claims": [
                     {
-                        "text": "The first budgeted chunk is relevant.",
+                        "text": "Evidence from budgeted-0.",
+                        "evidence_quote": "Evidence from budgeted-0.",
                         "chunk_ids": ["budgeted-0"],
                     }
                 ],
@@ -412,7 +649,7 @@ def test_context_rejection_reduces_already_budgeted_evidence_again() -> None:
     assert len(second_chunk_ids) < len(first_chunk_ids)
 
 
-def test_follow_up_reuses_evidence_for_unchanged_question_and_context() -> None:
+def test_follow_up_reuses_evidence_for_changed_question_and_same_retrieval_context() -> None:
     evidence = _evidence()
     search = FakeSearch({"initial": evidence})
 
@@ -434,6 +671,7 @@ def test_follow_up_reuses_evidence_for_unchanged_question_and_context() -> None:
                 "claims": [
                     {
                         "text": "A dragon guards the flooded temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
                         "chunk_ids": ["dragon-encounter"],
                     }
                 ],
@@ -442,8 +680,16 @@ def test_follow_up_reuses_evidence_for_unchanged_question_and_context() -> None:
     )
     service = RagService(search=search, gateway=model, planner=FakePlanner())
 
-    service.answer_question("initial", markdown_context="# Encounter")
-    service.answer_question("initial", markdown_context="# Encounter")
+    service.answer_question(
+        "initial",
+        markdown_context="# Encounter",
+        session_id="conversation-1",
+    )
+    service.answer_question(
+        "What guards it?",
+        markdown_context="# Encounter",
+        session_id="conversation-1",
+    )
 
     assert search.queries == ["initial"]
     assert len(model.chat_calls) == 2
@@ -451,6 +697,297 @@ def test_follow_up_reuses_evidence_for_unchanged_question_and_context() -> None:
         model.chat_calls[1]["messages"][-2]["content"]
     )
     assert "# Encounter" in model.chat_calls[0]["messages"][-1]["content"]
+
+
+def test_session_retrieval_context_change_invalidates_evidence_and_history() -> None:
+    first = _result("first", r"C:\campaign\first.md", 1, 0.9)
+    second = _result("second", r"C:\campaign\second.md", 1, 0.9)
+    search = FakeSearch({"initial": (first,), "later": (second,)})
+
+    class FakePlanner:
+        async def __call__(
+            self,
+            question: str,
+            markdown_context: str,
+            *,
+            gateway: FakeModel,
+        ) -> SearchPlan:
+            del markdown_context, gateway
+            return _plan(question)
+
+    class ContextModel(FakeModel):
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            self.chat_calls.append(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "schema": schema,
+                    "keep_alive": keep_alive,
+                }
+            )
+            prompt = messages[-1]["content"]
+            chunk_id = "first" if '"first"' in prompt else "second"
+            return json.dumps(
+                {
+                    "answer": f"Evidence from {chunk_id}.",
+                    "claims": [
+                        {
+                            "text": f"Evidence from {chunk_id}.",
+                            "evidence_quote": f"Evidence from {chunk_id}.",
+                            "chunk_ids": [chunk_id],
+                        }
+                    ],
+                }
+            )
+
+    model = ContextModel("")
+    service = RagService(search=search, gateway=model, planner=FakePlanner())
+
+    service.answer_question(
+        "initial",
+        markdown_context="# First",
+        session_id="conversation-1",
+    )
+    service.answer_question(
+        "later",
+        markdown_context="# Second",
+        session_id="conversation-1",
+    )
+
+    assert search.queries == ["initial", "later"]
+    assert "first" not in json.dumps(model.chat_calls[-1]["messages"][:-1])
+
+
+def test_session_index_profile_change_invalidates_reused_evidence() -> None:
+    profile_v1 = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:index-v1",
+        context_length=32_768,
+        dimensions=3,
+        capabilities=("embedding",),
+    )
+    profile_v2 = profile_v1.model_copy(update={"digest": "sha256:index-v2"})
+    first = _result("first", r"C:\campaign\first.md", 1, 0.9)
+    second = _result("second", r"C:\campaign\second.md", 1, 0.9)
+    search = HybridRecordingSearch(
+        {"initial": (first,), "follow-up": (second,)},
+        profile_v1,
+    )
+
+    class FakePlanner:
+        async def __call__(
+            self,
+            question: str,
+            markdown_context: str,
+            *,
+            gateway: FakeModel,
+        ) -> SearchPlan:
+            del markdown_context, gateway
+            return _plan(question)
+
+    class IndexedGateway(FakeModel):
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            del model, dimensions, truncate, keep_alive
+            queries = (text,) if isinstance(text, str) else tuple(text)
+            return tuple((0.1, 0.2, 0.3) for _ in queries)
+
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            self.chat_calls.append(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "schema": schema,
+                    "keep_alive": keep_alive,
+                }
+            )
+            prompt = messages[-1]["content"]
+            chunk_id = "first" if '"first"' in prompt else "second"
+            return json.dumps(
+                {
+                    "answer": f"Evidence from {chunk_id}.",
+                    "claims": [
+                        {
+                            "text": f"Evidence from {chunk_id}.",
+                            "evidence_quote": f"Evidence from {chunk_id}.",
+                            "chunk_ids": [chunk_id],
+                        }
+                    ],
+                }
+            )
+
+    model = IndexedGateway("")
+    service = RagService(search=search, gateway=model, planner=FakePlanner())
+
+    service.answer_question("initial", session_id="conversation-1")
+    search.embedding_profile = profile_v2
+    service.answer_question("follow-up", session_id="conversation-1")
+
+    assert search.queries == ["initial", "follow-up"]
+    assert search.calls[-1]["model_digest"] == "sha256:index-v2"
+    assert search.calls[-1]["index_version"] == profile_v2.default_index_version
+    assert "first" not in json.dumps(model.chat_calls[-1]["messages"][:-1])
+
+
+def test_explicit_retrieval_question_change_invalidates_reused_session() -> None:
+    first = _result("first", r"C:\campaign\first.md", 1, 0.9)
+    second = _result("second", r"C:\campaign\second.md", 1, 0.9)
+    search = FakeSearch({"initial": (first,), "replacement": (second,)})
+
+    class FakePlanner:
+        async def __call__(
+            self,
+            question: str,
+            markdown_context: str,
+            *,
+            gateway: FakeModel,
+        ) -> SearchPlan:
+            del markdown_context, gateway
+            return _plan(question)
+
+    model = FakeModel(
+        json.dumps(
+            {
+                "answer": "Evidence from first.",
+                "claims": [
+                    {
+                        "text": "Evidence from first.",
+                        "evidence_quote": "Evidence from first.",
+                        "chunk_ids": ["first"],
+                    }
+                ],
+            }
+        )
+    )
+    service = RagService(search=search, gateway=model, planner=FakePlanner())
+
+    service.answer_question(
+        "What is relevant?",
+        retrieval_question="initial",
+        session_id="conversation-1",
+    )
+    model.response = json.dumps(
+        {
+            "answer": "Evidence from second.",
+            "claims": [
+                {
+                    "text": "Evidence from second.",
+                    "evidence_quote": "Evidence from second.",
+                    "chunk_ids": ["second"],
+                }
+            ],
+        }
+    )
+    service.answer_question(
+        "What changed?",
+        retrieval_question="replacement",
+        session_id="conversation-1",
+    )
+
+    assert search.queries == ["initial", "replacement"]
+    assert "first" not in json.dumps(model.chat_calls[-1]["messages"][:-1])
+
+
+def test_concurrent_follow_ups_cannot_mix_session_state() -> None:
+    evidence = _result("shared", r"C:\campaign\shared.md", 1, 0.9)
+    search = FakeSearch({"initial": (evidence,)})
+
+    class FakePlanner:
+        async def __call__(
+            self,
+            question: str,
+            markdown_context: str,
+            *,
+            gateway: FakeModel,
+        ) -> SearchPlan:
+            del markdown_context, gateway
+            return _plan(question)
+
+    class SerialModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__("")
+            self.active = 0
+            self.overlapped = False
+
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            self.active += 1
+            self.overlapped = self.overlapped or self.active > 1
+            await asyncio.sleep(0.01)
+            self.chat_calls.append(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "schema": schema,
+                    "keep_alive": keep_alive,
+                }
+            )
+            self.active -= 1
+            return json.dumps(
+                {
+                    "answer": "Evidence from shared.",
+                    "claims": [
+                        {
+                            "text": "Evidence from shared.",
+                            "evidence_quote": "Evidence from shared.",
+                            "chunk_ids": ["shared"],
+                        }
+                    ],
+                }
+            )
+
+    model = SerialModel()
+    service = RagService(search=search, gateway=model, planner=FakePlanner())
+
+    async def run() -> None:
+        await asyncio.gather(
+            service.answer_question_async(
+                "initial",
+                session_id="conversation-1",
+            ),
+            service.answer_question_async(
+                "What follows?",
+                session_id="conversation-1",
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert search.queries == ["initial"]
+    assert model.overlapped is False
+    assert len(model.chat_calls) == 2
+    assert any(
+        message.get("content") == "Evidence from shared."
+        for message in model.chat_calls[1]["messages"]
+    )
 
 
 def test_service_accepts_direct_evidence_as_second_argument() -> None:
@@ -461,6 +998,7 @@ def test_service_accepts_direct_evidence_as_second_argument() -> None:
                 "claims": [
                     {
                         "text": "A dragon guards the flooded temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
                         "chunk_ids": ["dragon-encounter"],
                     }
                 ],

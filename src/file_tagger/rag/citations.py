@@ -15,6 +15,7 @@ MAX_ANSWER_RESPONSE_BYTES = 64 * 1024
 
 class AnswerClaim(DomainRecord):
     text: str = Field(min_length=1)
+    evidence_quote: str = Field(min_length=1)
     chunk_ids: tuple[str, ...] = Field(min_length=1)
     citations: tuple[SearchCitation, ...] = Field(min_length=1)
 
@@ -51,6 +52,7 @@ RagAnswer: TypeAlias = CitedAnswer
 
 class StructuredClaim(DomainRecord):
     text: str = Field(min_length=1)
+    evidence_quote: str = Field(min_length=1)
     chunk_ids: tuple[str, ...] = Field(min_length=1)
 
 
@@ -146,12 +148,30 @@ def parse_cited_answer(
             raise UncitedAnswerError(
                 "The model answer contains a claim without retrieved evidence."
             )
+        if not any(
+            raw_claim.evidence_quote in citation.excerpt
+            for citation in resolved
+        ):
+            raise UncitedAnswerError(
+                "The model answer evidence quote is not an exact quoted span "
+                "from its cited chunk."
+            )
+        if not _claim_is_supported(raw_claim.text, raw_claim.evidence_quote):
+            raise UncitedAnswerError(
+                "The model answer contains a claim not supported by its evidence quote."
+            )
         claims.append(
             AnswerClaim(
                 text=raw_claim.text,
+                evidence_quote=raw_claim.evidence_quote,
                 chunk_ids=tuple(chunk_ids),
                 citations=tuple(resolved),
             )
+        )
+
+    if not _answer_is_supported(structured.answer, structured.claims):
+        raise UncitedAnswerError(
+            "The model answer contains text unsupported by its validated claims."
         )
 
     return CitedAnswer(
@@ -182,7 +202,18 @@ def _normalize_answer_payload(raw: Mapping[Any, Any]) -> dict[str, Any]:
             references = item.get("citation_ids", item.get("citations"))
         if isinstance(references, str):
             references = [references]
-        claims.append({"text": text, "chunk_ids": references})
+        evidence_quote = item.get("evidence_quote", item.get("quote"))
+        if not isinstance(evidence_quote, str) or not evidence_quote:
+            raise UncitedAnswerError(
+                "Each structured answer claim requires a verifiable evidence quote."
+            )
+        claims.append(
+            {
+                "text": text,
+                "evidence_quote": evidence_quote,
+                "chunk_ids": references,
+            }
+        )
     return {"answer": answer, "claims": claims}
 
 
@@ -196,6 +227,123 @@ def _citation_indexes(
             by_chunk[citation.chunk_id] = citation
             by_citation[citation.citation_id] = citation
     return by_chunk, by_citation
+
+
+def _normalized_words(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[^\W_]+(?:[-'][^\W_]+)?", value.casefold()))
+
+
+def _claim_is_supported(claim: str, quote: str) -> bool:
+    claim_words = _normalized_words(claim)
+    quote_words = _normalized_words(quote)
+    if not claim_words or not quote_words:
+        return False
+    normalized_claim = " ".join(claim_words)
+    normalized_quote = " ".join(quote_words)
+    if normalized_quote in normalized_claim or normalized_claim in normalized_quote:
+        return True
+
+    claim_numbers = {word for word in claim_words if any(char.isdigit() for char in word)}
+    quote_numbers = {word for word in quote_words if any(char.isdigit() for char in word)}
+    if not claim_numbers <= quote_numbers:
+        return False
+    calendar_terms = {
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    }
+    claim_dates = set(claim_words) & calendar_terms
+    if not claim_dates <= set(quote_words):
+        return False
+    negations = {"no", "not", "never", "without"}
+    if bool(set(claim_words) & negations) != bool(set(quote_words) & negations):
+        return False
+
+    stop_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "with",
+    }
+    claim_terms = set(claim_words) - stop_words
+    quote_terms = set(quote_words) - stop_words
+    if not claim_terms or not quote_terms:
+        return False
+    return _canonical_terms(claim_terms) <= _canonical_terms(quote_terms)
+
+
+def _canonical_terms(words: set[str]) -> set[str]:
+    normalized: set[str] = set()
+    for word in words:
+        candidate = word
+        if len(candidate) > 5 and candidate.endswith("ing"):
+            candidate = candidate[:-3]
+        elif len(candidate) > 4 and candidate.endswith("ed"):
+            candidate = candidate[:-2]
+        elif len(candidate) > 3 and candidate.endswith("s"):
+            candidate = candidate[:-1]
+        normalized.add(candidate)
+    return normalized
+
+
+def _answer_is_supported(
+    answer: str,
+    claims: Sequence[StructuredClaim],
+) -> bool:
+    if not claims:
+        return False
+    answer_without_markers = re.sub(
+        r"\[source:\s*[^\]]+?\s*\]",
+        "",
+        answer,
+        flags=re.IGNORECASE,
+    )
+    answer_parts = [
+        part
+        for part in re.split(
+            r"(?<=[.!?])\s+|\n+",
+            answer_without_markers.strip(),
+        )
+        if part.strip()
+    ]
+    return bool(answer_parts) and all(
+        any(_claim_is_supported(part, claim.text) for claim in claims)
+        for part in answer_parts
+    )
 
 
 __all__ = (

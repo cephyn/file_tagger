@@ -70,6 +70,18 @@ class HybridSearch:
         self._index_version = index_version
         self._profile = embedding_profile or profile
 
+    @property
+    def embedding_profile(self) -> ModelProfile | None:
+        return self._profile
+
+    @property
+    def model_digest(self) -> str | None:
+        return self._model_digest
+
+    @property
+    def index_version(self) -> str | None:
+        return self._index_version
+
     def search(
         self,
         query: str,
