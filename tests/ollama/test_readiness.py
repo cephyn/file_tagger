@@ -18,6 +18,7 @@ class FakeGateway:
         unavailable_model: str | None = None,
         incompatible_model: str | None = None,
         latency: float = 10.0,
+        installed_models: tuple[str, ...] = (),
     ) -> None:
         self.base_readiness = readiness or OllamaReadiness(
             available=True,
@@ -27,7 +28,11 @@ class FakeGateway:
         self.unavailable_model = unavailable_model
         self.incompatible_model = incompatible_model
         self.latency = latency
+        self.installed_models = installed_models
         self.host = self.base_readiness.base_url
+
+    async def list_models(self):
+        return self.installed_models
 
     async def readiness(self, required_models):
         missing = tuple(
@@ -164,6 +169,31 @@ def test_successful_readiness_has_all_profiles() -> None:
         "embedding",
         "decision",
         "generation",
+    }
+
+
+def test_readiness_includes_full_compatible_installed_catalog_by_role() -> None:
+    report = asyncio.run(
+        OllamaReadinessService(
+            FakeGateway(
+                installed_models=(
+                    "embeddinggemma-2:270m",
+                    "embeddinggemma-2:440m",
+                    "nimble:9b",
+                    "tev1:4b",
+                    "gemma4:e4b",
+                    "gemma4:e2b",
+                )
+            )
+        ).check(required_models())
+    )
+
+    assert {
+        (profile.role, profile.model) for profile in report.profiles
+    } >= {
+        ("embedding", "embeddinggemma-2:440m"),
+        ("decision", "tev1:4b"),
+        ("generation", "gemma4:e2b"),
     }
 
 

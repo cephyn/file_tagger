@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy import select, text
 import pytest
 
-from file_tagger.domain.contracts import ModelProfile
+from file_tagger.domain.contracts import HardwareReport, ModelProfile
 from file_tagger.extraction.docling_adapter import ExtractedDocument, ExtractedPage
 from file_tagger.indexing.repository import IndexingRepository
 from file_tagger.indexing.service import IndexingService
@@ -22,6 +22,8 @@ from file_tagger.modern_context import (
     initialize_modern_runtime,
 )
 from file_tagger.persistence.models import File, FileTag, Tag
+from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
+from file_tagger.domain.contracts import OllamaReadiness
 
 
 def _create_legacy_database(path: Path) -> None:
@@ -770,6 +772,141 @@ def test_readiness_thread_does_not_block_runtime_initialization(
 
     assert runtime is not None
     assert started == [True]
+
+
+def test_runtime_persists_model_selections_and_refreshes(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, object())  # type: ignore[arg-type]
+    refreshed: list[RequiredModels | None] = []
+    profiles = (
+        ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:440m",
+            digest="embedding",
+            context_length=8192,
+            dimensions=512,
+            capabilities=("embedding",),
+        ),
+        ModelProfile(
+            role="decision",
+            model="tev1:4b",
+            digest="decision",
+            context_length=8192,
+            capabilities=("systemone",),
+        ),
+        ModelProfile(
+            role="generation",
+            model="gemma4:e2b",
+            digest="generation",
+            context_length=8192,
+            capabilities=("completion",),
+        ),
+    )
+    runtime.readiness = ReadinessReport(
+        ready=True,
+        profiles=profiles,
+        ollama=OllamaReadiness(
+            available=True,
+            version="0.35.0",
+            base_url="http://127.0.0.1:11434",
+        ),
+    )
+
+    def start_readiness():
+        refreshed.append(runtime.required_models)
+        return None
+
+    monkeypatch.setattr(runtime, "start_readiness", start_readiness)
+    selected = {
+        "embedding": "embeddinggemma-2:440m",
+        "decision": "tev1:4b",
+        "generation": "gemma4:e2b",
+    }
+
+    runtime.apply_model_selections(selected)
+    restarted = ModernRuntime(paths, object())  # type: ignore[arg-type]
+
+    assert refreshed == [
+        RequiredModels(
+            embedding="embeddinggemma-2:440m",
+            decision="tev1:4b",
+            generation="gemma4:e2b",
+        )
+    ]
+    assert restarted.model_overrides == selected
+
+
+def test_runtime_readiness_completion_ignores_stale_overlapping_result(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, object())  # type: ignore[arg-type]
+    started = (Event(), Event())
+    release = (Event(), Event())
+    call_count = 0
+    callbacks: list[ReadinessReport | None] = []
+
+    hardware = HardwareReport(
+        cpu_architecture="AMD64",
+        logical_processors=8,
+        total_ram_bytes=32 * 1024**3,
+        available_ram_bytes=24 * 1024**3,
+        available_disk_bytes=100 * 1024**3,
+    )
+    monkeypatch.setattr(
+        "file_tagger.modern_context.profile_hardware",
+        lambda: hardware,
+    )
+    monkeypatch.setattr(
+        "file_tagger.modern_context.IndexingService",
+        lambda *args, **kwargs: object(),
+    )
+
+    async def check_readiness(gateway, required):
+        nonlocal call_count
+        call_index = call_count
+        call_count += 1
+        started[call_index].set()
+        release[call_index].wait()
+        return ReadinessReport(
+            ready=True,
+            profiles=(
+                ModelProfile(
+                    role="embedding",
+                    model=required.embedding,
+                    digest=f"embedding-{call_index}",
+                    context_length=8192,
+                    dimensions=768,
+                    capabilities=("embedding",),
+                ),
+            ),
+            ollama=OllamaReadiness(
+                available=True,
+                version="0.35.0",
+                base_url="http://127.0.0.1:11434",
+            ),
+            selected_models=required,
+            warnings=(f"result-{call_index}",),
+        )
+
+    monkeypatch.setattr(runtime, "_check_readiness", check_readiness)
+
+    first = runtime.start_readiness(callbacks.append)
+    assert started[0].wait(2)
+    second = runtime.start_readiness(callbacks.append)
+    assert started[1].wait(2)
+
+    release[1].set()
+    assert second.result(timeout=2) is runtime.readiness
+    release[0].set()
+    assert first.result(timeout=2) is None
+
+    assert runtime.readiness is not None
+    assert runtime.readiness.warnings == ("result-1",)
+    assert callbacks[-1] is None
+    assert any(report and report.warnings == ("result-1",) for report in callbacks)
 
 
 def test_initialization_worker_exposes_modern_runtime_to_login(

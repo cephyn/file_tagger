@@ -51,6 +51,7 @@ class ReadinessReport(BaseModel):
     ollama: OllamaReadiness | None = None
     hardware: HardwareReport | None = None
     recommendation: ModelRecommendation | None = None
+    selected_models: RequiredModels | None = None
 
 
 def _cloud_model(model: str) -> bool:
@@ -159,6 +160,17 @@ class OllamaReadinessService:
                     f"({benchmark.elapsed_ms:.0f} ms)."
                 )
 
+        catalog_profiles = await self._compatible_installed_profiles()
+        known_profiles = {
+            (profile.role, profile.model, profile.digest)
+            for profile in profiles
+        }
+        for profile in catalog_profiles:
+            identity = (profile.role, profile.model, profile.digest)
+            if identity not in known_profiles:
+                profiles.append(profile)
+                known_profiles.add(identity)
+
         if self.session is not None:
             self._persist_profiles(profiles, benchmarks)
 
@@ -171,7 +183,30 @@ class OllamaReadinessService:
             profiles=tuple(profiles),
             benchmarks=tuple(benchmarks),
             ollama=gateway_report,
+            selected_models=required,
         )
+
+    async def _compatible_installed_profiles(self) -> list[ModelProfile]:
+        list_models = getattr(self.gateway, "list_models", None)
+        if not callable(list_models):
+            return []
+        try:
+            installed_models = await list_models()
+        except OllamaUnavailableError:
+            return []
+
+        profiles: list[ModelProfile] = []
+        for model in installed_models:
+            if _cloud_model(model):
+                continue
+            for role in ROLE_FEATURES:
+                try:
+                    profiles.append(await self.gateway.model_profile(role, model))
+                except (ModelMissingError, ModelIncompatibleError):
+                    continue
+                except OllamaUnavailableError:
+                    break
+        return profiles
 
     def _persist_profiles(
         self,
@@ -180,7 +215,9 @@ class OllamaReadinessService:
     ) -> None:
         if self.session is None:
             return
-        benchmark_by_role = {result.role: result for result in benchmarks}
+        benchmark_by_model = {
+            (result.role, result.model): result for result in benchmarks
+        }
         for profile in profiles:
             record = self.session.scalar(
                 select(ModelProfileRecord).where(
@@ -190,7 +227,7 @@ class OllamaReadinessService:
                     ModelProfileRecord.dimensions == profile.dimensions,
                 )
             )
-            benchmark = benchmark_by_role.get(profile.role)
+            benchmark = benchmark_by_model.get((profile.role, profile.model))
             index_version = (
                 f"{profile.model}@{profile.digest}:{profile.dimensions}"
                 if profile.role == "embedding"

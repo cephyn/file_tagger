@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass
+import json
 import logging
 import os
 from pathlib import Path
@@ -23,6 +25,7 @@ from .infrastructure.database import create_session_factory, upgrade_database
 from .migration.config_migration import ConfigMigrationReport, migrate_legacy_config
 from .migration.sqlite_migration import LegacyMigrationReport, migrate_legacy_sqlite
 from .ollama.hardware import profile_hardware
+from .domain.errors import ModelRecommendationError
 from .ollama.model_recommender import ModelRecommendation, recommend_models
 from .ollama.readiness import OllamaReadinessService, ReadinessReport, RequiredModels
 from .persistence.models import File, FileTag, Tag
@@ -32,6 +35,7 @@ from .persistence.vector_cleanup import delete_file_embeddings
 logger = logging.getLogger("ModernRuntime")
 SessionFactory: TypeAlias = sessionmaker[Session]
 TagData = tuple[str, str | None]
+ReadinessCallback = Callable[[ReadinessReport | None], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +95,8 @@ class ModernRuntime:
         self._index_worker: threading.Thread | None = None
         self._lock = threading.Lock()
         self._unavailable_reason = unavailable_reason
+        self._readiness_generation = 0
+        self._model_overrides = self._load_model_overrides()
 
     @property
     def unavailable_reason(self) -> str:
@@ -127,29 +133,126 @@ class ModernRuntime:
             return None
         return str(self.required_models.decision)
 
-    def start_readiness(self) -> None:
+    @property
+    def model_overrides(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._model_overrides)
+
+    def start_readiness(
+        self,
+        on_complete: ReadinessCallback | None = None,
+    ) -> Future[ReadinessReport | None]:
+        completion: Future[ReadinessReport | None] = Future()
         if self.session_factory is None:
-            return
+            completion.set_result(None)
+            self._notify_readiness_complete(on_complete, None)
+            return completion
+        with self._lock:
+            self._readiness_generation += 1
+            generation = self._readiness_generation
         thread = threading.Thread(
             target=self._initialize_readiness,
+            args=(generation, completion, on_complete),
             name="file-tagger-ollama-readiness",
             daemon=True,
         )
-        self._readiness_thread = thread
+        with self._lock:
+            self._readiness_thread = thread
         thread.start()
+        return completion
 
-    def _initialize_readiness(self) -> None:
+    def apply_model_selections(
+        self,
+        selections: Mapping[str, str | None],
+    ) -> Future[ReadinessReport | None]:
+        allowed_roles = {"embedding", "decision", "generation"}
+        unknown_roles = set(selections).difference(allowed_roles)
+        if unknown_roles:
+            raise ValueError(f"Unknown Ollama model roles: {sorted(unknown_roles)}")
+
+        with self._lock:
+            updated = dict(self._model_overrides)
+            report = self.readiness
+            catalog = {
+                role: {
+                    profile.model
+                    for profile in report.profiles
+                    if profile.role == role
+                }
+                for role in allowed_roles
+            } if report is not None else {}
+            required_models = self.required_models
+
+        for role in allowed_roles:
+            if role not in selections:
+                continue
+            model = selections[role]
+            if model is None:
+                updated.pop(role, None)
+                continue
+            normalized = model.strip()
+            if not normalized:
+                raise ValueError(f"A model is required for the {role} role.")
+            if any(
+                marker in normalized.lower()
+                for marker in (":cloud", "-cloud", "cloud:", ".cloud")
+            ):
+                raise ValueError("Cloud-hosted model variants are not supported.")
+            if role in catalog and catalog[role] and normalized not in catalog[role]:
+                raise ValueError(
+                    f"Model {normalized} is not a compatible installed {role} model."
+                )
+            updated[role] = normalized
+
+        base_models = (
+            required_models.as_mapping()
+            if required_models is not None
+            else {}
+        )
+        base_models.update(updated)
+        selected = (
+            RequiredModels.model_validate(base_models)
+            if set(base_models) == allowed_roles
+            else None
+        )
+        self._save_model_overrides(updated)
+        with self._lock:
+            self._model_overrides = updated
+            self.required_models = selected
+            self._indexing_service = None
+        return self.start_readiness()
+
+    def _initialize_readiness(
+        self,
+        generation: int,
+        completion: Future[ReadinessReport | None],
+        on_complete: ReadinessCallback | None,
+    ) -> None:
+        report: ReadinessReport | None = None
         gateway = OllamaGateway()
         try:
             hardware = profile_hardware()
-            recommendation = recommend_models(hardware)
-            required = _required_models(recommendation)
+            with self._lock:
+                overrides = dict(self._model_overrides)
+            try:
+                recommendation = recommend_models(
+                    hardware,
+                    embedding_override=overrides.get("embedding"),
+                    decision_override=overrides.get("decision"),
+                    generation_override=overrides.get("generation"),
+                )
+            except ModelRecommendationError:
+                recommendation = recommend_models(hardware)
+            recommended = _required_models(recommendation).as_mapping()
+            recommended.update(overrides)
+            required = RequiredModels.model_validate(recommended)
             report = asyncio.run(
                 self._check_readiness(gateway, required)
             ).model_copy(
                 update={
                     "hardware": hardware,
                     "recommendation": recommendation,
+                    "selected_models": required,
                 }
             )
             embedding_profile = None
@@ -159,6 +262,7 @@ class ModernRuntime:
                         profile
                         for profile in report.profiles
                         if profile.role == "embedding"
+                        and profile.model == required.embedding
                         and profile.dimensions in {256, 512, 768}
                     ),
                     None,
@@ -172,20 +276,25 @@ class ModernRuntime:
                     embedding_profile=embedding_profile,
                 )
             with self._lock:
-                self.required_models = required
-                self.readiness = report
-                self._indexing_service = indexing_service
-                self._unavailable_reason = None
+                if generation == self._readiness_generation:
+                    self.required_models = required
+                    self.readiness = report
+                    self._indexing_service = indexing_service
+                    self._unavailable_reason = None
+                else:
+                    report = None
             logger.info(
                 "Modern local-model readiness initialized (ready=%s, profiles=%d).",
-                report.ready,
-                len(report.profiles),
+                report.ready if report is not None else False,
+                len(report.profiles) if report is not None else 0,
             )
         except Exception as exc:
+            report = None
             with self._lock:
-                self._unavailable_reason = (
-                    f"{exc.__class__.__name__}: modern readiness is unavailable."
-                )
+                if generation == self._readiness_generation:
+                    self._unavailable_reason = (
+                        f"{exc.__class__.__name__}: modern readiness is unavailable."
+                    )
             logger.warning(
                 "Modern local-model readiness is unavailable (%s).",
                 exc.__class__.__name__,
@@ -195,6 +304,61 @@ class ModernRuntime:
                 asyncio.run(gateway.close())
             except Exception:
                 logger.debug("Closing the Ollama readiness client failed.")
+            if not completion.done():
+                completion.set_result(report)
+            self._notify_readiness_complete(on_complete, report)
+
+    @staticmethod
+    def _notify_readiness_complete(
+        callback: ReadinessCallback | None,
+        report: ReadinessReport | None,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(report)
+        except Exception:
+            logger.warning("A readiness completion callback failed.", exc_info=True)
+
+    @property
+    def _model_overrides_path(self) -> Path:
+        return self.paths.config_dir / "ollama-models.json"
+
+    def _load_model_overrides(self) -> dict[str, str]:
+        path = self._model_overrides_path
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            models = payload.get("models", payload)
+        except (OSError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(models, dict):
+            return {}
+        allowed_roles = {"embedding", "decision", "generation"}
+        loaded: dict[str, str] = {}
+        for role, model in models.items():
+            if role not in allowed_roles or not isinstance(model, str) or not model:
+                continue
+            if any(
+                marker in model.lower()
+                for marker in (":cloud", "-cloud", "cloud:", ".cloud")
+            ):
+                continue
+            loaded[role] = model
+        return loaded
+
+    def _save_model_overrides(self, models: Mapping[str, str]) -> None:
+        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+        path = self._model_overrides_path
+        replacement = path.with_suffix(f"{path.suffix}.tmp")
+        replacement.write_text(
+            json.dumps(
+                {"version": 1, "models": dict(models)},
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(replacement, path)
 
     async def _check_readiness(
         self,

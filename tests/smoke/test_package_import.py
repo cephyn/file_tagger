@@ -29,7 +29,14 @@ def test_search_chat_control_stays_disabled_after_results(
 
     vector_search = ModuleType("file_tagger.vector_search")
     vector_search.VectorSearch = object
+    content_extractor = ModuleType("file_tagger.vector_search.content_extractor")
+    content_extractor.ContentExtractor = object
     monkeypatch.setitem(sys.modules, "file_tagger.vector_search", vector_search)
+    monkeypatch.setitem(
+        sys.modules,
+        "file_tagger.vector_search.content_extractor",
+        content_extractor,
+    )
     sys.modules.pop("file_tagger.file_tag_manager", None)
     from file_tagger.file_tag_manager import FileTagManager
 

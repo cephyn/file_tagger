@@ -331,6 +331,104 @@ def test_provider_construction_does_not_start_refresh(qtbot) -> None:
     assert not dialog.ok_button.isEnabled()
 
 
+def test_refresh_callback_is_delivered_on_qt_event_loop(qtbot) -> None:
+    refreshed = _report(ready=True)
+
+    class Provider:
+        def __init__(self) -> None:
+            self.callbacks: list[Callable[[ReadinessReport], None]] = []
+            self.calls = 0
+
+        def start_readiness(
+            self, on_complete: Callable[[ReadinessReport], None]
+        ) -> None:
+            self.calls += 1
+            self.callbacks.append(on_complete)
+
+    provider = Provider()
+    dialog = OllamaSettingsDialog(
+        _report(),
+        runtime_refresh_provider=provider,
+    )
+    qtbot.addWidget(dialog)
+
+    qtbot.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+
+    assert provider.calls == 1
+    assert not dialog.refresh_button.isEnabled()
+    assert "refreshing" in dialog.refresh_button.text().lower()
+    provider.callbacks[0](refreshed)
+    qtbot.waitUntil(lambda: dialog.refresh_button.isEnabled())
+
+    assert dialog.ok_button.isEnabled()
+    assert dialog.selected_models()["decision"] == "nimble:9b"
+
+
+def test_stale_refresh_callback_cannot_replace_latest_report(qtbot) -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.callbacks: list[Callable[[ReadinessReport], None]] = []
+
+        def start_readiness(
+            self, on_complete: Callable[[ReadinessReport], None]
+        ) -> None:
+            self.callbacks.append(on_complete)
+
+    provider = Provider()
+    dialog = OllamaSettingsDialog(
+        _report(),
+        runtime_refresh_provider=provider,
+    )
+    qtbot.addWidget(dialog)
+
+    qtbot.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+    first = _report(ready=True).model_copy(
+        update={"warnings": ("first result",)}
+    )
+    provider.callbacks[0](first)
+    qtbot.waitUntil(lambda: dialog.refresh_button.isEnabled())
+    qtbot.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+    provider.callbacks[0](_report(ready=True).model_copy(
+        update={"warnings": ("stale result",)}
+    ))
+    qtbot.wait(20)
+    assert dialog._report is first
+
+    latest = _report(ready=True).model_copy(
+        update={"warnings": ("latest result",)}
+    )
+    provider.callbacks[1](latest)
+    qtbot.waitUntil(lambda: dialog.refresh_button.isEnabled())
+    assert dialog._report is latest
+
+
+def test_failed_refresh_callback_does_not_restore_previous_report(qtbot) -> None:
+    initial = _report(ready=True)
+
+    class Provider:
+        def __init__(self) -> None:
+            self.readiness = initial
+            self.unavailable_reason = "latest refresh failed"
+            self.callbacks: list[Callable[[ReadinessReport | None], None]] = []
+
+        def start_readiness(
+            self, on_complete: Callable[[ReadinessReport | None], None]
+        ) -> None:
+            self.callbacks.append(on_complete)
+
+    provider = Provider()
+    dialog = OllamaSettingsDialog(initial, runtime_refresh_provider=provider)
+    qtbot.addWidget(dialog)
+
+    qtbot.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+    provider.callbacks[0](None)
+    qtbot.waitUntil(lambda: dialog.refresh_button.isEnabled())
+
+    assert dialog._report is initial
+    assert not dialog.ok_button.isEnabled()
+    assert "latest refresh failed" in dialog.instructions.text()
+
+
 def _manager_module(monkeypatch):
     vector_search = ModuleType("file_tagger.vector_search")
     vector_search.VectorSearch = object
@@ -389,3 +487,38 @@ def test_manager_passes_runtime_readiness_to_dialog(qtbot, monkeypatch) -> None:
     assert captured["readiness"] is report
     assert captured["runtime_refresh_provider"] is runtime
     assert captured["parent"] is manager
+
+
+def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
+    module = _manager_module(monkeypatch)
+    manager = module.FileTagManager.__new__(module.FileTagManager)
+    QMainWindow.__init__(manager)
+    manager.logger = logging.getLogger("test-file-tagger-manager")
+    qtbot.addWidget(manager)
+    applied: list[dict[str, str | None]] = []
+    runtime = SimpleNamespace(
+        readiness=_report(ready=True),
+        apply_model_selections=applied.append,
+    )
+    manager.modern_runtime = runtime
+    selections = {
+        "embedding": "embeddinggemma-2:270m",
+        "decision": "nimble:9b",
+        "generation": "gemma4:e4b",
+    }
+
+    class Dialog:
+        def __init__(self, readiness, **kwargs) -> None:
+            self.readiness = readiness
+
+        def exec(self) -> int:
+            return int(module.QDialog.DialogCode.Accepted)
+
+        def selected_models(self) -> dict[str, str | None]:
+            return selections
+
+    monkeypatch.setattr(module, "OllamaSettingsDialog", Dialog)
+
+    manager.show_ollama_settings()
+
+    assert applied == [selections]

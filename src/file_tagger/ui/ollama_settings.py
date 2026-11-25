@@ -1,6 +1,10 @@
 from collections.abc import Callable
+from concurrent.futures import Future
+import inspect
+import queue
 from typing import Any
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -27,8 +31,10 @@ from ..ollama.readiness import ReadinessReport
 
 
 GIB = 1024**3
+_NO_REFRESH_RESULT = object()
 
 RefreshProvider = Callable[[], ReadinessReport | None]
+CompletionCallback = Callable[[ReadinessReport | None], None]
 
 
 def _gib(byte_count: int) -> str:
@@ -68,6 +74,17 @@ class OllamaSettingsDialog(QDialog):
         self._refresh_provider = (
             runtime_refresh_provider or refresh_provider
         )
+        self._completion_queue: queue.Queue[
+            tuple[int, ReadinessReport | None]
+        ] = queue.Queue()
+        self._refresh_generation = 0
+        self._refreshing = False
+        self._refresh_future: Future[ReadinessReport | None] | None = None
+        self._refresh_provider_report: ReadinessReport | None = None
+        self._refresh_observed_by_callback = False
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(50)
+        self._refresh_timer.timeout.connect(self._poll_refresh)
         self._build_ui()
         self.set_report(report)
 
@@ -209,11 +226,12 @@ class OllamaSettingsDialog(QDialog):
             )
         )
         self.ok_button.setEnabled(
-            report.ready
-            and valid_host
+            valid_host
             and version_value is not None
             and not outdated
+            and all(selector.isEnabled() for selector in self.model_selectors.values())
         )
+        self._set_refreshing(self._refreshing)
 
     def _hardware_text(self) -> str:
         hardware = self._hardware
@@ -344,7 +362,17 @@ class OllamaSettingsDialog(QDialog):
             )
             selector.addItems(installed or ("No compatible installed model",))
             selector.setEnabled(bool(installed))
-            if self._recommendation is not None and installed:
+            selected = (
+                self._report.selected_models.as_mapping()
+                if self._report.selected_models is not None
+                else {}
+            )
+            preferred = selected.get(role)
+            if preferred is not None and installed:
+                index = selector.findText(preferred)
+                if index >= 0:
+                    selector.setCurrentIndex(index)
+            elif self._recommendation is not None and installed:
                 recommended = getattr(self._recommendation, role).model
                 index = selector.findText(recommended)
                 if index >= 0:
@@ -361,30 +389,188 @@ class OllamaSettingsDialog(QDialog):
 
     def refresh(self) -> None:
         provider = self._refresh_provider
-        if provider is None:
+        if provider is None or self._refreshing:
             return
+        self._refresh_generation += 1
+        generation = self._refresh_generation
+        self._refresh_provider_report = self._provider_report(provider)
+        self._refresh_future = None
+        self._set_refreshing(True)
+
+        def callback(report: ReadinessReport | None) -> None:
+            self._completion_queue.put((generation, report))
+
         try:
-            callback = provider
-            if not callable(callback):
-                callback = (
+            operation = provider
+            if not callable(operation):
+                operation = (
                     getattr(provider, "refresh_readiness", None)
                     or getattr(provider, "start_readiness", None)
                 )
-            if callback is None:
+            if operation is None:
                 raise TypeError("Refresh provider does not expose a refresh operation.")
-            result = callback()
+            self._refresh_observed_by_callback = self._supports_completion_callback(
+                operation
+            )
+            result = self._invoke_refresh(operation, callback)
+            if isinstance(result, Future):
+                self._refresh_future = result
+                self._refresh_timer.start()
+                return
             if isinstance(result, ReadinessReport):
-                self.set_report(result)
-            elif not callable(provider):
-                latest = getattr(provider, "readiness", None)
-                if isinstance(latest, ReadinessReport):
-                    self.set_report(latest)
-                else:
-                    self.instructions.setText(
-                        "Refresh started. Reopen this dialog after the local readiness check completes."
-                    )
+                self._complete_refresh(result)
+                return
+            self._refresh_timer.start()
         except Exception as exc:
+            self._complete_refresh(error=exc)
+
+    @staticmethod
+    def _supports_completion_callback(operation: Callable[..., Any]) -> bool:
+        signature = inspect.signature(operation)
+        if any(
+            name in signature.parameters
+            for name in ("on_complete", "callback", "completion_callback")
+        ):
+            return True
+        parameters = signature.parameters.values()
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            return True
+        positional = [
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        return (
+            len(positional) == 1
+            and positional[0].default is inspect.Parameter.empty
+        )
+
+    @staticmethod
+    def _invoke_refresh(
+        operation: Callable[..., Any],
+        callback: CompletionCallback,
+    ) -> Any:
+        signature = inspect.signature(operation)
+        parameters = signature.parameters.values()
+        for name in ("on_complete", "callback", "completion_callback"):
+            if name in signature.parameters:
+                return operation(**{name: callback})
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            return operation(on_complete=callback)
+        positional = [
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        if len(positional) == 1 and positional[0].default is inspect.Parameter.empty:
+            return operation(callback)
+        return operation()
+
+    def _poll_refresh(self) -> None:
+        queued: tuple[int, ReadinessReport | None] | None = None
+        while True:
+            try:
+                item = self._completion_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] == self._refresh_generation:
+                queued = item
+        if queued is not None:
+            self._complete_refresh(queued[1])
+            return
+
+        future = self._refresh_future
+        if future is not None and future.done():
+            try:
+                self._complete_refresh(future.result())
+            except Exception as exc:
+                self._complete_refresh(error=exc)
+            return
+
+        provider = self._refresh_provider
+        latest = self._provider_report(provider)
+        if (
+            not self._refresh_observed_by_callback
+            and latest is not None
+            and latest is not self._refresh_provider_report
+        ):
+            self._complete_refresh(latest)
+            return
+
+        thread = (
+            getattr(provider, "_readiness_thread", None)
+            if not callable(provider)
+            else None
+        )
+        if (
+            future is None
+            and not self._refresh_observed_by_callback
+            and thread is not None
+            and not thread.is_alive()
+        ):
+            self._complete_refresh(latest)
+
+    @staticmethod
+    def _provider_report(provider: Any) -> ReadinessReport | None:
+        report = getattr(provider, "readiness", None)
+        return report if isinstance(report, ReadinessReport) else None
+
+    def _complete_refresh(
+        self,
+        report: ReadinessReport | None | object = _NO_REFRESH_RESULT,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self._refresh_timer.stop()
+        self._set_refreshing(False)
+        self._refresh_future = None
+        latest = (
+            self._provider_report(self._refresh_provider)
+            if report is _NO_REFRESH_RESULT
+            else report
+        )
+        if isinstance(latest, ReadinessReport):
+            self.set_report(latest)
+        elif error is not None:
             self.ok_button.setEnabled(False)
             self.instructions.setText(
-                f"Refresh failed: {exc.__class__.__name__}: {exc}"
+                f"Refresh failed: {error.__class__.__name__}: {error}"
+            )
+        else:
+            self.ok_button.setEnabled(False)
+            reason = getattr(
+                self._refresh_provider,
+                "unavailable_reason",
+                "The readiness refresh completed without a result.",
+            )
+            self.instructions.setText(f"Refresh failed: {reason}")
+
+    def _set_refreshing(self, refreshing: bool) -> None:
+        self._refreshing = refreshing
+        self.refresh_button.setText("Refreshing…" if refreshing else "Refresh")
+        self.refresh_button.setEnabled(
+            self._refresh_provider is not None and not refreshing
+        )
+        self.ok_button.setEnabled(
+            self.ok_button.isEnabled() and not refreshing
+        )
+        for selector in self.model_selectors.values():
+            selector.setEnabled(selector.isEnabled() and not refreshing)
+        if refreshing:
+            self.instructions.setText(
+                "Refreshing local Ollama readiness… No models are downloaded."
             )
