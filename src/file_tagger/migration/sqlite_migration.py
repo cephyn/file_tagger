@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -141,6 +141,25 @@ def _checksum(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _delete_file_embeddings(session: Session, file_ids: set[int]) -> None:
+    if not file_ids:
+        return
+    statement_parameters = {"file_ids": sorted(file_ids)}
+    for dimensions in (256, 512, 768):
+        statement = text(
+            f"""
+            DELETE FROM chunk_embeddings_{dimensions}
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM chunks
+                JOIN documents ON documents.id = chunks.document_id
+                WHERE documents.file_id IN :file_ids
+            )
+            """
+        ).bindparams(bindparam("file_ids", expanding=True))
+        session.execute(statement, statement_parameters)
+
+
 def migrate_legacy_sqlite(
     legacy_database: Path,
     target_session: Session,
@@ -159,6 +178,9 @@ def migrate_legacy_sqlite(
     errors = list(legacy_errors)
     source_files = {path for _, path in files}
     source_tags = {name for _, name, _ in tags}
+    source_tag_colors = {
+        name: (color or "#808080") for _, name, color in tags
+    }
     source_file_ids = {legacy_id: path for legacy_id, path in files}
     source_tag_ids = {legacy_id: name for legacy_id, name, _ in tags}
     source_associations = {
@@ -173,56 +195,85 @@ def migrate_legacy_sqlite(
 
     try:
         with target_session.begin_nested():
-            target_files: dict[str, File] = {}
-            for _, path in files:
-                target_file = target_session.scalar(
-                    select(File).where(File.canonical_path == path)
-                )
-                if target_file is None:
+            current_files = list(target_session.scalars(select(File)))
+            target_files = {file.canonical_path: file for file in current_files}
+            stale_files = [
+                file for file in current_files if file.canonical_path not in source_files
+            ]
+            _delete_file_embeddings(
+                target_session, {int(file.id) for file in stale_files}
+            )
+            for file in stale_files:
+                target_session.delete(file)
+
+            current_tags = list(target_session.scalars(select(Tag)))
+            target_tags = {tag.name: tag for tag in current_tags}
+            for tag in current_tags:
+                if tag.name not in source_tags:
+                    target_session.delete(tag)
+
+            for path in sorted(source_files):
+                if path not in target_files:
                     target_file = File(
                         canonical_path=path,
                         indexing_state="not_indexed",
                     )
                     target_session.add(target_file)
+                    target_files[path] = target_file
                     migrated_files += 1
-                target_files[path] = target_file
 
-            target_tags: dict[str, Tag] = {}
-            for _, name, color in tags:
-                target_tag = target_session.scalar(select(Tag).where(Tag.name == name))
+            for name, color in sorted(source_tag_colors.items()):
+                target_tag = target_tags.get(name)
                 if target_tag is None:
-                    target_tag = Tag(name=name, color=color or "#808080")
+                    target_tag = Tag(name=name, color=color)
                     target_session.add(target_tag)
+                    target_tags[name] = target_tag
                     migrated_tags += 1
-                target_tags[name] = target_tag
+                else:
+                    target_tag.color = color
 
             target_session.flush()
 
+            file_paths_by_id = {
+                int(file.id): path for path, file in target_files.items()
+            }
+            tag_names_by_id = {
+                int(tag.id): name for name, tag in target_tags.items()
+            }
+            current_associations = {
+                (
+                    file_paths_by_id[association.file_id],
+                    tag_names_by_id[association.tag_id],
+                ): association
+                for association in target_session.scalars(select(FileTag))
+            }
+            for association_key, association in current_associations.items():
+                if association_key not in source_associations:
+                    target_session.delete(association)
             for path, name in source_associations:
-                file_id = target_files[path].id
-                tag_id = target_tags[name].id
-                if not target_session.scalar(
-                    select(FileTag).where(
-                        FileTag.file_id == file_id, FileTag.tag_id == tag_id
+                if (path, name) not in current_associations:
+                    target_session.add(
+                        FileTag(
+                            file_id=int(target_files[path].id),
+                            tag_id=int(target_tags[name].id),
+                        )
                     )
-                ):
-                    target_session.add(FileTag(file_id=file_id, tag_id=tag_id))
                     migrated_associations += 1
 
             for suggestion in suggestions:
-                file = target_files.get(str(suggestion["file_path"]))
-                if file is None:
+                suggestion_file = target_files.get(str(suggestion["file_path"]))
+                if suggestion_file is None:
                     errors.append("Skipped suggestion data for an unknown legacy file.")
                     continue
                 if target_session.scalar(
                     select(TagSuggestionCache).where(
-                        TagSuggestionCache.file_id == file.id
+                        TagSuggestionCache.file_id == suggestion_file.id
                     )
                 ):
                     continue
                 target_session.add(
                     TagSuggestionCache(
-                        file_id=file.id,
+                        file_id=suggestion_file.id,
                         file_path=str(suggestion["file_path"]),
                         file_hash=str(suggestion["file_hash"]),
                         cached_at=_cache_timestamp(str(suggestion["cached_at"])),
@@ -232,27 +283,39 @@ def migrate_legacy_sqlite(
                 preserved_suggestions += 1
 
             target_session.flush()
+
+            target_file_paths = set(
+                target_session.scalars(select(File.canonical_path))
+            )
+            target_tag_values = set(
+                target_session.execute(select(Tag.name, Tag.color))
+            )
+            target_associations = set(
+                target_session.execute(
+                    select(File.canonical_path, Tag.name)
+                    .select_from(FileTag)
+                    .join(File, File.id == FileTag.file_id)
+                    .join(Tag, Tag.id == FileTag.tag_id)
+                )
+            )
+            if (
+                len(target_file_paths) != len(source_files)
+                or target_file_paths != source_files
+                or _checksum(sorted(target_file_paths))
+                != _checksum(sorted(source_files))
+                or len(target_tag_values) != len(source_tags)
+                or target_tag_values != set(source_tag_colors.items())
+                or len(target_associations) != len(source_associations)
+                or target_associations != source_associations
+            ):
+                raise IndexTransactionError(
+                    "Legacy migration verification failed; "
+                    f"backup remains at {backup_path}."
+                )
     except (SQLAlchemyError, RuntimeError) as exc:
         raise IndexTransactionError(
             f"Legacy migration failed; original database backup remains at {backup_path}."
         ) from exc
-
-    target_file_paths = set(
-        target_session.scalars(
-            select(File.canonical_path).where(File.canonical_path.in_(source_files))
-        )
-    )
-    target_tag_names = set(
-        target_session.scalars(select(Tag.name).where(Tag.name.in_(source_tags)))
-    )
-    if (
-        target_file_paths != source_files
-        or target_tag_names != source_tags
-        or _checksum(sorted(target_file_paths)) != _checksum(sorted(source_files))
-    ):
-        raise IndexTransactionError(
-            f"Legacy migration verification failed; backup remains at {backup_path}."
-        )
 
     return LegacyMigrationReport(
         files_seen=len(files),

@@ -123,6 +123,61 @@ def test_startup_upgrades_and_idempotently_migrates_legacy_tags(
         assert association is not None
 
 
+def test_startup_reconciles_legacy_snapshot_changes(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    _create_legacy_database(paths.legacy_database)
+    config = ReloadableConfig(paths)
+
+    initialize_modern_runtime(
+        paths,
+        config,
+        "password",
+        start_readiness=False,
+    )
+    with sqlite3.connect(paths.legacy_database) as connection:
+        connection.executescript(
+            """
+            UPDATE tags SET color = '#654321' WHERE name = 'research';
+            DELETE FROM file_tags;
+            DELETE FROM files;
+            INSERT INTO files VALUES (2, 'C:\\library\\renamed.pdf');
+            INSERT INTO file_tags VALUES (2, 1);
+            """
+        )
+
+    reconciled = initialize_modern_runtime(
+        paths,
+        config,
+        "password",
+        start_readiness=False,
+    )
+    converged = initialize_modern_runtime(
+        paths,
+        config,
+        "password",
+        start_readiness=False,
+    )
+
+    assert reconciled.sqlite_migration is not None
+    assert reconciled.sqlite_migration.files_migrated == 1
+    assert converged.sqlite_migration is not None
+    assert converged.sqlite_migration.files_migrated == 0
+    assert converged.sqlite_migration.tags_migrated == 0
+    assert converged.sqlite_migration.associations_migrated == 0
+    assert reconciled.session_factory is not None
+    with reconciled.session_factory() as session:
+        files = set(session.execute(select(File.canonical_path)).scalars())
+        tag = session.scalar(select(Tag))
+        association = session.execute(
+            select(File.canonical_path, Tag.name)
+            .join(FileTag, FileTag.file_id == File.id)
+            .join(Tag, Tag.id == FileTag.tag_id)
+        ).one()
+        assert files == {r"C:\library\renamed.pdf"}
+        assert tag is not None and tag.color == "#654321"
+        assert association == (r"C:\library\renamed.pdf", "research")
+
+
 def test_startup_reloads_config_only_after_a_real_legacy_config_migration(
     tmp_path, monkeypatch
 ) -> None:
