@@ -44,7 +44,8 @@ Last updated: 2026-11-24
 | 25: contextual Markdown search and chat | Complete | `59d4209`, `70351f8`, `f4e55da`, `77cc525`, `52d4a64`, `cd076f0`, `154347c` |
 | 26: remove cloud and legacy runtime stacks | Complete | `f994df67`, `e137eb0`, `89d9e54`, `d23a07a` |
 | 27: golden migration/retrieval acceptance | Complete | `eb2e9fd`, `76f6713` |
-| 28-29 | Not started | — |
+| 28: Windows packaging and per-user migration | Complete | `f5b4d76`, `637d926`, `2a2d0fd`, `35f4f27`, `0359291` |
+| 29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -1402,6 +1403,8 @@ git commit -m "test: cover local upgrade and contextual search"
 ```
 
 ### Task 28: Package the Windows Application and Per-User Migration
+
+**Status: Complete**
 
 **Files:**
 - Modify: `pyproject.toml`
