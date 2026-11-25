@@ -35,9 +35,9 @@ Last updated: 2026-11-24
 | 16: resumable transactional indexing | Complete | `a6bcb05`, `c8fe9f1`, `284bed4`, `cf7de50`, `fbdd6fd` |
 | 17: SQLite hybrid search | Complete | `ad05116`, `82c395e`, `fbdd6fd` |
 | 18: citation-first search results | Complete | `4f117a3`, `c3ec25a` |
-| 19: typed Ollama tag decisions | Complete | `eae8b89`, `862df67`, `50e588c`, `3ab3ebe` |
-| 20: cached typed tag recommendations | Complete | `b1bd9bc`, `1b3e677`, `d2e1681` |
-| 21: Markdown-context search planning | Complete | `43f17f4`, `37c8aaf`, `89fba5a`, `321f312` |
+| 19: typed Ollama tag decisions | Complete | `eae8b89`, `862df67`, `50e588c`, `3ab3ebe`, `3b7dc81` |
+| 20: cached typed tag recommendations | Complete | `b1bd9bc`, `1b3e677`, `d2e1681`, `3b7dc81`, `10a9fd5`, `d44bbdd`, `7ae3dd2`, `cd5ede3`, `6817c13`, `fa87cea` |
+| 21: Markdown-context search planning | Complete | `43f17f4`, `37c8aaf`, `89fba5a`, `321f312`, `3b7dc81` |
 | 22-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
