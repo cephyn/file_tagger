@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import threading
+import time
 from typing import Any, Protocol, TypeAlias
 
 from sqlalchemy import select
@@ -910,7 +911,11 @@ class ModernRuntime:
             except Exception:
                 pass
 
-    def close_contextual_session(self, session_id: str) -> None:
+    def close_contextual_session(
+        self,
+        session_id: str,
+        timeout: float = 2.0,
+    ) -> None:
         checked_id = session_id or "default"
         retired: list[tuple[str, RagService, Any]] = []
         with self._contextual_rag_condition:
@@ -921,7 +926,19 @@ class ModernRuntime:
                 self._contextual_rag_epochs.get(checked_id, 0) + 1
             )
             epoch = self._contextual_rag_epochs[checked_id]
-            while self._contextual_rag_active.get(checked_id, 0) > 0:
+        for retired_id, rag, _session in retired:
+            close_rag = getattr(rag, "close_session", None)
+            if callable(close_rag):
+                try:
+                    close_rag(retired_id)
+                except Exception:
+                    pass
+        with self._contextual_rag_condition:
+            deadline = time.monotonic() + max(0.0, timeout)
+            while (
+                self._contextual_rag_active.get(checked_id, 0) > 0
+                and time.monotonic() < deadline
+            ):
                 self._contextual_rag_condition.wait(timeout=0.05)
         if retired:
             for retired_id, rag, session in retired:

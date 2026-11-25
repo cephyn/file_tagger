@@ -167,6 +167,7 @@ class RagService:
         self._session_registry_lock = threading.Lock()
         self._session_epochs: dict[str, int] = {}
         self._session_active: dict[str, int] = {}
+        self._session_cancel_events: dict[str, threading.Event] = {}
 
     @property
     def evidence(self) -> tuple[SearchResult, ...]:
@@ -194,8 +195,13 @@ class RagService:
             )
             self._session_states.pop(checked_session, None)
             lock = self._session_locks.get(checked_session)
+            cancel_event = self._session_cancel_events.setdefault(
+                checked_session,
+                threading.Event(),
+            )
+            cancel_event.set()
         if lock is not None:
-            acquired = lock.acquire(timeout=2.0)
+            acquired = lock.acquire(timeout=0.25)
             if acquired:
                 with self._session_registry_lock:
                     self._session_states.pop(checked_session, None)
@@ -208,7 +214,26 @@ class RagService:
                 self._session_epochs[session_id] = (
                     self._session_epochs.get(session_id, 0) + 1
                 )
+                cancel_event = self._session_cancel_events.setdefault(
+                    session_id,
+                    threading.Event(),
+                )
+                cancel_event.set()
             self._session_states.clear()
+
+    def _is_session_cancelled(
+        self,
+        session_id: str,
+        cancellation_check: Callable[[], bool] | None,
+    ) -> bool:
+        with self._session_registry_lock:
+            cancel_event = self._session_cancel_events.setdefault(
+                session_id,
+                threading.Event(),
+            )
+        return cancel_event.is_set() or (
+            cancellation_check is not None and cancellation_check()
+        )
 
     def answer_question(
         self,
@@ -364,7 +389,10 @@ class RagService:
                         per_query_limit=self.per_query_limit,
                         limit=self.evidence_limit,
                         max_sections_per_file=self.max_sections_per_file,
-                        cancellation_check=cancellation_check,
+                        cancellation_check=lambda: self._is_session_cancelled(
+                            checked_session,
+                            cancellation_check,
+                        ),
                     )
                 previous_history = ()
                 version = previous_state.version if previous_state is not None else 0
@@ -518,7 +546,10 @@ class RagService:
                         per_query_limit=self.per_query_limit,
                         limit=self.evidence_limit,
                         max_sections_per_file=self.max_sections_per_file,
-                        cancellation_check=cancellation_check,
+                        cancellation_check=lambda: self._is_session_cancelled(
+                            checked_session,
+                            cancellation_check,
+                        ),
                     )
                 previous_history = ()
                 version = previous_state.version if previous_state is not None else 0
@@ -534,7 +565,10 @@ class RagService:
                 rerank_top_k=rerank_top_k,
                 max_context_retries=max_context_retries,
                 history=previous_history,
-                cancellation_check=cancellation_check,
+                cancellation_check=lambda: self._is_session_cancelled(
+                    checked_session,
+                    cancellation_check,
+                ),
             ):
                 if fragment:
                     yield fragment
@@ -562,9 +596,12 @@ class RagService:
         with self._session_registry_lock:
             lock = self._session_locks.setdefault(session_id, threading.Lock())
             epoch = self._session_epochs.get(session_id, 0)
-            self._session_active[session_id] = (
-                self._session_active.get(session_id, 0) + 1
-            )
+            active = self._session_active.get(session_id, 0)
+            if active == 0:
+                cancel_event = self._session_cancel_events.get(session_id)
+                if cancel_event is not None:
+                    cancel_event.clear()
+            self._session_active[session_id] = active + 1
         acquired = asyncio.create_task(asyncio.to_thread(lock.acquire))
         try:
             await asyncio.shield(acquired)
@@ -1208,11 +1245,26 @@ async def _generate_answer_stream_async(
         )
         chat_stream = getattr(gateway, "chat_stream", None)
         if not callable(chat_stream):
-            response = await gateway.chat(
-                model,
-                messages=messages,
-                schema=answer_schema(),
+            chat_task = asyncio.create_task(
+                gateway.chat(
+                    model,
+                    messages=messages,
+                    schema=answer_schema(),
+                )
             )
+            while not chat_task.done():
+                if cancellation_check is not None and cancellation_check():
+                    chat_task.cancel()
+                    try:
+                        await chat_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise asyncio.CancelledError
+                try:
+                    await asyncio.wait_for(asyncio.shield(chat_task), timeout=0.05)
+                except TimeoutError:
+                    continue
+            response = chat_task.result()
             yield response, parse_cited_answer(question, response, bounded)
             return
 
@@ -1220,11 +1272,37 @@ async def _generate_answer_stream_async(
         emitted_answer = ""
         mode: str | None = None
         try:
-            async for fragment in chat_stream(
+            stream = chat_stream(
                 model,
                 messages=messages,
                 schema=answer_schema(),
-            ):
+            )
+            iterator = stream.__aiter__()
+            while True:
+                next_fragment = asyncio.create_task(anext(iterator))
+                while not next_fragment.done():
+                    if cancellation_check is not None and cancellation_check():
+                        next_fragment.cancel()
+                        try:
+                            await next_fragment
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                        raise asyncio.CancelledError
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(next_fragment),
+                            timeout=0.05,
+                        )
+                    except TimeoutError:
+                        continue
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                try:
+                    fragment = next_fragment.result()
+                except StopAsyncIteration:
+                    break
                 if cancellation_check is not None and cancellation_check():
                     raise asyncio.CancelledError
                 if not isinstance(fragment, str) or not fragment:

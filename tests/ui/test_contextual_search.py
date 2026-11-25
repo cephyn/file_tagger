@@ -189,3 +189,60 @@ def test_dialog_close_requests_worker_cancellation_and_clears_session(qtbot) -> 
     release.set()
 
     assert worker._cancel_requested.is_set()
+
+
+def test_dialog_close_during_blocked_gateway_stops_worker_and_zeroes_active_use(
+    qtbot,
+) -> None:
+    import asyncio
+
+    gateway_blocked = threading.Event()
+    gateway_released = threading.Event()
+    active_count = 0
+
+    class Runtime:
+        def close_contextual_session(self, session_id, timeout=2.0):
+            del session_id, timeout
+            gateway_released.set()
+
+    class Service:
+        async def answer_contextual_question_stream_async(
+            self,
+            question,
+            markdown_context,
+            **kwargs,
+        ):
+            nonlocal active_count
+            del question, markdown_context, kwargs
+            active_count = 1
+            gateway_blocked.set()
+            try:
+                while not gateway_released.is_set():
+                    await asyncio.sleep(0.01)
+                yield "late"
+            finally:
+                active_count = 0
+
+    dialog = ContextualSearchDialog(modern_runtime=Runtime(), rag_service=Service())
+    qtbot.addWidget(dialog)
+    dialog.question.setText("block gateway")
+    dialog.submit()
+    worker = dialog._worker
+    assert worker is not None
+    assert gateway_blocked.wait(1)
+
+    def forbidden_terminate() -> None:
+        raise AssertionError("Contextual workers must not be force-terminated")
+
+    worker.terminate = forbidden_terminate
+
+    dialog.close()
+
+    qtbot.waitUntil(
+        lambda: (not worker.isRunning() and active_count == 0),
+        timeout=3000,
+    )
+    gateway_released.set()
+
+    assert active_count == 0
+    assert not worker.isRunning()

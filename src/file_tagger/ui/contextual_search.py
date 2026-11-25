@@ -179,6 +179,9 @@ class ContextualSearchWorker(QThread):
             self.cancelled.emit()
         except Exception as exc:
             self.failure.emit(exc)
+        finally:
+            if self._cancel_requested.is_set():
+                self.cancelled.emit()
 
 
 class ContextualSearchDialog(QDialog):
@@ -351,6 +354,7 @@ class ContextualSearchDialog(QDialog):
             return None
         if self._worker is not None and self._worker.isRunning():
             self._worker.request_cancel()
+            self._close_contextual_session()
             self._stop_worker(self._worker)
         if self._worker is not None:
             self._close_contextual_session()
@@ -523,9 +527,6 @@ class ContextualSearchDialog(QDialog):
         worker.request_cancel()
         if worker.isRunning():
             worker.wait(2000)
-        if worker.isRunning():
-            worker.terminate()
-            worker.wait(500)
 
     def _close_contextual_session(self) -> None:
         close_method = getattr(self.modern_runtime, "close_contextual_session", None)
@@ -539,6 +540,7 @@ class ContextualSearchDialog(QDialog):
     def reject(self) -> None:
         worker = self._worker
         if worker is not None:
+            self._close_contextual_session()
             self._stop_worker(worker)
         self._worker_generation += 1
         self._worker = None
@@ -548,6 +550,7 @@ class ContextualSearchDialog(QDialog):
     def closeEvent(self, event: Any) -> None:
         worker = self._worker
         if worker is not None:
+            self._close_contextual_session()
             self._stop_worker(worker)
         self._worker_generation += 1
         self._worker = None
