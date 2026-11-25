@@ -339,7 +339,16 @@ class IndexingService:
         for job_id in self._repository.expired_job_ids():
             if claim_guard is not None and not claim_guard():
                 break
-            recovered.append(self.resume(job_id))
+            recovered.append(
+                self.resume(
+                    job_id,
+                    cancellation_check=(
+                        (lambda: not claim_guard())
+                        if claim_guard is not None
+                        else None
+                    ),
+                )
+            )
         return tuple(recovered)
 
     def _with_lease_heartbeat(

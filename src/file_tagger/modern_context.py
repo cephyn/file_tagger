@@ -41,6 +41,7 @@ logger = logging.getLogger("ModernRuntime")
 SessionFactory: TypeAlias = sessionmaker[Session]
 TagData = tuple[str, str | None]
 ReadinessCallback = Callable[[ReadinessReport | None], None]
+_INDEX_RECOVERY_MAX_WAIT_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +109,8 @@ class ModernRuntime:
         self._index_queue: queue.Queue[_IndexRequest] = queue.Queue()
         self._index_generations: dict[str, int] = {}
         self._index_worker: threading.Thread | None = None
+        self._index_recovery_thread: threading.Thread | None = None
+        self._indexing_service_generation = 0
         self._lock = threading.Lock()
         self._unavailable_reason = unavailable_reason
         self._readiness_generation = 0
@@ -309,6 +312,7 @@ class ModernRuntime:
                     self.required_models = required
                     self.readiness = report
                     self._indexing_service = indexing_service
+                    self._indexing_service_generation = generation
                     self._embedding_gateway = embedding_gateway
                     self._unavailable_reason = None
                     published_service = indexing_service is not None
@@ -366,11 +370,87 @@ class ModernRuntime:
                 return (
                     generation == self._readiness_generation
                     and self._indexing_service is service
+                    and self._indexing_service_generation == generation
                 )
 
         if not current():
             return
-        service.recover_abandoned(claim_guard=current)
+        try:
+            service.recover_abandoned(claim_guard=current)
+        except Exception:
+            logger.warning(
+                "Initial abandoned-indexing recovery failed.",
+                exc_info=True,
+            )
+        finally:
+            self._start_indexing_recovery_scheduler()
+
+    def _start_indexing_recovery_scheduler(self) -> None:
+        with self._lock:
+            service = self._indexing_service
+            next_expiry = getattr(
+                getattr(service, "repository", None),
+                "seconds_until_next_lease_expiry",
+                None,
+            )
+            existing = self._index_recovery_thread
+            if (
+                not callable(next_expiry)
+                or (existing is not None and existing.is_alive())
+            ):
+                return
+            thread = threading.Thread(
+                target=self._run_indexing_recovery_scheduler,
+                name="file-tagger-indexing-recovery",
+                daemon=True,
+            )
+            self._index_recovery_thread = thread
+            thread.start()
+
+    def _run_indexing_recovery_scheduler(self) -> None:
+        while True:
+            with self._lock:
+                service = self._indexing_service
+                generation = self._readiness_generation
+                published_generation = self._indexing_service_generation
+            if service is None:
+                threading.Event().wait(_INDEX_RECOVERY_MAX_WAIT_SECONDS)
+                continue
+            repository = service.repository
+            next_expiry = repository.seconds_until_next_lease_expiry
+            try:
+                delay = next_expiry()
+            except Exception:
+                logger.warning(
+                    "Modern indexing recovery scheduling failed.",
+                    exc_info=True,
+                )
+                delay = None
+            if delay is None:
+                delay = _INDEX_RECOVERY_MAX_WAIT_SECONDS
+            else:
+                delay = min(delay, _INDEX_RECOVERY_MAX_WAIT_SECONDS)
+            if delay > 0:
+                threading.Event().wait(delay)
+
+            def current() -> bool:
+                with self._lock:
+                    return (
+                        generation == self._readiness_generation
+                        and self._indexing_service is service
+                        and published_generation == self._indexing_service_generation
+                        and generation == published_generation
+                    )
+
+            if not current():
+                continue
+            try:
+                service.recover_abandoned(claim_guard=current)
+            except Exception:
+                logger.warning(
+                    "Modern indexing abandoned-lease recovery failed.",
+                    exc_info=True,
+                )
 
     @property
     def _model_overrides_path(self) -> Path:

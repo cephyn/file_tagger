@@ -551,6 +551,65 @@ def test_restarted_service_does_not_take_over_live_owner(tmp_path: Path) -> None
     assert extractor.calls == 0
 
 
+def test_published_service_retries_recovery_after_live_lease_expires(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "delayed-recovery.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    now = [datetime(2026, 11, 24, 12, tzinfo=UTC)]
+    lease_duration = timedelta(seconds=30)
+    crashed_repository = IndexingRepository(
+        session_factory,
+        lease_duration=lease_duration,
+        clock=lambda: now[0],
+    )
+    job_id = crashed_repository.queue(source)
+    abandoned = crashed_repository.begin(job_id)
+    restarted_repository = IndexingRepository(
+        session_factory,
+        lease_duration=lease_duration,
+        clock=lambda: now[0],
+    )
+    restarted_service = IndexingService(
+        restarted_repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="recovered later", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+        recover_on_startup=False,
+    )
+    runtime = ModernRuntime(AppPaths.discover(), session_factory)
+    runtime._indexing_service = restarted_service
+
+    runtime._recover_published_indexing_service(0, restarted_service)
+
+    live = restarted_repository.state(job_id)
+    assert live.status == "running"
+    assert live.lease_token == abandoned.lease_token
+
+    now[0] += timedelta(seconds=31)
+    deadline = time.monotonic() + 2
+    while (
+        restarted_repository.state(job_id).status != "completed"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+
+    recovered = restarted_repository.state(job_id)
+    assert recovered.status == "completed"
+    assert recovered.processed_count == recovered.total_count == 1
+
+
 def test_live_worker_heartbeats_during_slow_embedding(tmp_path: Path) -> None:
     database = tmp_path / "heartbeat.sqlite3"
     source = tmp_path / "guide.md"

@@ -278,6 +278,23 @@ class IndexingRepository:
                 )
             )
 
+    def seconds_until_next_lease_expiry(self) -> float | None:
+        with self._session_factory() as session:
+            expires_at = session.scalar(
+                select(func.min(IndexJob.lease_expires_at)).where(
+                    IndexJob.status == "running",
+                    IndexJob.lease_expires_at.is_not(None),
+                )
+            )
+        if expires_at is None:
+            return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        return max(0.0, (expires_at - now).total_seconds())
+
     def latest_resumable_job(self) -> JobState | None:
         with self._session_factory() as session:
             jobs = session.scalars(
