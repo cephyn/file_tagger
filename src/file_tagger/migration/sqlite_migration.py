@@ -7,12 +7,13 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from sqlalchemy import bindparam, select, text
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..domain.errors import IndexTransactionError
 from ..persistence.models import File, FileTag, Tag, TagSuggestionCache
+from ..persistence.vector_cleanup import delete_file_embeddings
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,25 +142,6 @@ def _checksum(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _delete_file_embeddings(session: Session, file_ids: set[int]) -> None:
-    if not file_ids:
-        return
-    statement_parameters = {"file_ids": sorted(file_ids)}
-    for dimensions in (256, 512, 768):
-        statement = text(
-            f"""
-            DELETE FROM chunk_embeddings_{dimensions}
-            WHERE chunk_id IN (
-                SELECT chunks.id
-                FROM chunks
-                JOIN documents ON documents.id = chunks.document_id
-                WHERE documents.file_id IN :file_ids
-            )
-            """
-        ).bindparams(bindparam("file_ids", expanding=True))
-        session.execute(statement, statement_parameters)
-
-
 def migrate_legacy_sqlite(
     legacy_database: Path,
     target_session: Session,
@@ -200,8 +182,8 @@ def migrate_legacy_sqlite(
             stale_files = [
                 file for file in current_files if file.canonical_path not in source_files
             ]
-            _delete_file_embeddings(
-                target_session, {int(file.id) for file in stale_files}
+            delete_file_embeddings(
+                target_session, (int(file.id) for file in stale_files)
             )
             for file in stale_files:
                 target_session.delete(file)

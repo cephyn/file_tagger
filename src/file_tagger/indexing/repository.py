@@ -23,10 +23,13 @@ from ..persistence.models import (
     IndexJobCheckpointChunk,
     Page,
 )
+from ..persistence.vector_cleanup import (
+    VECTOR_DIMENSIONS,
+    delete_document_embeddings,
+)
 from .chunker import DocumentChunk
 from .embedder import EmbeddedChunk
 
-VECTOR_DIMENSIONS = (256, 512, 768)
 DEFAULT_LEASE_DURATION = timedelta(minutes=5)
 
 
@@ -467,16 +470,7 @@ class IndexingRepository:
                     select(Document.id).where(Document.file_id == file.id)
                 )
             )
-            for old_document_id in old_document_ids:
-                for old_dimensions in VECTOR_DIMENSIONS:
-                    session.execute(
-                        text(
-                            f"DELETE FROM chunk_embeddings_{old_dimensions} "
-                            "WHERE chunk_id IN "
-                            "(SELECT id FROM chunks WHERE document_id = :document_id)"
-                        ),
-                        {"document_id": old_document_id},
-                    )
+            delete_document_embeddings(session, old_document_ids)
             if old_document_ids:
                 session.execute(
                     delete(Document).where(Document.file_id == file.id)

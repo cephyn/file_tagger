@@ -4,6 +4,7 @@ from concurrent.futures import TimeoutError
 from hashlib import sha256
 import os
 from pathlib import Path
+import struct
 import time
 
 import pytest
@@ -18,7 +19,9 @@ from file_tagger.extraction.docling_adapter import ExtractedDocument, ExtractedP
 from file_tagger.indexing.chunker import DocumentChunk
 from file_tagger.indexing.repository import IndexingRepository
 from file_tagger.indexing.service import IndexingService
+from file_tagger.infrastructure.app_paths import AppPaths
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
+from file_tagger.modern_context import ModernRuntime
 from file_tagger.persistence.models import Chunk, File
 from file_tagger.search.hybrid import HybridSearch
 
@@ -180,6 +183,70 @@ def test_identical_files_receive_distinct_stable_chunk_ids(tmp_path: Path) -> No
         stable_ids = list(session.scalars(select(Chunk.stable_id)))
     assert len(stable_ids) == 2
     assert len(set(stable_ids)) == 2
+
+
+@pytest.mark.parametrize("deletion_method", ("delete_file", "sync_legacy_changes"))
+def test_runtime_file_deletion_removes_vectors_before_chunk_id_reuse(
+    tmp_path: Path,
+    deletion_method: str,
+) -> None:
+    database = tmp_path / "live-deletion.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    service = IndexingService(
+        IndexingRepository(session_factory),
+        extractor=MutableExtractor(
+            extraction(source, marker="reusable chunk", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+    )
+    assert service.reindex(source).status == "completed"
+    with session_factory.begin() as session:
+        original_chunk_id = session.scalar(select(Chunk.id))
+        assert original_chunk_id is not None
+        for dimensions in (512, 768):
+            vector = tuple(float(index) for index in range(dimensions))
+            session.execute(
+                text(
+                    f"INSERT INTO chunk_embeddings_{dimensions} "
+                    "(chunk_id, embedding) VALUES (:chunk_id, :embedding)"
+                ),
+                {
+                    "chunk_id": original_chunk_id,
+                    "embedding": struct.pack(f"<{dimensions}f", *vector),
+                },
+            )
+
+    runtime = ModernRuntime(AppPaths.discover(), session_factory)
+    if deletion_method == "delete_file":
+        runtime.delete_file(str(source))
+    else:
+        runtime.sync_legacy_changes(file_deletes=(str(source),))
+
+    with session_factory() as session:
+        assert session.scalar(select(File)) is None
+        assert session.scalar(select(Chunk)) is None
+        for dimensions in (256, 512, 768):
+            assert (
+                session.scalar(
+                    text(f"SELECT count(*) FROM chunk_embeddings_{dimensions}")
+                )
+                == 0
+            )
+
+    assert service.reindex(source).status == "completed"
+    with session_factory() as session:
+        replacement_chunk_id = session.scalar(select(Chunk.id))
+    assert replacement_chunk_id == original_chunk_id
 
 
 def test_indexed_file_mime_type_supports_filtered_hybrid_search(

@@ -24,6 +24,7 @@ from .ollama.hardware import profile_hardware
 from .ollama.model_recommender import ModelRecommendation, recommend_models
 from .ollama.readiness import OllamaReadinessService, ReadinessReport, RequiredModels
 from .persistence.models import File, FileTag, Tag
+from .persistence.vector_cleanup import delete_file_embeddings
 
 
 logger = logging.getLogger("ModernRuntime")
@@ -302,6 +303,7 @@ class ModernRuntime:
                 )
             )
             if file is not None:
+                delete_file_embeddings(session, (int(file.id),))
                 session.delete(file)
 
     def sync_legacy_changes(
@@ -320,6 +322,7 @@ class ModernRuntime:
         deleted_tags = list(tag_deletes)
         updated_tags = list(tag_upserts)
         with self.session_factory.begin() as session:
+            files_to_delete: dict[int, File] = {}
             for path in deleted_files:
                 file = session.scalar(
                     select(File).where(
@@ -327,7 +330,10 @@ class ModernRuntime:
                     )
                 )
                 if file is not None:
-                    session.delete(file)
+                    files_to_delete[int(file.id)] = file
+            delete_file_embeddings(session, files_to_delete)
+            for file in files_to_delete.values():
+                session.delete(file)
             for name in deleted_tags:
                 tag = session.scalar(select(Tag).where(Tag.name == name))
                 if tag is not None:
