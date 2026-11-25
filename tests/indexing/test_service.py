@@ -489,6 +489,26 @@ def test_restarted_service_recovers_expired_job_without_cooperative_pause(
         )
 
 
+def test_queued_batch_survives_repository_restart(tmp_path: Path) -> None:
+    database = tmp_path / "queued-batch.sqlite3"
+    sources = tuple(tmp_path / name for name in ("one.md", "two.md", "three.md"))
+    for source in sources:
+        source.write_text(source.stem, encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    original = IndexingRepository(session_factory)
+
+    job_ids = original.queue_many(sources)
+    restarted = IndexingRepository(session_factory)
+
+    restored = restarted.resumable_jobs()
+    assert tuple(state.id for state in restored) == job_ids
+    assert tuple(state.file_path for state in restored) == tuple(
+        str(source.resolve()) for source in sources
+    )
+    assert all(state.status == "queued" for state in restored)
+
+
 def test_restarted_service_does_not_take_over_live_owner(tmp_path: Path) -> None:
     database = tmp_path / "live-owner.sqlite3"
     source = tmp_path / "guide.md"

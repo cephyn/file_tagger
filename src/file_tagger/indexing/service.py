@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -95,6 +95,9 @@ class IndexingService:
 
     def queue(self, file_path: str | Path) -> int:
         return self._repository.queue(file_path)
+
+    def queue_many(self, file_paths: Iterable[str | Path]) -> tuple[int, ...]:
+        return self._repository.queue_many(file_paths)
 
     def reindex(
         self,
@@ -321,8 +324,23 @@ class IndexingService:
         state = self._repository.latest_resumable_job()
         return IndexingResult.from_state(state) if state is not None else None
 
-    def recover_abandoned(self) -> tuple[IndexingResult, ...]:
-        return tuple(self.resume(job_id) for job_id in self._repository.expired_job_ids())
+    def resumable_jobs(self) -> tuple[IndexingResult, ...]:
+        return tuple(
+            IndexingResult.from_state(state)
+            for state in self._repository.resumable_jobs()
+        )
+
+    def recover_abandoned(
+        self,
+        *,
+        claim_guard: Callable[[], bool] | None = None,
+    ) -> tuple[IndexingResult, ...]:
+        recovered: list[IndexingResult] = []
+        for job_id in self._repository.expired_job_ids():
+            if claim_guard is not None and not claim_guard():
+                break
+            recovered.append(self.resume(job_id))
+        return tuple(recovered)
 
     def _with_lease_heartbeat(
         self,

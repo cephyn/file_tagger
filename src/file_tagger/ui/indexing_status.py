@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..modern_context import ModernIndexingUnavailable
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingIndexJob:
+    job_id: int | None
+    file_path: str
 
 
 class _IndexingWorker(QThread):
@@ -69,7 +76,7 @@ class IndexingStatus(QWidget):
         self.service = service
         self._job_id: int | None = None
         self._worker: _IndexingWorker | None = None
-        self._pending: deque[str] = deque()
+        self._pending: deque[_PendingIndexJob] = deque()
         self._active_path = ""
         self._active_service: Any = service
         self._worker_generation = 0
@@ -115,8 +122,7 @@ class IndexingStatus(QWidget):
         return bool(getattr(self.service, "previous_revision_available", True))
 
     def _resolved_service(self) -> Any:
-        indexing_service = getattr(self.service, "_indexing_service", None)
-        return indexing_service if indexing_service is not None else self.service
+        return getattr(self.service, "_indexing_service", self.service)
 
     def start(self, file_path: str | Path) -> int | None:
         if self._closing:
@@ -124,38 +130,92 @@ class IndexingStatus(QWidget):
                 "the indexing status widget is shutting down."
             )
         path = str(Path(file_path)) if not isinstance(file_path, str) else file_path
-        if self._worker is not None and self._worker.isRunning():
-            self._pending.append(path)
-            return None
-        self._active_path = path
-        self._active_service = self._resolved_service()
-        if self._active_service is None:
+        active_service = self._resolved_service()
+        if active_service is None:
             raise ModernIndexingUnavailable(
                 "the modern indexing service is not initialized."
             )
+        queue_index = getattr(active_service, "queue", None)
+        if self._worker is not None and self._worker.isRunning():
+            if callable(queue_index):
+                self._pending.append(
+                    _PendingIndexJob(int(queue_index(path)), path)
+                )
+            else:
+                self._pending.append(_PendingIndexJob(None, path))
+            return None
+        self._activate_job(
+            active_service,
+            int(queue_index(path)) if callable(queue_index) else None,
+            path,
+        )
+        return self._job_id
+
+    def _activate_job(
+        self,
+        active_service: Any,
+        job_id: int | None,
+        file_path: str,
+    ) -> None:
+        self._active_path = file_path
+        self._active_service = active_service
         setattr(self._active_service, "cancel_requested", False)
         setattr(self.service, "cancel_requested", False)
 
-        queue_index = getattr(self._active_service, "queue", None)
-        if callable(queue_index):
-            job_id = int(queue_index(path))
+        if job_id is not None or callable(
+            getattr(self._active_service, "index_file", None)
+        ):
             self._run_job(job_id)
-            return job_id
-
-        if callable(getattr(self._active_service, "index_file", None)):
-            self._run_job(None)
-            return None
+            return
         raise ModernIndexingUnavailable("Modern indexing is not available.")
 
     def start_many(self, file_paths: Iterable[str | Path]) -> None:
-        self._pending.extend(str(path) for path in file_paths)
+        paths = [
+            str(path)
+            for path in file_paths
+        ]
+        if not paths:
+            return
+        active_service = self._resolved_service()
+        if active_service is None:
+            raise ModernIndexingUnavailable(
+                "the modern indexing service is not initialized."
+            )
+        queue_many = getattr(active_service, "queue_many", None)
+        queue_one = getattr(active_service, "queue", None)
+        job_ids: tuple[int | None, ...]
+        if callable(queue_many):
+            job_ids = tuple(int(job_id) for job_id in queue_many(paths))
+        elif callable(queue_one):
+            job_ids = tuple(int(queue_one(path)) for path in paths)
+        else:
+            job_ids = (None,) * len(paths)
+        self._pending.extend(
+            _PendingIndexJob(job_id, path)
+            for job_id, path in zip(job_ids, paths, strict=True)
+        )
         if self._worker is not None and self._worker.isRunning():
             return
         self._start_next()
 
     def _start_next(self) -> None:
         while self._pending:
-            self.start(self._pending.popleft())
+            pending = self._pending.popleft()
+            active_service = self._resolved_service()
+            if active_service is None:
+                self._pending.appendleft(pending)
+                self._timer.start()
+                return
+            try:
+                self._activate_job(
+                    active_service,
+                    pending.job_id,
+                    pending.file_path,
+                )
+            except ModernIndexingUnavailable:
+                self._pending.appendleft(pending)
+                self._timer.start()
+                return
             if self._worker is not None and self._worker.isRunning():
                 return
 
@@ -221,6 +281,9 @@ class IndexingStatus(QWidget):
         self._timer.start()
 
     def _refresh_progress(self) -> None:
+        if self._worker is None and self._pending:
+            self._start_next()
+            return
         if self._job_id is None:
             self._set_progress(
                 "Indexing",
@@ -342,10 +405,12 @@ class IndexingStatus(QWidget):
         if not self._is_current_worker(worker, generation):
             return
         self._worker = None
-        if self._completed and not self._closing:
+        if self._pending and not self._closing:
             self._start_next()
         elif not self._closing:
-            self.resume_button.setEnabled(self._job_id is not None)
+            self.resume_button.setEnabled(
+                self._job_id is not None and not self._completed
+            )
 
     def cancel(self) -> None:
         setattr(self.service, "cancel_requested", True)
@@ -396,7 +461,6 @@ class IndexingStatus(QWidget):
 
     def shutdown(self, timeout_ms: int = 30_000) -> bool:
         self._closing = True
-        self._pending.clear()
         self._timer.stop()
         worker = self._worker
         if worker is not None and worker.isRunning():
@@ -414,6 +478,27 @@ class IndexingStatus(QWidget):
         event.ignore()
 
     def _restore_resumable_job(self) -> None:
+        resumable_jobs = getattr(self.service, "resumable_jobs", None)
+        if callable(resumable_jobs):
+            try:
+                results = tuple(resumable_jobs())
+            except Exception:
+                results = ()
+            if results:
+                for result in results:
+                    job_id = getattr(result, "job_id", None)
+                    if job_id is None:
+                        job_id = getattr(result, "id", None)
+                    if job_id is not None:
+                        self._pending.append(
+                            _PendingIndexJob(
+                                int(job_id),
+                                str(getattr(result, "file_path", "")),
+                            )
+                        )
+                self._timer.start()
+                self._start_next()
+                return
         latest = getattr(self.service, "latest_resumable_job", None)
         if not callable(latest):
             return

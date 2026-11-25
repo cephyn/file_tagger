@@ -303,6 +303,7 @@ class ModernRuntime:
                     embedding_profile=embedding_profile,
                     recover_on_startup=False,
                 )
+            published_service = False
             with self._lock:
                 if generation == self._readiness_generation:
                     self.required_models = required
@@ -310,10 +311,14 @@ class ModernRuntime:
                     self._indexing_service = indexing_service
                     self._embedding_gateway = embedding_gateway
                     self._unavailable_reason = None
-                    if indexing_service is not None:
-                        indexing_service.recover_abandoned()
+                    published_service = indexing_service is not None
                 else:
                     report = None
+            if published_service and indexing_service is not None:
+                self._recover_published_indexing_service(
+                    generation,
+                    indexing_service,
+                )
             logger.info(
                 "Modern local-model readiness initialized (ready=%s, profiles=%d).",
                 report.ready if report is not None else False,
@@ -350,6 +355,22 @@ class ModernRuntime:
             callback(report)
         except Exception:
             logger.warning("A readiness completion callback failed.", exc_info=True)
+
+    def _recover_published_indexing_service(
+        self,
+        generation: int,
+        service: IndexingService,
+    ) -> None:
+        def current() -> bool:
+            with self._lock:
+                return (
+                    generation == self._readiness_generation
+                    and self._indexing_service is service
+                )
+
+        if not current():
+            return
+        service.recover_abandoned(claim_guard=current)
 
     @property
     def _model_overrides_path(self) -> Path:
@@ -408,6 +429,12 @@ class ModernRuntime:
     def queue(self, file_path: str | Path) -> int:
         return self._require_indexing_service().queue(file_path)
 
+    def queue_many(
+        self,
+        file_paths: Iterable[str | Path],
+    ) -> tuple[int, ...]:
+        return self._require_indexing_service().queue_many(file_paths)
+
     def resume(
         self,
         job_id: int,
@@ -437,6 +464,15 @@ class ModernRuntime:
             return None
         state = repository.latest_resumable_job()
         return IndexingResult.from_state(state) if state is not None else None
+
+    def resumable_jobs(self) -> tuple[IndexingResult, ...]:
+        repository = self._indexing_repository
+        if repository is None:
+            return ()
+        return tuple(
+            IndexingResult.from_state(state)
+            for state in repository.resumable_jobs()
+        )
 
     def _require_indexing_service(self) -> IndexingService:
         with self._lock:

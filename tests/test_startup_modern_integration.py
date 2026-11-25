@@ -1225,7 +1225,9 @@ def test_runtime_readiness_completion_ignores_stale_overlapping_result(
     )
     monkeypatch.setattr(
         "file_tagger.modern_context.IndexingService",
-        lambda *args, **kwargs: SimpleNamespace(recover_abandoned=lambda: ()),
+        lambda *args, **kwargs: SimpleNamespace(
+            recover_abandoned=lambda **kwargs: ()
+        ),
     )
 
     async def check_readiness(gateway, required):
@@ -1307,7 +1309,8 @@ def test_overlapping_readiness_only_recovers_published_service(
             if recover_on_startup:
                 self.recover_abandoned()
 
-        def recover_abandoned(self) -> tuple[()]:
+        def recover_abandoned(self, *, claim_guard=None) -> tuple[()]:
+            assert claim_guard is None or claim_guard()
             recovered_digests.append(self.embedding_profile.digest)
             return ()
 
@@ -1355,6 +1358,80 @@ def test_overlapping_readiness_only_recovers_published_service(
     assert first.result(timeout=2) is None
 
     assert recovered_digests == ["embedding-1"]
+
+
+def test_slow_recovery_does_not_hold_modern_runtime_lock(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, object())  # type: ignore[arg-type]
+    recovery_started = Event()
+    release_recovery = Event()
+    lock_probe_finished = Event()
+    hardware = HardwareReport(
+        cpu_architecture="AMD64",
+        logical_processors=8,
+        total_ram_bytes=32 * 1024**3,
+        available_ram_bytes=24 * 1024**3,
+        available_disk_bytes=100 * 1024**3,
+    )
+    monkeypatch.setattr(
+        "file_tagger.modern_context.profile_hardware",
+        lambda: hardware,
+    )
+
+    class SlowRecoveryService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def recover_abandoned(self, *, claim_guard=None) -> tuple[()]:
+            assert claim_guard is None or claim_guard()
+            recovery_started.set()
+            assert release_recovery.wait(5)
+            return ()
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.IndexingService",
+        SlowRecoveryService,
+    )
+
+    async def check_readiness(gateway, required):
+        return ReadinessReport(
+            ready=True,
+            profiles=(
+                ModelProfile(
+                    role="embedding",
+                    model=required.embedding,
+                    digest="embedding",
+                    context_length=8192,
+                    dimensions=768,
+                    capabilities=("embedding",),
+                ),
+            ),
+            ollama=OllamaReadiness(
+                available=True,
+                version="0.35.0",
+                base_url="http://127.0.0.1:11434",
+            ),
+            selected_models=required,
+        )
+
+    monkeypatch.setattr(runtime, "_check_readiness", check_readiness)
+    completion = runtime.start_readiness()
+    assert recovery_started.wait(2)
+
+    def inspect_published_runtime() -> None:
+        assert runtime.selected_models is not None
+        lock_probe_finished.set()
+
+    probe = threading.Thread(target=inspect_published_runtime)
+    probe.start()
+    try:
+        assert lock_probe_finished.wait(0.5)
+    finally:
+        release_recovery.set()
+        probe.join(2)
+        completion.result(timeout=2)
 
 
 def test_initialization_worker_exposes_modern_runtime_to_login(

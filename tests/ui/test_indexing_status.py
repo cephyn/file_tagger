@@ -127,6 +127,88 @@ def test_indexing_queues_a_second_ui_request_while_worker_is_running(qtbot) -> N
     qtbot.waitUntil(lambda: resumed == [1, 2])
 
 
+def test_close_mid_batch_restores_and_resumes_every_remaining_job(qtbot) -> None:
+    entered = Event()
+    paths = [
+        "C:\\library\\one.md",
+        "C:\\library\\two.md",
+        "C:\\library\\three.md",
+    ]
+
+    class DurableService:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def __init__(self) -> None:
+            self.jobs: dict[int, SimpleNamespace] = {}
+            self.next_job_id = 1
+            self.resumed: list[str] = []
+
+        def queue(self, path: str) -> int:
+            job_id = self.next_job_id
+            self.next_job_id += 1
+            self.jobs[job_id] = SimpleNamespace(
+                job_id=job_id,
+                file_path=path,
+                status="queued",
+                total_count=0,
+                processed_count=0,
+                failed_count=0,
+                retry_count=0,
+                revision=None,
+                failure=None,
+            )
+            return job_id
+
+        def queue_many(self, file_paths):
+            return tuple(self.queue(path) for path in file_paths)
+
+        def resumable_jobs(self):
+            return tuple(
+                job
+                for job in self.jobs.values()
+                if job.status not in {"completed", "running"}
+            )
+
+        def state(self, job_id: int):
+            return self.jobs[job_id]
+
+        def cancel(self, job_id: int):
+            job = self.jobs[job_id]
+            job.status = "queued"
+            return job
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            job = self.jobs[job_id]
+            assert len(self.jobs) == 3
+            self.resumed.append(job.file_path)
+            if len(self.resumed) == 1:
+                entered.set()
+                while cancellation_check is not None and not cancellation_check():
+                    Event().wait(0.01)
+                job.status = "queued"
+                return job
+            job.status = "completed"
+            return job
+
+    service = DurableService()
+    status = IndexingStatus(service)
+    qtbot.addWidget(status)
+    status.start_many(paths)
+    assert entered.wait(1)
+
+    assert [job.file_path for job in service.jobs.values()] == paths
+    assert status.shutdown(1_000)
+
+    restarted = IndexingStatus(service)
+    qtbot.addWidget(restarted)
+    qtbot.waitUntil(
+        lambda: all(job.status == "completed" for job in service.jobs.values())
+    )
+
+    assert sorted(service.resumed.count(path) for path in paths) == [1, 1, 2]
+
+
 def test_indexing_status_does_not_call_runtime_async_queue(qtbot) -> None:
     calls: list[str] = []
 

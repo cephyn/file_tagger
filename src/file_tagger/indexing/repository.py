@@ -86,34 +86,45 @@ class IndexingRepository:
         return min(30.0, max(0.01, self._lease_duration.total_seconds() / 3))
 
     def queue(self, file_path: str | Path, *, job_type: str = "index") -> int:
-        canonical_path = self._canonical_path(file_path)
+        return self.queue_many((file_path,), job_type=job_type)[0]
+
+    def queue_many(
+        self,
+        file_paths: Iterable[str | Path],
+        *,
+        job_type: str = "index",
+    ) -> tuple[int, ...]:
         with self._session_factory.begin() as session:
-            file = session.scalar(
-                select(File).where(File.canonical_path == canonical_path)
-            )
-            if file is None:
-                file = File(
-                    canonical_path=canonical_path,
-                    mime_type=self._mime_type(canonical_path),
-                    indexing_state="queued",
+            job_ids: list[int] = []
+            for file_path in file_paths:
+                canonical_path = self._canonical_path(file_path)
+                file = session.scalar(
+                    select(File).where(File.canonical_path == canonical_path)
                 )
-                session.add(file)
+                if file is None:
+                    file = File(
+                        canonical_path=canonical_path,
+                        mime_type=self._mime_type(canonical_path),
+                        indexing_state="queued",
+                    )
+                    session.add(file)
+                    session.flush()
+                else:
+                    file.mime_type = self._mime_type(canonical_path)
+                    file.indexing_state = "queued"
+                job = IndexJob(
+                    file_id=file.id,
+                    job_type=job_type,
+                    status="queued",
+                    total_count=0,
+                    processed_count=0,
+                    failed_count=0,
+                    retry_count=0,
+                )
+                session.add(job)
                 session.flush()
-            else:
-                file.mime_type = self._mime_type(canonical_path)
-                file.indexing_state = "queued"
-            job = IndexJob(
-                file_id=file.id,
-                job_type=job_type,
-                status="queued",
-                total_count=0,
-                processed_count=0,
-                failed_count=0,
-                retry_count=0,
-            )
-            session.add(job)
-            session.flush()
-            return int(job.id)
+                job_ids.append(int(job.id))
+            return tuple(job_ids)
 
     def begin(self, job_id: int) -> JobState:
         lease_token = uuid4().hex
@@ -284,6 +295,26 @@ class IndexingRepository:
                 ):
                     return self._state(session, job)
         return None
+
+    def resumable_jobs(self) -> tuple[JobState, ...]:
+        with self._session_factory() as session:
+            jobs = session.scalars(
+                select(IndexJob)
+                .where(
+                    IndexJob.file_id.is_not(None),
+                    IndexJob.status.in_(("queued", "failed", "pending", "running")),
+                )
+                .order_by(IndexJob.id)
+            )
+            return tuple(
+                self._state(session, job)
+                for job in jobs
+                if job.status != "running"
+                or (
+                    job.failure is not None
+                    and job.failure.get("code") == "cancel_requested"
+                )
+            )
 
     def heartbeat(self, job_id: int, *, lease_token: str) -> JobState:
         with self._session_factory.begin() as session:
