@@ -10,13 +10,13 @@ from time import perf_counter
 from typing import Any, Mapping, Sequence
 
 import pytest
-from ollama import AsyncClient
 
 from file_tagger.adapters.ollama.gateway import (
     DEFAULT_OLLAMA_HOST,
     OllamaGateway,
 )
 from file_tagger.domain.contracts import ModelProfile
+from file_tagger.domain.errors import RemoteOllamaHostError
 from file_tagger.infrastructure.app_paths import AppPaths
 
 
@@ -69,7 +69,6 @@ class ChatResult:
 @dataclass
 class RealOllama:
     gateway: OllamaGateway
-    client: AsyncClient
     report_dir: Path
     metrics: dict[str, Any] = field(default_factory=dict)
 
@@ -146,7 +145,7 @@ class RealOllama:
     ) -> ChatResult:
         started = perf_counter()
         response = asyncio.run(
-            self.client.chat(
+            self.gateway._client.chat(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
@@ -273,26 +272,34 @@ def integration_profile() -> IntegrationProfile:
         pytest.skip("set FILE_TAGGER_RUN_OLLAMA_TESTS=1 to run real local Ollama tests")
 
     host = os.environ.get("FILE_TAGGER_OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
-    gateway = OllamaGateway(host=host)
     try:
-        readiness = asyncio.run(
-            gateway.readiness(
-                {
-                    "embedding": os.environ.get(
-                        "FILE_TAGGER_OLLAMA_EMBED_MODEL",
-                        DEFAULT_EMBED_MODEL,
-                    ),
-                    "decision": os.environ.get(
-                        "FILE_TAGGER_OLLAMA_DECISION_MODEL",
-                        DEFAULT_DECISION_MODEL,
-                    ),
-                    "generation": os.environ.get(
-                        "FILE_TAGGER_OLLAMA_GENERATION_MODEL",
-                        DEFAULT_GENERATION_MODEL,
-                    ),
-                }
-            )
-        )
+        gateway = OllamaGateway(host=host)
+    except RemoteOllamaHostError as exc:
+        pytest.fail(f"Remote Ollama hosts require loopback: {exc}")
+
+    required_models = {
+        "embedding": os.environ.get(
+            "FILE_TAGGER_OLLAMA_EMBED_MODEL",
+            DEFAULT_EMBED_MODEL,
+        ),
+        "decision": os.environ.get(
+            "FILE_TAGGER_OLLAMA_DECISION_MODEL",
+            DEFAULT_DECISION_MODEL,
+        ),
+        "generation": os.environ.get(
+            "FILE_TAGGER_OLLAMA_GENERATION_MODEL",
+            DEFAULT_GENERATION_MODEL,
+        ),
+    }
+    try:
+        for model in required_models.values():
+            gateway._validate_model(model)
+    except Exception as exc:
+        asyncio.run(gateway.close())
+        pytest.fail(f"Cloud or missing Ollama model configuration: {exc}")
+
+    try:
+        readiness = asyncio.run(gateway.readiness(required_models))
     except Exception as exc:
         asyncio.run(gateway.close())
         pytest.fail(f"Could not connect to local Ollama: {exc}")
@@ -307,43 +314,25 @@ def integration_profile() -> IntegrationProfile:
         )
 
     profile = IntegrationProfile(
-        embedding=os.environ.get(
-            "FILE_TAGGER_OLLAMA_EMBED_MODEL",
-            DEFAULT_EMBED_MODEL,
-        ),
-        decision=os.environ.get(
-            "FILE_TAGGER_OLLAMA_DECISION_MODEL",
-            DEFAULT_DECISION_MODEL,
-        ),
-        generation=os.environ.get(
-            "FILE_TAGGER_OLLAMA_GENERATION_MODEL",
-            DEFAULT_GENERATION_MODEL,
-        ),
+        embedding=required_models["embedding"],
+        decision=required_models["decision"],
+        generation=required_models["generation"],
         embedding_profile=asyncio.run(
             gateway.model_profile(
                 "embedding",
-                os.environ.get(
-                    "FILE_TAGGER_OLLAMA_EMBED_MODEL",
-                    DEFAULT_EMBED_MODEL,
-                ),
+                required_models["embedding"],
             )
         ),
         decision_profile=asyncio.run(
             gateway.model_profile(
                 "decision",
-                os.environ.get(
-                    "FILE_TAGGER_OLLAMA_DECISION_MODEL",
-                    DEFAULT_DECISION_MODEL,
-                ),
+                required_models["decision"],
             )
         ),
         generation_profile=asyncio.run(
             gateway.model_profile(
                 "generation",
-                os.environ.get(
-                    "FILE_TAGGER_OLLAMA_GENERATION_MODEL",
-                    DEFAULT_GENERATION_MODEL,
-                ),
+                required_models["generation"],
             )
         ),
     )
@@ -358,11 +347,6 @@ def real_ollama(integration_profile: IntegrationProfile):
     report_dir = AppPaths.discover().data_dir / "reports"
     wrapper = RealOllama(
         gateway=gateway,
-        client=AsyncClient(
-            host=host,
-            timeout=120.0,
-            follow_redirects=False,
-        ),
         report_dir=report_dir,
     )
     yield wrapper

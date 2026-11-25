@@ -1,6 +1,25 @@
+from pathlib import Path
+
 import pytest
 
+from file_tagger.adapters.ollama.gateway import OllamaGateway
+from file_tagger.domain.errors import RemoteOllamaHostError
+
 pytestmark = pytest.mark.ollama
+
+
+def test_remote_host_requires_loopback_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FILE_TAGGER_RUN_OLLAMA_TESTS", "1")
+    monkeypatch.setenv("FILE_TAGGER_OLLAMA_HOST", "http://example.invalid:11434")
+    with pytest.raises(RemoteOllamaHostError):
+        OllamaGateway(host="http://example.invalid:11434")
+
+
+def test_conftest_does_not_construct_raw_host_client() -> None:
+    source = (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
+
+    assert "from ollama import AsyncClient" not in source
+    assert "AsyncClient(" not in source
 
 
 def test_installed_profiles_cover_embed_decide_and_answer(
