@@ -191,6 +191,151 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     assert answer.citations == evidence[0].citations
 
 
+def test_structured_claim_marker_must_resolve_to_its_claim_chunks() -> None:
+    first = make_result(
+        {
+            "file_path": r"C:\campaign\first.md",
+            "stable_id": "first",
+            "page_number": 1,
+            "text": "The first witness arrived early.",
+        },
+        source="fts",
+    )
+    second = make_result(
+        {
+            "file_path": r"C:\campaign\second.md",
+            "stable_id": "second",
+            "page_number": 1,
+            "text": "The second witness arrived late.",
+        },
+        source="fts",
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The first witness arrived early.",
+                "claims": [
+                    {
+                        "text": (
+                            "The first witness arrived early. "
+                            "[source: second]"
+                        ),
+                        "evidence_quote": "The first witness arrived early.",
+                        "chunk_ids": ["first"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="does not match"):
+        answer_question("What happened?", (first, second), gateway=fake_model)
+
+
+def test_structured_answer_rejects_duplicate_visible_source_markers() -> None:
+    evidence = _evidence()
+    chunk_id = evidence[0].chunk_id
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": (
+                    "A dragon guards the flooded temple. "
+                    f"[source: {chunk_id}] [source: {chunk_id}]"
+                ),
+                "claims": [
+                    {
+                        "text": "A dragon guards the flooded temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "chunk_ids": [chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="duplicate"):
+        answer_question("Find suitable encounters", evidence, gateway=fake_model)
+
+
+def test_structured_answer_marker_must_match_the_preceding_claim() -> None:
+    first = make_result(
+        {
+            "file_path": r"C:\campaign\first.md",
+            "stable_id": "first",
+            "page_number": 1,
+            "text": "The first witness arrived early.",
+        },
+        source="fts",
+    )
+    second = make_result(
+        {
+            "file_path": r"C:\campaign\second.md",
+            "stable_id": "second",
+            "page_number": 1,
+            "text": "The second witness arrived late.",
+        },
+        source="fts",
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": (
+                    "The first witness arrived early. [source: second]"
+                ),
+                "claims": [
+                    {
+                        "text": "The first witness arrived early.",
+                        "evidence_quote": "The first witness arrived early.",
+                        "chunk_ids": ["first"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="does not match"):
+        answer_question("What happened?", (first, second), gateway=fake_model)
+
+
+@pytest.mark.parametrize("qualifier", ("reportedly", "may", "believed"))
+def test_structured_claim_cannot_strengthen_qualified_evidence(
+    qualifier: str,
+) -> None:
+    quote = {
+        "reportedly": "The witness reportedly left before dawn.",
+        "may": "The witness may have left before dawn.",
+        "believed": "The witness is believed to have left before dawn.",
+    }[qualifier]
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "qualified",
+                "page_number": 1,
+                "text": quote,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The witness left before dawn.",
+                "claims": [
+                    {
+                        "text": "The witness left before dawn.",
+                        "evidence_quote": quote,
+                        "chunk_ids": ["qualified"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("When did the witness leave?", evidence, gateway=fake_model)
+
+
 def test_structured_claim_without_verifiable_quote_is_rejected() -> None:
     evidence = _evidence()
     fake_model = FakeModel(

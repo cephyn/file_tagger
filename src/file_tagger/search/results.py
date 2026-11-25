@@ -312,7 +312,13 @@ def _is_stale(item: object) -> bool:
         document = _first_value(page, "document") if page is not None else None
         file = _first_value(document, "file") if document is not None else None
         state = _first_value(file, "indexing_state")
-    return state is not None and str(state) != "indexed"
+    return state is not None and str(state).casefold() in {
+        "corrupt",
+        "missing",
+        "not_indexed",
+        "stale",
+        "superseded",
+    }
 
 
 def _mime_type(item: object) -> str | None:

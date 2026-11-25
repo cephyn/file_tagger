@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from file_tagger.domain.contracts import ModelProfile
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.persistence.models import Chunk, Document, File, FileTag, Page, Tag
 from file_tagger.rag.planner import SearchPlan
@@ -259,6 +260,68 @@ def test_vector_search_without_identity_keeps_only_lexical_results(
 
     assert [candidate.chunk_id for candidate in result] == ["lexical-only"]
     assert result[0].source == "fts"
+
+
+def test_changed_profile_does_not_fall_back_to_old_lexical_identity(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "old-index.md",
+        stable_id="old-profile",
+        text_value="needle is available from the old identity",
+        vector=_vector(1.0, 0.0),
+        model_digest="sha256:old",
+        index_version="old-v1",
+    )
+    search_session.commit()
+    new_profile = ModelProfile(
+        role="embedding",
+        model="embedding-new",
+        digest="sha256:new",
+        context_length=1_000,
+        dimensions=256,
+    )
+
+    result = HybridSearch(
+        search_session,
+        embedding_profile=new_profile,
+    ).search("needle", _vector(1.0, 0.0))
+
+    assert result == ()
+
+
+def test_active_profile_does_not_return_fts_only_from_missing_vector_rows(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "missing-vector.md",
+        stable_id="missing-vector",
+        text_value="needle with a missing semantic index row",
+        vector=_vector(1.0, 0.0),
+    )
+    search_session.commit()
+    chunk_id = search_session.scalar(
+        select(Chunk.id).where(Chunk.stable_id == "missing-vector")
+    )
+    assert chunk_id is not None
+    search_session.execute(
+        text("DELETE FROM chunk_embeddings_256 WHERE chunk_id = :chunk_id"),
+        {"chunk_id": chunk_id},
+    )
+    search_session.commit()
+
+    result = HybridSearch(search_session).search(
+        "needle",
+        _vector(1.0, 0.0),
+        model_digest=MODEL_DIGEST,
+        index_version=INDEX_VERSION,
+    )
+
+    assert result == ()
 
 
 @pytest.mark.parametrize(

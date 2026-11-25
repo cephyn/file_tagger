@@ -16,6 +16,10 @@ from file_tagger.domain.contracts import HardwareReport, ModelProfile
 from file_tagger.extraction.docling_adapter import ExtractedDocument, ExtractedPage
 from file_tagger.indexing.repository import IndexingRepository
 from file_tagger.indexing.service import IndexingService
+from file_tagger.infrastructure.database import (
+    create_session_factory,
+    upgrade_database,
+)
 from file_tagger.modern_context import (
     ModernIndexingUnavailable,
     ModernSearchUnavailable,
@@ -1167,12 +1171,110 @@ def test_manager_content_search_never_constructs_legacy_vector_search(
 
     try:
         manager.search_by_content()
+        qtbot.waitUntil(lambda: bool(calls))
+        qtbot.waitUntil(lambda: bool(manager.current_search_results))
     finally:
         source.unlink(missing_ok=True)
 
     assert calls == [("modern", (), True, 20)]
     assert manager.current_search_results[0]["summary"] == "modern result"
     assert manager.rag_search_results.count() > 0
+
+
+def test_manager_content_search_runs_runtime_work_on_qthread(
+    qtbot, monkeypatch, tmp_path
+) -> None:
+    from PySide6.QtCore import QThread
+
+    manager_class = _manager_class(monkeypatch)
+    manager = manager_class.__new__(manager_class)
+    file_tag_manager = sys.modules["file_tagger.file_tag_manager"]
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    source = tmp_path / "threaded-search.txt"
+    source.write_text("modern", encoding="utf-8")
+    entered = Event()
+    release = Event()
+    worker_threads: list[object] = []
+
+    class Runtime:
+        def search_content(
+            self,
+            query,
+            *,
+            tags=(),
+            use_and=True,
+            limit=20,
+            cancellation_check=None,
+        ):
+            del query, tags, use_and, limit, cancellation_check
+            worker_threads.append(QThread.currentThread())
+            entered.set()
+            assert release.wait(2)
+            return (
+                {
+                    "path": str(source),
+                    "score": 0.9,
+                    "summary": "threaded result",
+                    "snippets": ["modern"],
+                    "tags": [],
+                },
+            )
+
+    manager.modern_runtime = Runtime()
+    manager.vector_search = SimpleNamespace(
+        search=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy VectorSearch must not be used")
+        )
+    )
+    tab = manager.create_rag_search_tab()
+    qtbot.addWidget(tab)
+    manager.query_input.setText("modern")
+
+    manager.search_by_content()
+    assert entered.wait(1)
+    assert manager.current_search_results == []
+    assert worker_threads[0] is not QThread.currentThread()
+
+    release.set()
+    qtbot.waitUntil(
+        lambda: bool(manager.current_search_results)
+        and manager.current_search_results[0]["summary"] == "threaded result"
+    )
+
+
+def test_manager_content_search_cancellation_does_not_publish_results(
+    qtbot, monkeypatch
+) -> None:
+    manager_class = _manager_class(monkeypatch)
+    manager = manager_class.__new__(manager_class)
+    file_tag_manager = sys.modules["file_tagger.file_tag_manager"]
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    entered = Event()
+
+    class Runtime:
+        def search_content(self, *args, cancellation_check=None, **kwargs):
+            del args, kwargs
+            entered.set()
+            assert cancellation_check is not None
+            while not cancellation_check():
+                Event().wait(0.01)
+            return ({"path": "cancelled"},)
+
+    manager.modern_runtime = Runtime()
+    tab = manager.create_rag_search_tab()
+    qtbot.addWidget(tab)
+    manager.query_input.setText("cancel")
+
+    manager.search_by_content()
+    assert entered.wait(1)
+    manager.cancel_content_search()
+    qtbot.waitUntil(lambda: manager._content_search_worker is None)
+
+    assert manager.current_search_results == []
+    assert manager.cancel_content_search_btn.isEnabled() is False
+    assert manager.search_content_btn.isEnabled() is True
 
 
 def test_manager_content_search_reports_modern_unavailable(
@@ -1200,6 +1302,79 @@ def test_manager_content_search_reports_modern_unavailable(
     assert warnings
     assert "unavailable" in warnings[0].lower()
     assert manager.current_search_results == []
+
+
+def test_runtime_blocks_search_until_profile_full_reindex_is_complete(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    database = tmp_path / "runtime-profile-reindex.sqlite3"
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    source = tmp_path / "old-index.md"
+    source.write_text("source", encoding="utf-8")
+    old_profile = ModelProfile(
+        role="embedding",
+        model="embedding-old",
+        digest="sha256:old",
+        context_length=1_000,
+        dimensions=256,
+    )
+    new_profile = ModelProfile(
+        role="embedding",
+        model="embedding-new",
+        digest="sha256:new",
+        context_length=1_000,
+        dimensions=512,
+    )
+
+    class OldGateway:
+        async def embed(self, *args, **kwargs):
+            del args, kwargs
+            return (tuple(float(index) for index in range(256)),)
+
+    old_service = IndexingService(
+        IndexingRepository(session_factory),
+        extractor=SimpleNamespace(
+            extract=lambda path: ExtractedDocument(
+                file_path=str(path),
+                file_hash=sha256(Path(path).read_bytes()).hexdigest(),
+                parser="test",
+                parser_version="1",
+                status="complete",
+                pages=(
+                    ExtractedPage(
+                        number=1,
+                        ordinal=0,
+                        text="old indexed content",
+                        markdown="old indexed content",
+                    ),
+                ),
+            )
+        ),
+        embedding_gateway=OldGateway(),
+        embedding_profile=old_profile,
+    )
+    assert old_service.reindex(source).status == "completed"
+
+    runtime = ModernRuntime(paths, session_factory)
+    runtime.required_models = RequiredModels(
+        embedding=new_profile.model,
+        decision="decision",
+        generation="generation",
+    )
+    runtime.readiness = ReadinessReport(
+        ready=True,
+        profiles=(new_profile,),
+        selected_models=runtime.required_models,
+    )
+    runtime._embedding_gateway = object()
+
+    with pytest.raises(ModernSearchUnavailable, match="reindex"):
+        runtime.search_content("old indexed content")
+    assert runtime.readiness is not None
+    assert runtime.readiness.ready is False
+    assert "search" in runtime.readiness.blocked_roles
 
 
 def test_runtime_readiness_completion_ignores_stale_overlapping_result(

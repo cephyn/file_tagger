@@ -370,6 +370,116 @@ def test_indexed_file_mime_type_supports_filtered_hybrid_search(
     assert results[0].source == "vector"
 
 
+@pytest.mark.parametrize("job_state", ("queued", "running", "failed", "paused"))
+def test_noncompleted_job_never_hides_previous_committed_revision(
+    tmp_path: Path,
+    job_state: str,
+) -> None:
+    database = tmp_path / f"available-{job_state}.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    repository = IndexingRepository(session_factory)
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=1_000,
+        dimensions=256,
+    )
+    service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="committed evidence", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=profile,
+    )
+    assert service.reindex(source).status == "completed"
+    job_id = repository.queue(source)
+    owner = None
+    if job_state in {"running", "failed", "paused"}:
+        owner = repository.begin(job_id)
+    if job_state == "failed":
+        assert owner is not None and owner.lease_token is not None
+        repository.fail(
+            job_id,
+            {"code": "test", "summary": "expected failure"},
+            lease_token=owner.lease_token,
+        )
+    elif job_state == "paused":
+        assert owner is not None and owner.lease_token is not None
+        repository.pause(job_id, lease_token=owner.lease_token)
+
+    with session_factory() as session:
+        file = session.scalar(select(File))
+        assert file is not None
+        assert file.indexing_state == "indexed"
+        results = HybridSearch(session, embedding_profile=profile).search(
+            "committed evidence",
+            tuple(float(index) for index in range(256)),
+        )
+
+    assert len(results) == 1
+    assert results[0].stale is False
+
+
+def test_embedding_profile_change_requires_full_vector_reindex(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "profile-reindex.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    session_factory = create_session_factory(database)
+    repository = IndexingRepository(session_factory)
+    old_profile = ModelProfile(
+        role="embedding",
+        model="embedding-old",
+        digest="sha256:old",
+        context_length=1_000,
+        dimensions=256,
+    )
+    new_profile = ModelProfile(
+        role="embedding",
+        model="embedding-new",
+        digest="sha256:new",
+        context_length=1_000,
+        dimensions=512,
+    )
+    old_service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="old vector identity", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=old_profile,
+    )
+    assert old_service.reindex(source).status == "completed"
+
+    before = repository.vector_readiness(new_profile)
+    queued = repository.queue_vector_reindex(new_profile)
+    after_queue = repository.vector_readiness(new_profile)
+
+    assert before.ready is False
+    assert before.total_files == before.pending_files == 1
+    assert len(queued) == 1
+    assert after_queue.ready is False
+    assert repository.queue_vector_reindex(new_profile) == ()
+
+    new_service = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="new vector identity", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=new_profile,
+    )
+    assert new_service.resume(queued[0]).status == "completed"
+    assert repository.vector_readiness(new_profile).ready is True
+
+
 def test_job_claim_is_exclusive_and_stale_owner_cannot_mutate_completion(
     tmp_path: Path,
 ) -> None:

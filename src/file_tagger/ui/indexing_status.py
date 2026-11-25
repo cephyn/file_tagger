@@ -82,6 +82,7 @@ class IndexingStatus(QWidget):
         self._worker_generation = 0
         self._result_handled = False
         self._completed = False
+        self._last_result: Any | None = None
         self._closing = False
 
         layout = QVBoxLayout(self)
@@ -119,6 +120,18 @@ class IndexingStatus(QWidget):
 
     @property
     def previous_revision_available(self) -> bool:
+        last_revision = getattr(self._last_result, "revision", None)
+        if self._last_result is not None:
+            return last_revision is not None
+        state_call = getattr(self._active_service, "state", None)
+        if self._job_id is not None and callable(state_call):
+            try:
+                state = state_call(self._job_id)
+            except Exception:
+                pass
+            else:
+                revision = getattr(state, "revision", None)
+                return revision is not None
         return bool(getattr(self.service, "previous_revision_available", True))
 
     def _resolved_service(self) -> Any:
@@ -232,6 +245,7 @@ class IndexingStatus(QWidget):
         self._job_id = job_id
         self._result_handled = False
         self._completed = False
+        self._last_result = None
         self._set_progress(
             "Extracting",
             3,
@@ -337,6 +351,7 @@ class IndexingStatus(QWidget):
         if not self._is_current_worker(worker, generation) or self._result_handled:
             return
         self._result_handled = True
+        self._last_result = result
         self._timer.stop()
         self.cancel_button.setEnabled(False)
         self.finished.emit(result)

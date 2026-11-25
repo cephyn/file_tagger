@@ -11,6 +11,10 @@ from ..search.results import MatchedSection, SearchCitation, SearchResult
 
 NOT_FOUND_ANSWER = "not found in indexed files"
 MAX_ANSWER_RESPONSE_BYTES = 64 * 1024
+SOURCE_MARKER_PATTERN = re.compile(
+    r"\[source:\s*([^\]]+?)\s*\]",
+    flags=re.IGNORECASE,
+)
 
 
 class AnswerClaim(DomainRecord):
@@ -109,29 +113,20 @@ def parse_cited_answer(
         )
 
     by_chunk, by_citation = _citation_indexes(evidence)
-    known_markers = {*by_chunk, *by_citation}
-    marker_text = "\n".join(
-        (structured.answer, *(claim.text for claim in structured.claims))
+    _resolved_markers(
+        "\n".join(
+            (structured.answer, *(claim.text for claim in structured.claims))
+        ),
+        by_chunk,
+        by_citation,
     )
-    unknown_markers = [
-        marker
-        for marker in re.findall(
-            r"\[source:\s*([^\]]+?)\s*\]",
-            marker_text,
-            flags=re.IGNORECASE,
-        )
-        if marker not in known_markers
-    ]
-    if unknown_markers:
-        raise UncitedAnswerError(
-            "The model answer references unknown evidence citation "
-            f"{unknown_markers[0]!r}."
-        )
     claims: list[AnswerClaim] = []
     seen_citations: dict[str, SearchCitation] = {}
+    resolved_claims: list[tuple[StructuredClaim, tuple[SearchCitation, ...]]] = []
     for raw_claim in structured.claims:
         resolved: list[SearchCitation] = []
         chunk_ids: list[str] = []
+        seen_references: set[str] = set()
         for reference in raw_claim.chunk_ids:
             match = by_chunk.get(reference)
             if match is None:
@@ -140,6 +135,12 @@ def parse_cited_answer(
                 raise UncitedAnswerError(
                     f"The model answer references unknown evidence ID {reference!r}."
                 )
+            if match.citation_id in seen_references:
+                raise UncitedAnswerError(
+                    "The model answer contains duplicate evidence chunk IDs "
+                    f"for {match.chunk_id!r}."
+                )
+            seen_references.add(match.citation_id)
             if match.chunk_id not in chunk_ids:
                 chunk_ids.append(match.chunk_id)
                 resolved.append(match)
@@ -160,6 +161,8 @@ def parse_cited_answer(
             raise UncitedAnswerError(
                 "The model answer contains a claim not supported by its evidence quote."
             )
+        _validate_claim_markers(raw_claim.text, tuple(resolved), by_chunk, by_citation)
+        resolved_claims.append((raw_claim, tuple(resolved)))
         claims.append(
             AnswerClaim(
                 text=raw_claim.text,
@@ -169,6 +172,12 @@ def parse_cited_answer(
             )
         )
 
+    _validate_answer_markers(
+        structured.answer,
+        resolved_claims,
+        by_chunk,
+        by_citation,
+    )
     if not _answer_is_supported(structured.answer, structured.claims):
         raise UncitedAnswerError(
             "The model answer contains text unsupported by its validated claims."
@@ -230,24 +239,53 @@ def _citation_indexes(
 
 
 def _normalized_words(value: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"[^\W_]+(?:[-'][^\W_]+)?", value.casefold()))
+    without_markers = SOURCE_MARKER_PATTERN.sub("", value)
+    return tuple(
+        re.findall(
+            r"[^\W_]+(?:[-'][^\W_]+)?",
+            without_markers.casefold(),
+        )
+    )
 
 
 def _claim_is_supported(claim: str, quote: str) -> bool:
     raw_claim_words = _normalized_words(claim)
     raw_quote_words = _normalized_words(quote)
     relation_markers = {
+        "alleged",
+        "allegedly",
+        "appears",
+        "apparently",
+        "believed",
+        "believes",
+        "believe",
         "no",
         "not",
         "never",
         "without",
         "cannot",
         "can't",
+        "claimed",
+        "claims",
+        "could",
+        "indicated",
+        "indicates",
         "may",
         "might",
         "must",
+        "possibly",
+        "probably",
+        "purportedly",
+        "reported",
+        "reportedly",
+        "reports",
+        "seemingly",
         "shall",
         "should",
+        "suggested",
+        "suggests",
+        "suspected",
+        "suspects",
         "will",
         "would",
     }
@@ -317,6 +355,93 @@ def _answer_is_supported(
         any(_claim_is_supported(part, claim.text) for claim in claims)
         for part in answer_parts
     )
+
+
+def _validate_claim_markers(
+    text: str,
+    resolved: Sequence[SearchCitation],
+    by_chunk: Mapping[str, SearchCitation],
+    by_citation: Mapping[str, SearchCitation],
+) -> None:
+    markers = _resolved_markers(text, by_chunk, by_citation)
+    allowed_ids = {
+        citation.citation_id
+        for citation in resolved
+    }
+    if any(marker.citation_id not in allowed_ids for marker in markers):
+        raise UncitedAnswerError(
+            "A visible source marker does not match the claim chunk_ids."
+        )
+
+
+def _validate_answer_markers(
+    answer: str,
+    resolved_claims: Sequence[
+        tuple[StructuredClaim, tuple[SearchCitation, ...]]
+    ],
+    by_chunk: Mapping[str, SearchCitation],
+    by_citation: Mapping[str, SearchCitation],
+) -> None:
+    for part in _answer_parts_preserving_markers(answer):
+        if not part.strip():
+            continue
+        markers = _resolved_markers(part, by_chunk, by_citation)
+        if not markers:
+            continue
+        supported_claims = [
+            citations
+            for claim, citations in resolved_claims
+            if _claim_is_supported(part, claim.text)
+        ]
+        if not supported_claims:
+            continue
+        allowed_ids = {
+            citation.citation_id
+            for citations in supported_claims
+            for citation in citations
+        }
+        if any(marker.citation_id not in allowed_ids for marker in markers):
+            raise UncitedAnswerError(
+                "A visible source marker does not match its structured claim."
+            )
+
+
+def _answer_parts_preserving_markers(answer: str) -> tuple[str, ...]:
+    return tuple(
+        part
+        for part in re.split(
+            r"(?<=[.!?])\s+(?!(?i:\[source:))|(?<=\])\s+(?=\S)|\n+",
+            answer.strip(),
+        )
+        if part.strip()
+    )
+
+
+def _resolved_markers(
+    text: str,
+    by_chunk: Mapping[str, SearchCitation],
+    by_citation: Mapping[str, SearchCitation],
+) -> tuple[SearchCitation, ...]:
+    markers = tuple(
+        match.group(1).strip()
+        for match in SOURCE_MARKER_PATTERN.finditer(text)
+    )
+    resolved: list[SearchCitation] = []
+    seen: set[str] = set()
+    for marker in markers:
+        citation = by_chunk.get(marker) or by_citation.get(marker)
+        if citation is None:
+            raise UncitedAnswerError(
+                "The model answer references unknown evidence citation "
+                f"{marker!r}."
+            )
+        if citation.citation_id in seen:
+            raise UncitedAnswerError(
+                f"The model answer contains duplicate evidence marker {marker!r}."
+            )
+        seen.add(citation.citation_id)
+        resolved.append(citation)
+    return tuple(resolved)
 
 
 __all__ = (

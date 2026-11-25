@@ -429,6 +429,7 @@ def execute_search_plan(
     per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
     limit: int = DEFAULT_EVIDENCE_LIMIT,
     max_sections_per_file: int = DEFAULT_MAX_SECTIONS_PER_FILE,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[SearchResult, ...]:
     return _run_sync(
         execute_search_plan_async(
@@ -441,6 +442,7 @@ def execute_search_plan(
             per_query_limit=per_query_limit,
             limit=limit,
             max_sections_per_file=max_sections_per_file,
+            cancellation_check=cancellation_check,
         )
     )
 
@@ -456,6 +458,7 @@ async def execute_search_plan_async(
     per_query_limit: int = DEFAULT_PER_QUERY_LIMIT,
     limit: int = DEFAULT_EVIDENCE_LIMIT,
     max_sections_per_file: int = DEFAULT_MAX_SECTIONS_PER_FILE,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[SearchResult, ...]:
     if not isinstance(plan, SearchPlan):
         raise TypeError("plan must be a SearchPlan.")
@@ -467,6 +470,8 @@ async def execute_search_plan_async(
         raise ValueError("The per-file evidence limit must be positive.")
     if limit == 0:
         return ()
+    if cancellation_check is not None and cancellation_check():
+        raise asyncio.CancelledError
 
     selected_filters, retrieval_constraints = _plan_search_options(plan)
     queries = tuple(
@@ -487,10 +492,13 @@ async def execute_search_plan_async(
             embedding_gateway,
             selected_profile,
             queries,
+            cancellation_check=cancellation_check,
         )
 
     candidates: list[SearchResult] = []
     for index, query in enumerate(queries):
+        if cancellation_check is not None and cancellation_check():
+            raise asyncio.CancelledError
         if embeddings is None:
             if selected_filters is None:
                 candidates.extend(search.search(query, limit=per_query_limit))
@@ -762,7 +770,11 @@ async def _embed_queries(
     gateway: Any | None,
     profile: ModelProfile,
     queries: Sequence[str],
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[tuple[float, ...], ...]:
+    if cancellation_check is not None and cancellation_check():
+        raise asyncio.CancelledError
     dimensions = profile.dimensions
     assert dimensions is not None
     embed = getattr(gateway, "embed", None)
@@ -778,6 +790,8 @@ async def _embed_queries(
     )
     if inspect.isawaitable(result):
         result = await result
+    if cancellation_check is not None and cancellation_check():
+        raise asyncio.CancelledError
     if not isinstance(result, Sequence) or isinstance(result, (str, bytes)):
         raise ModelIncompatibleError(
             "The embedding gateway returned invalid retrieval query vectors."

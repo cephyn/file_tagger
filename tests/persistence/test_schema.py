@@ -204,3 +204,59 @@ def test_tag_cache_identity_migration_adds_document_state_digest(
     assert "document_state_digest" in columns
     assert "file_path" in index_columns
     assert "document_state_digest" in index_columns
+
+
+def test_index_availability_migration_preserves_committed_documents(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "job-state-v9.sqlite3"
+    config_path = Path(__file__).resolve().parents[2] / "alembic.ini"
+    config = Config(str(config_path))
+    config.attributes["database_path"] = database_path
+    command.upgrade(config, "0009_tag_cache_document")
+    with sqlite3.connect(database_path) as connection:
+        cursor = connection.execute(
+            "INSERT INTO files "
+            "(canonical_path, indexing_state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                r"C:\docs\committed.md",
+                "running",
+                "2026-11-24 11:00:00",
+                "2026-11-24 11:00:00",
+            ),
+        )
+        committed_id = int(cursor.lastrowid)
+        missing_id = int(
+            connection.execute(
+                "INSERT INTO files "
+                "(canonical_path, indexing_state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    r"C:\docs\missing.md",
+                    "failed",
+                    "2026-11-24 11:00:00",
+                    "2026-11-24 11:00:00",
+                ),
+            ).lastrowid
+        )
+        connection.execute(
+            "INSERT INTO documents "
+            "(file_id, revision, file_hash, extraction_version, parser, "
+            "page_count, extraction_status, diagnostics, created_at) "
+            "VALUES (?, 1, 'hash', 'test', 'test', 1, 'complete', '[]', ?)",
+            (committed_id, "2026-11-24 11:00:00"),
+        )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(database_path) as connection:
+        states = dict(
+            connection.execute(
+                "SELECT id, indexing_state FROM files ORDER BY id"
+            )
+        )
+    assert states == {
+        committed_id: "indexed",
+        missing_id: "not_indexed",
+    }

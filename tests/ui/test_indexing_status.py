@@ -25,6 +25,33 @@ def test_index_cancel_does_not_delete_previous_revision(qtbot) -> None:
     assert service.previous_revision_available is True
 
 
+def test_previous_revision_availability_comes_from_committed_state(qtbot) -> None:
+    class Service:
+        cancel_requested = False
+
+        def queue(self, path: str) -> int:
+            del path
+            return 4
+
+        def state(self, job_id: int):
+            assert job_id == 4
+            return SimpleNamespace(revision=None, status="running")
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            del job_id, cancellation_check
+            return SimpleNamespace(
+                revision=None,
+                status="queued",
+                failure=None,
+            )
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+    status.start("C:\\library\\first.md")
+
+    assert status.previous_revision_available is False
+
+
 def test_indexing_runs_off_the_ui_thread_and_commits_after_success(qtbot) -> None:
     entered = Event()
     release = Event()

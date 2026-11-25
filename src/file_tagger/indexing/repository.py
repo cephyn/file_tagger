@@ -9,10 +9,11 @@ import struct
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import and_, case, delete, func, or_, select, text, update
+from sqlalchemy import and_, bindparam, case, delete, func, or_, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
+from ..domain.contracts import ModelProfile
 from ..domain.errors import IndexTransactionError
 from ..extraction.docling_adapter import ExtractedDocument
 from ..persistence.models import (
@@ -64,6 +65,16 @@ class JobCheckpoint:
     source_hash: str
 
 
+@dataclass(frozen=True)
+class VectorIndexReadiness:
+    ready: bool
+    total_files: int
+    ready_files: int
+    pending_files: int
+    model_digest: str
+    index_version: str
+
+
 class IndexingRepository:
     def __init__(
         self,
@@ -105,13 +116,12 @@ class IndexingRepository:
                     file = File(
                         canonical_path=canonical_path,
                         mime_type=self._mime_type(canonical_path),
-                        indexing_state="queued",
+                        indexing_state="not_indexed",
                     )
                     session.add(file)
                     session.flush()
                 else:
                     file.mime_type = self._mime_type(canonical_path)
-                    file.indexing_state = "queued"
                 job = IndexJob(
                     file_id=file.id,
                     job_type=job_type,
@@ -178,11 +188,6 @@ class IndexingRepository:
                 job.failure and job.failure.get("code") == "cancel_requested"
             ):
                 job.failure = None
-            session.execute(
-                update(File)
-                .where(File.id == job.file_id)
-                .values(indexing_state="running", updated_at=claimed_at)
-            )
             session.expire_all()
             job = self._job(session, job_id)
             return self._state(session, job)
@@ -448,8 +453,6 @@ class IndexingRepository:
             job.lease_expires_at = None
             job.failure = None
             job.completed_at = None
-            if job.file is not None:
-                job.file.indexing_state = "queued"
             session.flush()
             return self._state(session, job)
 
@@ -466,8 +469,6 @@ class IndexingRepository:
             job.lease_expires_at = None
             job.failure = None
             job.completed_at = None
-            if job.file is not None:
-                job.file.indexing_state = "queued"
             session.flush()
             return self._state(session, job)
 
@@ -486,8 +487,6 @@ class IndexingRepository:
             job.failure = dict(failure)
             job.failed_count += 1
             job.completed_at = datetime.now(UTC)
-            if job.file is not None:
-                job.file.indexing_state = "failed"
             session.flush()
             return self._state(session, job)
 
@@ -503,6 +502,138 @@ class IndexingRepository:
                 .join(File, Document.file_id == File.id)
                 .where(File.canonical_path == canonical_path)
             )
+
+    def vector_readiness(
+        self,
+        profile: ModelProfile,
+    ) -> VectorIndexReadiness:
+        dimensions = profile.dimensions
+        index_version = profile.default_index_version
+        if (
+            profile.role != "embedding"
+            or dimensions not in VECTOR_DIMENSIONS
+            or index_version is None
+        ):
+            raise ValueError("A dimensioned embedding profile is required.")
+        with self._session_factory() as session:
+            files = tuple(session.scalars(select(File).order_by(File.id)))
+            ready_files = sum(
+                self._file_vector_ready(
+                    session,
+                    file,
+                    model_digest=profile.digest,
+                    index_version=index_version,
+                    dimensions=dimensions,
+                )
+                for file in files
+            )
+        total_files = len(files)
+        return VectorIndexReadiness(
+            ready=ready_files == total_files,
+            total_files=total_files,
+            ready_files=ready_files,
+            pending_files=total_files - ready_files,
+            model_digest=profile.digest,
+            index_version=index_version,
+        )
+
+    def queue_vector_reindex(
+        self,
+        profile: ModelProfile,
+    ) -> tuple[int, ...]:
+        dimensions = profile.dimensions
+        index_version = profile.default_index_version
+        if (
+            profile.role != "embedding"
+            or dimensions not in VECTOR_DIMENSIONS
+            or index_version is None
+        ):
+            raise ValueError("A dimensioned embedding profile is required.")
+        with self._session_factory.begin() as session:
+            pending_paths: list[str] = []
+            for file in session.scalars(select(File).order_by(File.id)):
+                if self._file_vector_ready(
+                    session,
+                    file,
+                    model_digest=profile.digest,
+                    index_version=index_version,
+                    dimensions=dimensions,
+                ):
+                    continue
+                outstanding = session.scalar(
+                    select(IndexJob.id)
+                    .where(
+                        IndexJob.file_id == file.id,
+                        IndexJob.status.in_(
+                            ("pending", "queued", "running", "failed")
+                        ),
+                    )
+                    .order_by(IndexJob.updated_at.desc(), IndexJob.id.desc())
+                    .limit(1)
+                )
+                if outstanding is None:
+                    pending_paths.append(file.canonical_path)
+        if not pending_paths:
+            return ()
+        return self.queue_many(pending_paths)
+
+    @staticmethod
+    def _file_vector_ready(
+        session: Session,
+        file: File,
+        *,
+        model_digest: str,
+        index_version: str,
+        dimensions: int,
+    ) -> bool:
+        document = session.scalar(
+            select(Document)
+            .where(Document.file_id == file.id)
+            .order_by(Document.revision.desc(), Document.id.desc())
+            .limit(1)
+        )
+        if (
+            document is None
+            or document.extraction_status == "failed"
+            or file.content_hash != document.file_hash
+            or file.indexing_state
+            in {"corrupt", "missing", "not_indexed", "stale", "superseded"}
+        ):
+            return False
+        chunk_rows = tuple(
+            session.execute(
+                select(
+                    Chunk.id,
+                    Chunk.model_digest,
+                    Chunk.index_version,
+                ).where(Chunk.document_id == document.id)
+            )
+        )
+        if not chunk_rows:
+            return document.page_count >= 0
+        if any(
+            str(row.model_digest) != model_digest
+            or str(row.index_version) != index_version
+            for row in chunk_rows
+        ):
+            return False
+        chunk_ids = tuple(int(row.id) for row in chunk_rows)
+        vector_count = session.scalar(
+            text(
+                f"SELECT count(*) FROM chunk_embeddings_{dimensions} "
+                "WHERE chunk_id IN :chunk_ids"
+            ).bindparams(bindparam("chunk_ids", expanding=True)),
+            {"chunk_ids": chunk_ids},
+        )
+        fts_count = session.scalar(
+            text("SELECT count(*) FROM chunks_fts WHERE rowid IN :chunk_ids").bindparams(
+                bindparam("chunk_ids", expanding=True)
+            ),
+            {"chunk_ids": chunk_ids},
+        )
+        return bool(
+            vector_count == len(chunk_ids) and fts_count == len(chunk_ids)
+        )
 
     def fail_next_vector_insert(self) -> None:
         self._fail_next_vector = True

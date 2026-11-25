@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .adapters.ollama.gateway import OllamaGateway
 from .extraction.docling_adapter import DoclingAdapter
 from .indexing.repository import IndexingRepository
+from .indexing.repository import VectorIndexReadiness
 from .indexing.service import IndexingResult, IndexingService
 from .infrastructure.app_paths import AppPaths
 from .infrastructure.database import create_session_factory, upgrade_database
@@ -96,7 +97,7 @@ class ModernRuntime:
         self.session_factory = session_factory
         self.sqlite_migration = sqlite_migration
         self.config_migration = config_migration
-        self.readiness: ReadinessReport | None = None
+        self._model_readiness: ReadinessReport | None = None
         self.required_models: RequiredModels | None = None
         self._indexing_service: IndexingService | None = None
         self._indexing_repository = (
@@ -115,6 +116,72 @@ class ModernRuntime:
         self._unavailable_reason = unavailable_reason
         self._readiness_generation = 0
         self._model_overrides = self._load_model_overrides()
+
+    @property
+    def readiness(self) -> ReadinessReport | None:
+        report = self._model_readiness
+        if report is None:
+            return None
+        profile = report.selected_profile("embedding")
+        required = self.required_models
+        selected = report.selected_models
+        if (
+            profile is None
+            or required is None
+            or selected != required
+            or self._indexing_repository is None
+        ):
+            return report
+        try:
+            readiness = self._indexing_repository.vector_readiness(profile)
+        except Exception:
+            if not callable(
+                getattr(self.session_factory, "begin", None)
+            ):
+                return report
+            blocked_roles = tuple(
+                dict.fromkeys((*report.blocked_roles, "search"))
+            )
+            return report.model_copy(
+                update={
+                    "ready": False,
+                    "blocked_roles": blocked_roles,
+                    "instructions": tuple(
+                        dict.fromkeys(
+                            (
+                                *report.instructions,
+                                "Semantic search is unavailable until committed "
+                                "index readiness can be verified.",
+                            )
+                        )
+                    ),
+                }
+            )
+        if readiness.ready:
+            return report
+        blocked_roles = tuple(
+            dict.fromkeys((*report.blocked_roles, "search"))
+        )
+        instructions = tuple(
+            dict.fromkeys(
+                (
+                    *report.instructions,
+                    "Semantic search requires a full reindex for the active "
+                    f"embedding profile ({readiness.pending_files} file(s) pending).",
+                )
+            )
+        )
+        return report.model_copy(
+            update={
+                "ready": False,
+                "blocked_roles": blocked_roles,
+                "instructions": instructions,
+            }
+        )
+
+    @readiness.setter
+    def readiness(self, report: ReadinessReport | None) -> None:
+        self._model_readiness = report
 
     @property
     def unavailable_reason(self) -> str:
@@ -149,6 +216,22 @@ class ModernRuntime:
             if self.readiness is not None:
                 return self.readiness.selected_models
         return None
+
+    @property
+    def vector_index_readiness(self) -> VectorIndexReadiness | None:
+        report = self._model_readiness
+        required = self.required_models
+        profile = report.selected_profile("embedding") if report is not None else None
+        repository = self._indexing_repository
+        if (
+            profile is None
+            or required is None
+            or report is None
+            or report.selected_models != required
+            or repository is None
+        ):
+            return None
+        return repository.vector_readiness(profile)
 
     def selected_profile(self, role: str) -> ModelProfile | None:
         with self._lock:
@@ -309,6 +392,16 @@ class ModernRuntime:
             published_service = False
             with self._lock:
                 if generation == self._readiness_generation:
+                    if (
+                        embedding_profile is not None
+                        and self._indexing_repository is not None
+                    ):
+                        try:
+                            self._indexing_repository.queue_vector_reindex(
+                                embedding_profile
+                            )
+                        except AttributeError:
+                            pass
                     self.required_models = required
                     self.readiness = report
                     self._indexing_service = indexing_service
@@ -323,6 +416,9 @@ class ModernRuntime:
                     generation,
                     indexing_service,
                 )
+            with self._lock:
+                if generation == self._readiness_generation:
+                    report = self.readiness
             logger.info(
                 "Modern local-model readiness initialized (ready=%s, profiles=%d).",
                 report.ready if report is not None else False,
@@ -569,15 +665,39 @@ class ModernRuntime:
         tags: Iterable[str] = (),
         use_and: bool = True,
         limit: int = 20,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> tuple[SearchResult, ...]:
         if not isinstance(query, str) or not query.strip():
             return ()
+        if cancellation_check is not None and cancellation_check():
+            raise asyncio.CancelledError
         with self._lock:
             gateway = self._embedding_gateway
             factory = self.session_factory
         profile = self.embedding_profile
         if profile is None or gateway is None or factory is None:
             raise ModernSearchUnavailable(self.unavailable_reason)
+        repository = self._indexing_repository
+        if repository is None:
+            raise ModernSearchUnavailable("The modern database is unavailable.")
+        try:
+            repository.queue_vector_reindex(profile)
+            readiness = repository.vector_readiness(profile)
+        except AttributeError:
+            if callable(getattr(self.session_factory, "begin", None)):
+                raise ModernSearchUnavailable(
+                    "the committed vector index readiness could not be verified."
+                )
+            readiness = None
+        except Exception as exc:
+            raise ModernSearchUnavailable(
+                "the committed vector index readiness could not be verified."
+            ) from exc
+        if readiness is not None and not readiness.ready:
+            raise ModernSearchUnavailable(
+                "the active embedding profile requires a full reindex "
+                f"({readiness.pending_files} file(s) pending)."
+            )
 
         selected_tags = tuple(dict.fromkeys(tag.strip() for tag in tags if tag.strip()))
         tag_groups = (
@@ -599,19 +719,26 @@ class ModernRuntime:
                     filters=tuple(f"tag:{tag}" for tag in tag_group),
                     evidence_categories=("document_content",),
                 )
+                search_kwargs: dict[str, Any] = {
+                    "embedding_gateway": gateway,
+                    "embedding_profile": profile,
+                    "model_digest": profile.digest,
+                    "index_version": profile.default_index_version,
+                    "per_query_limit": per_query_limit,
+                    "limit": limit,
+                    "max_sections_per_file": 1,
+                }
+                if cancellation_check is not None:
+                    search_kwargs["cancellation_check"] = cancellation_check
                 matches.extend(
                     execute_search_plan(
                         plan,
                         search,
-                        embedding_gateway=gateway,
-                        embedding_profile=profile,
-                        model_digest=profile.digest,
-                        index_version=profile.default_index_version,
-                        per_query_limit=per_query_limit,
-                        limit=limit,
-                        max_sections_per_file=1,
+                        **search_kwargs,
                     )
                 )
+                if cancellation_check is not None and cancellation_check():
+                    raise asyncio.CancelledError
             return merge_results(matches, limit=limit)
         finally:
             session.close()

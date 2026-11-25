@@ -174,23 +174,29 @@ class HybridSearch:
         lexical_query = normalize_fts_query(query)
         if not lexical_query:
             return ()
+        embedding = tuple(query_embedding or ())
+        identity = (
+            self._vector_identity(
+                embedding,
+                model_digest=model_digest,
+                index_version=index_version,
+                embedding_profile=embedding_profile,
+                profile=profile,
+            )
+            if embedding
+            else None
+        )
         with _sqlite_read_snapshot(self._session):
             rankings: dict[str, tuple[str, ...]] = {
                 "lexical": self._lexical_rankings(
                     lexical_query,
                     selected_filters,
+                    identity,
+                    len(embedding) if identity is not None else None,
                 )
             }
 
-            embedding = tuple(query_embedding or ())
             if embedding:
-                identity = self._vector_identity(
-                    embedding,
-                    model_digest=model_digest,
-                    index_version=index_version,
-                    embedding_profile=embedding_profile,
-                    profile=profile,
-                )
                 if identity is not None:
                     rankings["vector"] = self._vector_rankings(
                         embedding,
@@ -201,15 +207,29 @@ class HybridSearch:
             fused = reciprocal_rank_fusion(rankings, k=self._rrf_k)
             if not fused:
                 return ()
-            hydrated = self._hydrate_candidates(fused, selected_filters)
+            hydrated = self._hydrate_candidates(
+                fused,
+                selected_filters,
+                identity,
+                len(embedding) if identity is not None else None,
+            )
             return self._group_by_file(fused, hydrated, limit)
 
     def _lexical_rankings(
         self,
         lexical_query: str,
         filters: SearchFilters,
+        identity: tuple[str, str] | None = None,
+        vector_dimensions: int | None = None,
     ) -> tuple[str, ...]:
         conditions, parameters = _filter_sql(filters)
+        if identity is not None:
+            conditions, parameters = _restrict_index_identity(
+                conditions,
+                parameters,
+                identity,
+                vector_dimensions,
+            )
         parameters.update(
             {
                 "lexical_query": lexical_query,
@@ -326,8 +346,17 @@ class HybridSearch:
         self,
         fused: tuple[FusedHit, ...],
         filters: SearchFilters,
+        identity: tuple[str, str] | None = None,
+        vector_dimensions: int | None = None,
     ) -> Mapping[str, RowMapping]:
         conditions, parameters = _filter_sql(filters)
+        if identity is not None:
+            conditions, parameters = _restrict_index_identity(
+                conditions,
+                parameters,
+                identity,
+                vector_dimensions,
+            )
         placeholders = []
         for index, hit in enumerate(fused):
             name = f"chunk_{index}"
@@ -436,6 +465,10 @@ def hybrid_search(
         excluded_file_types=excluded_file_types,
         filters=filters,
         limit=limit,
+        model_digest=model_digest,
+        index_version=index_version,
+        embedding_profile=embedding_profile,
+        profile=profile,
     )
 
 
@@ -562,6 +595,35 @@ def _filter_sql(
     if excluded_type_clauses:
         clauses.append(f"NOT ({' OR '.join(excluded_type_clauses)})")
     return " AND ".join(clauses), parameters
+
+
+def _restrict_index_identity(
+    conditions: str,
+    parameters: dict[str, object],
+    identity: tuple[str, str],
+    vector_dimensions: int | None = None,
+) -> tuple[str, dict[str, object]]:
+    parameters = dict(parameters)
+    parameters.update(
+        {
+            "identity_model_digest": identity[0],
+            "identity_index_version": identity[1],
+        }
+    )
+    restricted = (
+        f"{conditions} "
+        "AND c.model_digest = :identity_model_digest "
+        "AND c.index_version = :identity_index_version"
+    )
+    if vector_dimensions is not None:
+        if vector_dimensions not in VECTOR_DIMENSIONS:
+            raise ValueError(f"Unsupported vector dimension: {vector_dimensions}.")
+        restricted += (
+            " AND EXISTS ("
+            f"SELECT 1 FROM chunk_embeddings_{vector_dimensions} AS identity_vector "
+            "WHERE identity_vector.chunk_id = c.id)"
+        )
+    return restricted, parameters
 
 
 def _file_type_clauses(

@@ -44,12 +44,15 @@ from .models import File, Tag
 from .ollama.readiness import ReadinessReport
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
+from .ui.content_search import ContentSearchWorker
 from .ui.indexing_status import IndexingStatus
 from .ui.ollama_settings import OllamaSettingsDialog
 from .migration.legacy_chroma import cleanup_legacy_chroma, inspect_legacy_chroma
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
 from .modern_context import ModernIndexingUnavailable, ModernSearchUnavailable
+
+_ACTIVE_CONTENT_SEARCH_WORKERS: set[ContentSearchWorker] = set()
 
 
 class HTMLDelegate(QStyledItemDelegate):
@@ -227,6 +230,9 @@ class FileTagManager(QMainWindow):
 
                 self.current_file_path = None
                 self.current_search_results = []  # Initialize search results storage
+                self.result_document_items: dict[str, QListWidgetItem] = {}
+                self._content_search_worker: ContentSearchWorker | None = None
+                self._content_search_generation = 0
 
                 self.logger.debug("About to call init_ui")
                 self.init_ui()
@@ -362,24 +368,37 @@ class FileTagManager(QMainWindow):
 
     def closeEvent(self, event):
         """Override closeEvent to log when window is closed"""
-        self.logger.debug(
+        logger = getattr(self, "logger", logging.getLogger(__name__))
+        logger.debug(
             f"Main window close event received, reason: {event.spontaneous()}"
         )
-        self.logger.debug("Stack trace at close event:")
-        self.logger.debug("".join(traceback.format_stack()))
+        logger.debug("Stack trace at close event:")
+        logger.debug("".join(traceback.format_stack()))
 
         indexing_status = getattr(self, "indexing_status", None)
         shutdown = getattr(indexing_status, "shutdown", None)
         if callable(shutdown) and not shutdown():
-            self.logger.warning(
+            logger.warning(
                 "Window close deferred because modern indexing is still stopping."
             )
             event.ignore()
             return
+        content_worker = getattr(self, "_content_search_worker", None)
+        if isinstance(content_worker, ContentSearchWorker):
+            content_worker.request_cancel()
+            self._content_search_generation = (
+                getattr(self, "_content_search_generation", 0) + 1
+            )
+            if content_worker.isRunning() and not content_worker.wait(1_000):
+                logger.warning(
+                    "Window close deferred because modern content search is stopping."
+                )
+                event.ignore()
+                return
 
         # Call parent class method to proceed with normal closing
         super().closeEvent(event)
-        self.logger.debug("Main window closed")
+        logger.debug("Main window closed")
 
     def init_ui(self):
         self.logger.debug("init_ui started")
@@ -745,6 +764,7 @@ class FileTagManager(QMainWindow):
     def create_rag_search_tab(self):
         """Create and return the RAG search tab."""
         tab = QWidget()
+        tab.destroyed.connect(self._abandon_content_search)
         layout = QVBoxLayout(tab)
 
         # Query input section
@@ -755,9 +775,15 @@ class FileTagManager(QMainWindow):
         self.query_input.setPlaceholderText("Enter your search query...")
         query_layout.addWidget(self.query_input)
 
-        search_btn = QPushButton("Search")
-        search_btn.clicked.connect(self.search_by_content)
-        query_layout.addWidget(search_btn)
+        self.search_content_btn = QPushButton("Search")
+        self.search_content_btn.clicked.connect(self.search_by_content)
+        query_layout.addWidget(self.search_content_btn)
+        self.cancel_content_search_btn = QPushButton("Cancel")
+        self.cancel_content_search_btn.clicked.connect(
+            self.cancel_content_search
+        )
+        self.cancel_content_search_btn.setEnabled(False)
+        query_layout.addWidget(self.cancel_content_search_btn)
 
         layout.addLayout(query_layout)
 
@@ -1306,189 +1332,228 @@ class FileTagManager(QMainWindow):
                 item.setToolTip(file.path)
                 self.search_results.addItem(item)
 
-    def search_by_content(self):
-        """Search for files using semantic search."""
+    def search_by_content(self) -> None:
+        """Run modern content search without blocking the UI thread."""
         query = self.query_input.text().strip()
         if not query:
             QMessageBox.warning(self, "Error", "Please enter a search query!")
             return
 
-        # Get selected tags for filtering
-        tag_filters = []
+        tag_filters: list[str] = []
         for i in range(self.tag_filter_list.count()):
             item = self.tag_filter_list.item(i)
             if item.isSelected():
                 tag_filters.append(item.text())
 
-        # Perform search
-        try:
-            runtime = getattr(self, "modern_runtime", None)
-            search_content = getattr(runtime, "search_content", None)
-            if runtime is None or not callable(search_content):
-                raise ModernSearchUnavailable(
-                    "the modern runtime is not initialized."
-                )
-            modern_results = search_content(
-                query,
-                tags=tag_filters,
-                use_and=self.rag_and_radio.isChecked(),
-                limit=20,
+        runtime = getattr(self, "modern_runtime", None)
+        if runtime is None or not callable(
+            getattr(runtime, "search_content", None)
+        ):
+            self._content_search_failed(
+                None,
+                0,
+                ModernSearchUnavailable("the modern runtime is not initialized."),
             )
-            results = [
+            return
+
+        self.cancel_content_search()
+        self._content_search_generation = (
+            getattr(self, "_content_search_generation", 0) + 1
+        )
+        generation = self._content_search_generation
+        worker = ContentSearchWorker(
+            runtime,
+            query,
+            tags=tag_filters,
+            use_and=self.rag_and_radio.isChecked(),
+            limit=20,
+        )
+        _ACTIVE_CONTENT_SEARCH_WORKERS.add(worker)
+        self._content_search_worker = worker
+        worker.result_ready.connect(
+            lambda results, worker=worker, generation=generation:
+            self._content_search_succeeded(worker, generation, results)
+        )
+        worker.failure.connect(
+            lambda exc, worker=worker, generation=generation:
+            self._content_search_failed(worker, generation, exc)
+        )
+        worker.cancelled.connect(
+            lambda worker=worker, generation=generation:
+            self._content_search_cancelled(worker, generation)
+        )
+        worker.finished.connect(
+            lambda worker=worker, generation=generation:
+            self._content_search_finished(worker, generation)
+        )
+        self.rag_search_results.clear()
+        self.current_search_results = []
+        self.result_document_items = {}
+        self.chat_results_btn.setEnabled(False)
+        self.search_content_btn.setEnabled(False)
+        self.cancel_content_search_btn.setEnabled(True)
+        worker.start()
+
+    def cancel_content_search(self) -> None:
+        worker = getattr(self, "_content_search_worker", None)
+        if isinstance(worker, ContentSearchWorker) and worker.isRunning():
+            worker.request_cancel()
+
+    def _abandon_content_search(self, *_args: object) -> None:
+        self._content_search_generation = (
+            getattr(self, "_content_search_generation", 0) + 1
+        )
+        worker = getattr(self, "_content_search_worker", None)
+        if isinstance(worker, ContentSearchWorker):
+            worker.request_cancel()
+            if worker.isRunning():
+                worker.wait(1_000)
+
+    def _content_search_succeeded(
+        self,
+        worker: ContentSearchWorker,
+        generation: int,
+        modern_results: Any,
+    ) -> None:
+        if (
+            worker is not self._content_search_worker
+            or generation != self._content_search_generation
+            or worker.cancellation_check()
+        ):
+            return
+        self._render_content_search_results(
+            [
                 self._modern_search_result(result)
                 for result in modern_results
             ]
+        )
 
-            # Display results
-            self.rag_search_results.clear()
-
-            if not results or len(results) == 0:
-                self.chat_results_btn.setEnabled(False)
-                self.current_search_results = []
-                return
-
-            # Store all results for reference
-            self.current_search_results = results
-
-            # Keep track of which list items correspond to documents (not snippets)
-            self.result_document_items = {}
-
-            for result in results:
-                if os.path.exists(result["path"]):
-                    # Add file item with checkbox
-                    score = result.get("score", 0)
-
-                    # Create main file item
-                    file_item = QListWidgetItem(
-                        f"{os.path.basename(result['path'])} ({score:.2f})"
-                    )
-                    file_item.setToolTip(result["path"])
-                    file_item.setBackground(get_score_color(score))
-                    file_item.setFlags(
-                        file_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
-                    )
-                    file_item.setCheckState(Qt.CheckState.Unchecked)
-                    self.rag_search_results.addItem(file_item)
-
-                    # Store reference to this item for selection tracking
-                    self.result_document_items[result["path"]] = file_item
-                    # Display document summary if available
-                    summary = result.get("summary", "")
-                    if summary:
-                        # Wrap summary in HTML div to ensure proper text wrapping
-                        formatted_summary = f"<div style='text-align:left; margin-left:4px; margin-right:4px;'>    📝 {summary}</div>"
-                        summary_item = QListWidgetItem()
-                        summary_item.setText(formatted_summary)
-                        summary_item.setToolTip(result["path"])
-                        # Use lighter background to differentiate from main result
-                        bg_color = get_score_color(score)
-                        # Make the background slightly lighter for summary
-                        lighter_bg = QColor(
-                            min(bg_color.red() + 15, 255),
-                            min(bg_color.green() + 15, 255),
-                            min(bg_color.blue() + 15, 255),
-                        )
-                        summary_item.setBackground(lighter_bg)
-                        self.rag_search_results.addItem(summary_item)
-
-                    # Display tags on a separate line with colored backgrounds for each tag
-                    tags = result.get("tags", [])
-                    if tags:
-                        tag_display = "    ⚑ Tags: "
-                        tags_item = QListWidgetItem(tag_display)
-                        tags_item.setToolTip(result["path"])
-                        # Use lighter background to differentiate from main result
-                        bg_color = get_score_color(score)
-                        # Make the background slightly lighter
-                        lighter_bg = QColor(
-                            min(bg_color.red() + 20, 255),
-                            min(bg_color.green() + 20, 255),
-                            min(bg_color.blue() + 20, 255),
-                        )
-                        tags_item.setBackground(lighter_bg)
-                        self.rag_search_results.addItem(tags_item)
-
-                        # Add each tag with its proper color
-                        for tag_name in tags:
-                            # Look up the tag color from the database
-                            tag = (
-                                self.db_session.query(Tag)
-                                .filter_by(name=tag_name)
-                                .first()
-                            )
-                            if tag:
-                                tag_color = QColor(tag.color)
-                                text_color = (
-                                    Qt.white if is_dark_color(tag_color) else Qt.black
-                                )
-
-                                # Create a tag item with spacing for visual separation
-                                tag_item = QListWidgetItem(f"        • {tag_name}")
-                                tag_item.setToolTip(result["path"])
-                                tag_item.setBackground(tag_color)
-                                tag_item.setForeground(text_color)
-                                self.rag_search_results.addItem(tag_item)
-
-                    # Add snippet items if available
-                    for snippet in result.get("snippets", []):
-                        # Create a rich text item that can show bold formatting
-                        snippet_item = QListWidgetItem()
-                        snippet_item.setToolTip(result["path"])
-
-                        # Check if this is already a formatted snippet with a context
-                        if (
-                            isinstance(snippet, str)
-                            and snippet.startswith("[")
-                            and "]" in snippet
-                        ):
-                            # Get context and text parts
-                            context_end = snippet.find("]")
-                            context = snippet[1:context_end]
-                            text = snippet[context_end + 1 :].strip()
-
-                            # Create formatted text with context prefix in italics
-                            formatted_text = f"    ↪ <i>{context}:</i> {text}"
-                        else:
-                            # Just use the snippet text as-is
-                            formatted_text = f"    ↪ {snippet}"
-                        # Set the text with HTML formatting that preserves bold highlighting
-                        # (the ** marks from markdown are converted to HTML <b> tags)
-                        formatted_text = formatted_text.replace("**", "<b>", 1)
-                        while "**" in formatted_text:
-                            formatted_text = formatted_text.replace("**", "</b>", 1)
-
-                        # Add div with styling for better text wrapping
-                        formatted_text = f"<div style='text-align:left; margin-left:4px; margin-right:4px;'>{formatted_text}</div>"
-
-                        snippet_item.setText(formatted_text)
-
-                        # Apply lighter background color for snippet items
-                        lighter_bg = QColor(
-                            min(bg_color.red() + 40, 255),
-                            min(bg_color.green() + 40, 255),
-                            min(bg_color.blue() + 40, 255),
-                        )
-                        snippet_item.setBackground(lighter_bg)
-
-                        # Add to results list
-                        self.rag_search_results.addItem(snippet_item)
-
-        except ModernSearchUnavailable as e:
-            self.rag_search_results.clear()
+    def _content_search_failed(
+        self,
+        worker: ContentSearchWorker | None,
+        generation: int,
+        exc: object,
+    ) -> None:
+        if worker is not None and (
+            worker is not self._content_search_worker
+            or generation != self._content_search_generation
+        ):
+            return
+        self.rag_search_results.clear()
+        self.current_search_results = []
+        self.result_document_items = {}
+        self.chat_results_btn.setEnabled(False)
+        if isinstance(exc, ModernSearchUnavailable):
             QMessageBox.warning(
                 self,
                 "Modern content search unavailable",
-                f"Modern content search is unavailable: {e}",
+                f"Modern content search is unavailable: {exc}",
             )
-            self.chat_results_btn.setEnabled(False)
-            self.current_search_results = []
-            self.result_document_items = {}
-        except Exception as e:
-            self.rag_search_results.clear()
-            QMessageBox.warning(self, "Error", f"Search failed: {str(e)}")
-            self.chat_results_btn.setEnabled(False)
-            self.current_search_results = []
-            self.result_document_items = {}
+            return
+        QMessageBox.warning(self, "Error", f"Search failed: {exc}")
+
+    def _content_search_cancelled(
+        self,
+        worker: ContentSearchWorker,
+        generation: int,
+    ) -> None:
+        if (
+            worker is self._content_search_worker
+            and generation == self._content_search_generation
+        ):
+            self.search_content_btn.setEnabled(True)
+            self.cancel_content_search_btn.setEnabled(False)
+
+    def _content_search_finished(
+        self,
+        worker: ContentSearchWorker,
+        generation: int,
+    ) -> None:
+        worker.deleteLater()
+        _ACTIVE_CONTENT_SEARCH_WORKERS.discard(worker)
+        if worker is not self._content_search_worker:
+            return
+        if not worker.isRunning():
+            self._content_search_worker = None
+        if generation == self._content_search_generation:
+            self.search_content_btn.setEnabled(True)
+            self.cancel_content_search_btn.setEnabled(False)
+
+    def _render_content_search_results(
+        self,
+        results: list[dict[str, Any]],
+    ) -> None:
+        self.rag_search_results.clear()
+        self.current_search_results = results
+        self.result_document_items = {}
+        for result in results:
+            if not os.path.exists(result["path"]):
+                continue
+            score = result.get("score", 0)
+            base_color = get_score_color(score)
+            file_item = QListWidgetItem(
+                f"{os.path.basename(result['path'])} ({score:.2f})"
+            )
+            file_item.setToolTip(result["path"])
+            file_item.setBackground(base_color)
+            file_item.setFlags(
+                file_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            file_item.setCheckState(Qt.CheckState.Unchecked)
+            self.rag_search_results.addItem(file_item)
+            self.result_document_items[result["path"]] = file_item
+
+            summary = result.get("summary", "")
+            if summary:
+                summary_item = QListWidgetItem(
+                    "<div style='text-align:left; margin-left:4px; "
+                    f"margin-right:4px;'>    📝 {summary}</div>"
+                )
+                summary_item.setToolTip(result["path"])
+                summary_item.setBackground(
+                    QColor(
+                        min(base_color.red() + 15, 255),
+                        min(base_color.green() + 15, 255),
+                        min(base_color.blue() + 15, 255),
+                    )
+                )
+                self.rag_search_results.addItem(summary_item)
+
+            for tag_name in result.get("tags", []):
+                tag_item = QListWidgetItem(f"        ⚑ {tag_name}")
+                tag_item.setToolTip(result["path"])
+                self.rag_search_results.addItem(tag_item)
+
+            for snippet in result.get("snippets", []):
+                snippet_item = QListWidgetItem()
+                snippet_item.setToolTip(result["path"])
+                if (
+                    isinstance(snippet, str)
+                    and snippet.startswith("[")
+                    and "]" in snippet
+                ):
+                    context_end = snippet.find("]")
+                    context = snippet[1:context_end]
+                    text = snippet[context_end + 1 :].strip()
+                    formatted_text = f"    ↪ <i>{context}:</i> {text}"
+                else:
+                    formatted_text = f"    ↪ {snippet}"
+                formatted_text = formatted_text.replace("**", "<b>", 1)
+                while "**" in formatted_text:
+                    formatted_text = formatted_text.replace("**", "</b>", 1)
+                snippet_item.setText(
+                    "<div style='text-align:left; margin-left:4px; "
+                    f"margin-right:4px;'>{formatted_text}</div>"
+                )
+                snippet_item.setBackground(
+                    QColor(
+                        min(base_color.red() + 40, 255),
+                        min(base_color.green() + 40, 255),
+                        min(base_color.blue() + 40, 255),
+                    )
+                )
+                self.rag_search_results.addItem(snippet_item)
+        self.chat_results_btn.setEnabled(bool(self.current_search_results))
 
     @staticmethod
     def _modern_search_result(result: Any) -> dict[str, Any]:
