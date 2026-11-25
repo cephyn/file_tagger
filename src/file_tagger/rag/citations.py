@@ -16,6 +16,39 @@ SOURCE_MARKER_PATTERN = re.compile(
     r"\[source:\s*([^\]]+?)\s*\]",
     flags=re.IGNORECASE,
 )
+_SENTENCE_TERMINATORS = frozenset(".!?。！？．")
+_SENTENCE_CLOSERS = frozenset("\"'”’»›）〕］】」』)]}")
+_COMMON_ABBREVIATIONS = frozenset(
+    {
+        "approx",
+        "ave",
+        "capt",
+        "col",
+        "corp",
+        "dept",
+        "dr",
+        "e.g",
+        "etc",
+        "fig",
+        "gen",
+        "gov",
+        "i.e",
+        "inc",
+        "jr",
+        "ltd",
+        "mr",
+        "mrs",
+        "ms",
+        "no",
+        "prof",
+        "rep",
+        "sen",
+        "sgt",
+        "sr",
+        "st",
+        "vs",
+    }
+)
 
 
 class AnswerClaim(DomainRecord):
@@ -151,12 +184,15 @@ def parse_cited_answer(
                 "The model answer contains a claim without retrieved evidence."
             )
         if not any(
-            raw_claim.evidence_quote in citation.excerpt
+            _quote_matches_complete_evidence_span(
+                raw_claim.evidence_quote,
+                citation.excerpt,
+            )
             for citation in resolved
         ):
             raise UncitedAnswerError(
-                "The model answer evidence quote is not an exact quoted span "
-                "from its cited chunk."
+                "The model answer evidence quote is not a complete normalized "
+                "evidence sentence or full-excerpt quoted span from its cited chunk."
             )
         if not _claim_is_supported(raw_claim.text, raw_claim.evidence_quote):
             raise UncitedAnswerError(
@@ -239,9 +275,10 @@ def _citation_indexes(
     return by_chunk, by_citation
 
 
-def _normalized_words(value: str) -> tuple[str, ...]:
-    without_markers = SOURCE_MARKER_PATTERN.sub("", value)
-    normalized = unicodedata.normalize("NFKC", without_markers.casefold())
+def _normalized_words(value: str, *, strip_markers: bool = True) -> tuple[str, ...]:
+    if strip_markers:
+        value = SOURCE_MARKER_PATTERN.sub("", value)
+    normalized = unicodedata.normalize("NFKC", value.casefold())
     words: list[str] = []
     current: list[str] = []
     for character in normalized:
@@ -262,12 +299,129 @@ def _claim_is_supported(claim: str, quote: str) -> bool:
     return bool(claim_words) and claim_words == quote_words
 
 
+def _quote_matches_complete_evidence_span(quote: str, excerpt: str) -> bool:
+    normalized_quote = _normalized_words(quote, strip_markers=False)
+    if not normalized_quote:
+        return False
+    return any(
+        normalized_quote
+        == _normalized_words(span, strip_markers=False)
+        for span in _evidence_sentence_spans(excerpt)
+    )
+
+
+def _evidence_sentence_spans(excerpt: str) -> tuple[str, ...]:
+    text = excerpt.strip()
+    if not text:
+        return ()
+
+    spans: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        terminator = text[index]
+        if terminator not in _SENTENCE_TERMINATORS:
+            index += 1
+            continue
+
+        terminator_end = index + 1
+        while (
+            terminator_end < len(text)
+            and text[terminator_end] in _SENTENCE_TERMINATORS
+        ):
+            terminator_end += 1
+        span_end = terminator_end
+        while span_end < len(text) and text[span_end] in _SENTENCE_CLOSERS:
+            span_end += 1
+
+        if span_end == len(text):
+            break
+
+        next_start = span_end
+        while next_start < len(text) and text[next_start].isspace():
+            next_start += 1
+        if next_start == span_end:
+            if terminator == "." and _period_is_internal(text, index):
+                index = terminator_end
+                continue
+            return (text,)
+        if terminator == "." and _period_is_abbreviation(text, index):
+            index = terminator_end
+            continue
+        if (
+            terminator in {".", "。", "．"}
+            and len(text[index:terminator_end]) >= 3
+            and len(set(text[index:terminator_end])) == 1
+        ):
+            return (text,)
+        if not _looks_like_sentence_start(text, next_start):
+            return (text,)
+
+        spans.append(text[start:span_end].strip())
+        start = next_start
+        index = next_start
+
+    final_span = text[start:].strip()
+    if final_span:
+        if start and not _has_sentence_ending(final_span):
+            return (text,)
+        spans.append(final_span)
+    return tuple(span for span in spans if span)
+
+
+def _period_is_internal(text: str, index: int) -> bool:
+    return (
+        index > 0
+        and index + 1 < len(text)
+        and (text[index - 1].isalnum() or text[index - 1] == "_")
+        and (text[index + 1].isalnum() or text[index + 1] == "_")
+    )
+
+
+def _period_is_abbreviation(text: str, index: int) -> bool:
+    prefix = text[:index]
+    match = re.search(r"([^\W\d_]+(?:\.[^\W\d_]+)*)$", prefix, flags=re.UNICODE)
+    if match is None:
+        return False
+    abbreviation = match.group(1).casefold()
+    return abbreviation in _COMMON_ABBREVIATIONS or (
+        "." in abbreviation or len(abbreviation) == 1
+    )
+
+
+def _has_sentence_ending(value: str) -> bool:
+    candidate = value.rstrip()
+    while candidate and candidate[-1] in _SENTENCE_CLOSERS:
+        candidate = candidate[:-1]
+    if not candidate or candidate[-1] not in _SENTENCE_TERMINATORS:
+        return False
+    if candidate[-1] == "." and _period_is_abbreviation(
+        candidate,
+        len(candidate) - 1,
+    ):
+        return False
+    return True
+
+
+def _looks_like_sentence_start(text: str, index: int) -> bool:
+    while index < len(text) and text[index] in "\"'“‘«‹（〔［【「『([{":
+        index += 1
+    return index < len(text) and (
+        text[index].isupper() or text[index].isdigit()
+    )
+
+
 def _answer_is_supported(
     answer: str,
     claims: Sequence[StructuredClaim],
 ) -> bool:
     if not claims:
         return False
+    if any(
+        _claim_is_supported(answer, claim.text)
+        for claim in claims
+    ):
+        return True
     answer_parts = _answer_parts_preserving_markers(answer)
     return bool(answer_parts) and all(
         any(_claim_is_supported(part, claim.text) for claim in claims)
@@ -302,6 +456,20 @@ def _validate_answer_markers(
     by_citation: Mapping[str, SearchCitation],
 ) -> None:
     _validate_marker_layout(answer)
+    if any(
+        _claim_is_supported(answer, claim.text)
+        for claim, _citations in resolved_claims
+    ):
+        _validate_marker_bindings(
+            answer,
+            tuple((claim.text, citations) for claim, citations in resolved_claims),
+            by_chunk,
+            by_citation,
+            mismatch_message=(
+                "A visible source marker does not match its structured claim."
+            ),
+        )
+        return
     for part in _answer_parts_preserving_markers(answer):
         _validate_marker_bindings(
             part,
@@ -371,6 +539,16 @@ def _answer_parts_preserving_markers(answer: str) -> tuple[str, ...]:
 
 def _validate_marker_layout(text: str) -> None:
     for match in SOURCE_MARKER_PATTERN.finditer(text):
+        whitespace_start = match.start()
+        while whitespace_start > 0 and text[whitespace_start - 1] in " \t\r\n":
+            whitespace_start -= 1
+        if any(
+            character in "\r\n"
+            for character in text[whitespace_start : match.start()]
+        ):
+            raise UncitedAnswerError(
+                "A visible source marker is not bound to a structured claim."
+            )
         suffix = text[match.end() :]
         if suffix and not suffix[0].isspace():
             raise UncitedAnswerError(

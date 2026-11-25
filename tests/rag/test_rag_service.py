@@ -433,6 +433,190 @@ def test_structured_claim_cannot_strengthen_qualified_evidence(
         answer_question("When did the witness leave?", evidence, gateway=fake_model)
 
 
+@pytest.mark.parametrize(
+    ("excerpt", "claim"),
+    (
+        (
+            "The witness may have left before dawn.",
+            "left before dawn",
+        ),
+        (
+            "The witness did not leave before dawn.",
+            "leave before dawn",
+        ),
+    ),
+)
+def test_structured_claim_rejects_incomplete_evidence_sentence(
+    excerpt: str,
+    claim: str,
+) -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "incomplete-evidence",
+                "page_number": 1,
+                "text": excerpt,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": claim,
+                        "chunk_ids": ["incomplete-evidence"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("When did the witness leave?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_accepts_complete_middle_evidence_sentence() -> None:
+    quote = "The witness may have left before dawn."
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "neighboring-evidence",
+                "page_number": 1,
+                "text": (
+                    "A watchman arrived at midnight. "
+                    f"{quote} "
+                    "The eastern gate remained closed."
+                ),
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": quote,
+                "claims": [
+                    {
+                        "text": quote,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["neighboring-evidence"],
+                    }
+                ],
+            }
+        )
+    )
+
+    answer = answer_question("When did the witness leave?", evidence, gateway=fake_model)
+
+    assert answer.claims[0].evidence_quote == quote
+
+
+def test_structured_claim_rejects_partial_neighboring_sentences() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "partial-neighbors",
+                "page_number": 1,
+                "text": (
+                    "A watchman arrived at midnight. "
+                    "The witness may have left before dawn."
+                ),
+            },
+            source="hybrid",
+        ),
+    )
+    quote = "arrived at midnight. The witness may have left before dawn."
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": quote,
+                "claims": [
+                    {
+                        "text": quote,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["partial-neighbors"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("When did the witness leave?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_requires_full_excerpt_when_delimiters_are_uncertain() -> None:
+    quote = "A watchman arrived. Gate status pending"
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "uncertain-boundary",
+                "page_number": 1,
+                "text": quote,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "Gate status pending",
+                "claims": [
+                    {
+                        "text": "Gate status pending",
+                        "evidence_quote": "Gate status pending",
+                        "chunk_ids": ["uncertain-boundary"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("What is the gate status?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_accepts_full_excerpt_with_abbreviated_delimiter() -> None:
+    quote = "Witness status: e.g. may have departed before dawn"
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "abbreviated-excerpt",
+                "page_number": 1,
+                "text": quote,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": quote,
+                "claims": [
+                    {
+                        "text": quote,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["abbreviated-excerpt"],
+                    }
+                ],
+            }
+        )
+    )
+
+    answer = answer_question("What happened?", evidence, gateway=fake_model)
+
+    assert answer.claims[0].evidence_quote == quote
+
+
 def test_structured_claim_cannot_omit_nontrivial_evidence_words() -> None:
     evidence = _evidence()
     fake_model = FakeModel(
