@@ -1207,8 +1207,10 @@ def _answer_messages(
                 "Answer only from the indexed evidence below. Return JSON only in the "
                 "requested schema. Every factual claim must include one or more chunk_ids "
                 "and an evidence_quote copied exactly from the cited chunk text. The claim "
-                "must be directly supported by that quote. Never invent chunk IDs, quotes, "
-                "citations, facts, or files. "
+                "must match that quote after Unicode, case, whitespace, and punctuation "
+                "normalization; never omit hedges, uncertainty, or negation. Put any "
+                "visible source marker immediately after the matching claim sentence. "
+                "Never invent chunk IDs, quotes, citations, facts, or files. "
                 f'If the evidence is insufficient, answer "{NOT_FOUND_ANSWER}" with no '
                 "claims."
             ),

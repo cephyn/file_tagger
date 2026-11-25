@@ -164,17 +164,18 @@ def test_structured_answer_with_invented_source_marker_is_rejected() -> None:
 
 def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     evidence = _evidence()
+    claim = "A dragon guards the flooded temple."
     fake_model = FakeModel(
         json.dumps(
             {
                 "answer": (
-                    "A dragon guards the temple. "
+                    f"{claim} "
                     f"[source: {evidence[0].chunk_id}]"
                 ),
                 "claims": [
                     {
-                        "text": "A dragon guards the temple.",
-                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "text": claim,
+                        "evidence_quote": claim,
                         "chunk_ids": [evidence[0].chunk_id],
                     }
                 ],
@@ -191,25 +192,78 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     assert answer.citations == evidence[0].citations
 
 
-@pytest.mark.parametrize("marker_position", ("leading", "separate_line"))
+def test_structured_claim_accepts_normalized_unicode_text() -> None:
+    quote = "Ａ DRAGON guards—the flooded temple!"
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\normalized.md",
+                "stable_id": "normalized",
+                "page_number": 1,
+                "text": quote,
+            },
+            source="hybrid",
+        ),
+    )
+    claim = "a  dragon guards the flooded temple."
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["normalized"],
+                    }
+                ],
+            }
+        )
+    )
+
+    answer = answer_question("What guards the temple?", evidence, gateway=fake_model)
+
+    assert answer.text == claim
+
+
+@pytest.mark.parametrize(
+    "marker_position",
+    (
+        "leading",
+        "leading_colon",
+        "leading_no_space",
+        "separate_line",
+        "standalone_before",
+        "standalone_between",
+        "after_claim_colon",
+        "after_claim_no_space",
+    ),
+)
 def test_structured_answer_rejects_orphan_source_marker_fragments(
     marker_position: str,
 ) -> None:
     evidence = _evidence()
     marker = f"[source: {evidence[0].chunk_id}]"
-    answer = (
-        f"{marker} A dragon guards the temple."
-        if marker_position == "leading"
-        else f"A dragon guards the temple.\n{marker}"
-    )
+    claim = "A dragon guards the flooded temple."
+    answers = {
+        "leading": f"{marker} {claim}",
+        "leading_colon": f"{marker}: {claim}",
+        "leading_no_space": f"{marker}{claim}",
+        "separate_line": f"{claim}\n{marker}",
+        "standalone_before": f"{marker}\n{claim}",
+        "standalone_between": f"{claim}\n{marker}\n{claim}",
+        "after_claim_colon": f"{claim} {marker}: {claim}",
+        "after_claim_no_space": f"{claim} {marker}{claim}",
+    }
+    answer = answers[marker_position]
     fake_model = FakeModel(
         json.dumps(
             {
                 "answer": answer,
                 "claims": [
                     {
-                        "text": "A dragon guards the temple.",
-                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "text": claim,
+                        "evidence_quote": claim,
                         "chunk_ids": [evidence[0].chunk_id],
                     }
                 ],
@@ -331,6 +385,7 @@ def test_structured_answer_marker_must_match_the_preceding_claim() -> None:
     "quote",
     (
         "The witness likely left before dawn.",
+        "The witness conceivably left before dawn.",
         "The witness unlikely left before dawn.",
         "The witness probably left before dawn.",
         "The witness possibly left before dawn.",
@@ -376,6 +431,58 @@ def test_structured_claim_cannot_strengthen_qualified_evidence(
 
     with pytest.raises(UncitedAnswerError, match="not supported"):
         answer_question("When did the witness leave?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_cannot_omit_nontrivial_evidence_words() -> None:
+    evidence = _evidence()
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "A dragon guards the temple.",
+                "claims": [
+                    {
+                        "text": "A dragon guards the temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("What guards the temple?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_cannot_omit_evidence_symbols() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\budget.md",
+                "stable_id": "budget",
+                "page_number": 1,
+                "text": "The total is $5.",
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The total is 5.",
+                "claims": [
+                    {
+                        "text": "The total is 5.",
+                        "evidence_quote": "The total is $5.",
+                        "chunk_ids": ["budget"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("What is the total?", evidence, gateway=fake_model)
 
 
 def test_structured_claim_without_verifiable_quote_is_rejected() -> None:

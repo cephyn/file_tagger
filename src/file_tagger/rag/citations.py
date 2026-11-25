@@ -2,6 +2,7 @@ from collections.abc import Mapping, Sequence
 import json
 import re
 from typing import Any, TypeAlias
+import unicodedata
 
 from pydantic import Field, ValidationError
 
@@ -240,146 +241,25 @@ def _citation_indexes(
 
 def _normalized_words(value: str) -> tuple[str, ...]:
     without_markers = SOURCE_MARKER_PATTERN.sub("", value)
-    return tuple(
-        re.findall(
-            r"[^\W_]+(?:[-'][^\W_]+)?",
-            without_markers.casefold(),
-        )
-    )
+    normalized = unicodedata.normalize("NFKC", without_markers.casefold())
+    words: list[str] = []
+    current: list[str] = []
+    for character in normalized:
+        category = unicodedata.category(character)[0]
+        if category in {"L", "M", "N", "S"}:
+            current.append(character)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return tuple(words)
 
 
 def _claim_is_supported(claim: str, quote: str) -> bool:
-    raw_claim_words = _normalized_words(claim)
-    raw_quote_words = _normalized_words(quote)
-    relation_markers = {
-        "according",
-        "allege",
-        "allegation",
-        "alleged",
-        "allegedly",
-        "appears",
-        "apparently",
-        "assumed",
-        "assumes",
-        "believed",
-        "believes",
-        "believe",
-        "barely",
-        "couldn't",
-        "no",
-        "not",
-        "never",
-        "without",
-        "cannot",
-        "can't",
-        "claimed",
-        "claims",
-        "can",
-        "could",
-        "doubted",
-        "doubts",
-        "evidently",
-        "estimated",
-        "estimates",
-        "expected",
-        "expects",
-        "indicated",
-        "indicates",
-        "likely",
-        "may",
-        "maybe",
-        "might",
-        "mistakenly",
-        "mustn't",
-        "must",
-        "neither",
-        "none",
-        "nor",
-        "nothing",
-        "nobody",
-        "perhaps",
-        "purported",
-        "possibly",
-        "possible",
-        "impossible",
-        "improbable",
-        "presumably",
-        "probable",
-        "probably",
-        "purportedly",
-        "reputedly",
-        "report",
-        "reported",
-        "reportedly",
-        "reports",
-        "say",
-        "said",
-        "says",
-        "seem",
-        "seemed",
-        "seemingly",
-        "seems",
-        "shall",
-        "should",
-        "source",
-        "sources",
-        "speculated",
-        "speculates",
-        "supposedly",
-        "suggested",
-        "suggests",
-        "suspected",
-        "suspects",
-        "thought",
-        "unlikely",
-        "unconfirmed",
-        "uncertain",
-        "unknown",
-        "will",
-        "wouldn't",
-        "won't",
-        "would",
-    }
-    claim_markers = tuple(word for word in raw_claim_words if word in relation_markers)
-    quote_markers = tuple(word for word in raw_quote_words if word in relation_markers)
-    if claim_markers != quote_markers:
-        return False
-    stop_words = {
-        "a",
-        "an",
-        "and",
-        "as",
-        "at",
-        "for",
-        "from",
-        "in",
-        "of",
-        "on",
-        "or",
-        "that",
-        "the",
-        "this",
-        "to",
-        "with",
-    }
-    claim_words = tuple(
-        word for word in raw_claim_words if word not in stop_words
-    )
-    quote_words = tuple(
-        word for word in raw_quote_words if word not in stop_words
-    )
-    if not claim_words or not quote_words:
-        return False
-    if len(quote_words) - len(claim_words) > 1:
-        return False
-    quote_index = 0
-    for word in claim_words:
-        while quote_index < len(quote_words) and quote_words[quote_index] != word:
-            quote_index += 1
-        if quote_index == len(quote_words):
-            return False
-        quote_index += 1
-    return True
+    claim_words = _normalized_words(claim)
+    quote_words = _normalized_words(quote)
+    return bool(claim_words) and claim_words == quote_words
 
 
 def _answer_is_supported(
@@ -388,20 +268,7 @@ def _answer_is_supported(
 ) -> bool:
     if not claims:
         return False
-    answer_without_markers = re.sub(
-        r"\[source:\s*[^\]]+?\s*\]",
-        "",
-        answer,
-        flags=re.IGNORECASE,
-    )
-    answer_parts = [
-        part
-        for part in re.split(
-            r"(?<=[.!?])\s+|\n+",
-            answer_without_markers.strip(),
-        )
-        if part.strip()
-    ]
+    answer_parts = _answer_parts_preserving_markers(answer)
     return bool(answer_parts) and all(
         any(_claim_is_supported(part, claim.text) for claim in claims)
         for part in answer_parts
@@ -414,15 +281,16 @@ def _validate_claim_markers(
     by_chunk: Mapping[str, SearchCitation],
     by_citation: Mapping[str, SearchCitation],
 ) -> None:
-    markers = _resolved_markers(text, by_chunk, by_citation)
-    allowed_ids = {
-        citation.citation_id
-        for citation in resolved
-    }
-    if any(marker.citation_id not in allowed_ids for marker in markers):
-        raise UncitedAnswerError(
+    _validate_marker_layout(text)
+    _validate_marker_bindings(
+        text,
+        ((text, resolved),),
+        by_chunk,
+        by_citation,
+        mismatch_message=(
             "A visible source marker does not match the claim chunk_ids."
-        )
+        ),
+    )
 
 
 def _validate_answer_markers(
@@ -433,16 +301,111 @@ def _validate_answer_markers(
     by_chunk: Mapping[str, SearchCitation],
     by_citation: Mapping[str, SearchCitation],
 ) -> None:
+    _validate_marker_layout(answer)
     for part in _answer_parts_preserving_markers(answer):
-        if not part.strip():
+        _validate_marker_bindings(
+            part,
+            tuple((claim.text, citations) for claim, citations in resolved_claims),
+            by_chunk,
+            by_citation,
+            mismatch_message=(
+                "A visible source marker does not match its structured claim."
+            ),
+        )
+
+
+def _answer_parts_preserving_markers(answer: str) -> tuple[str, ...]:
+    text = answer.strip()
+    parts: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        if text[index] in "\r\n":
+            part = text[start:index].strip()
+            if part:
+                parts.append(part)
+            while index < len(text) and text[index] in "\r\n":
+                index += 1
+            start = index
             continue
-        markers = _resolved_markers(part, by_chunk, by_citation)
-        if not markers:
+        if text[index] not in ".!?":
+            index += 1
             continue
+
+        sentence_end = index + 1
+        cursor = sentence_end
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        marker_end = cursor
+        marker_found = False
+        while match := SOURCE_MARKER_PATTERN.match(text, marker_end):
+            marker_found = True
+            marker_end = match.end()
+            while marker_end < len(text) and text[marker_end] in " \t":
+                marker_end += 1
+        if marker_found:
+            part = text[start:marker_end].strip()
+            if part:
+                parts.append(part)
+            start = marker_end
+            index = marker_end
+            continue
+        if (
+            cursor == len(text)
+            or cursor > sentence_end
+            or text[cursor] in "\r\n"
+        ):
+            part = text[start:sentence_end].strip()
+            if part:
+                parts.append(part)
+            start = cursor
+            index = cursor
+            continue
+        index += 1
+
+    final_part = text[start:].strip()
+    if final_part:
+        parts.append(final_part)
+    return tuple(parts)
+
+
+def _validate_marker_layout(text: str) -> None:
+    for match in SOURCE_MARKER_PATTERN.finditer(text):
+        suffix = text[match.end() :]
+        if suffix and not suffix[0].isspace():
+            raise UncitedAnswerError(
+                "A visible source marker is not bound to a structured claim."
+            )
+        normalized_suffix = unicodedata.normalize("NFKC", suffix.lstrip())
+        if normalized_suffix.startswith(":"):
+            raise UncitedAnswerError(
+                "A visible source marker is not bound to a structured claim."
+            )
+
+
+def _validate_marker_bindings(
+    text: str,
+    resolved_claims: Sequence[
+        tuple[str, Sequence[SearchCitation]]
+    ],
+    by_chunk: Mapping[str, SearchCitation],
+    by_citation: Mapping[str, SearchCitation],
+    *,
+    mismatch_message: str,
+) -> None:
+    matches = tuple(SOURCE_MARKER_PATTERN.finditer(text))
+    if not matches:
+        return
+    markers = _resolved_markers(text, by_chunk, by_citation)
+    for match, marker in zip(matches, markers, strict=True):
+        prefix = text[: match.start()]
         supported_claims = [
             citations
             for claim, citations in resolved_claims
-            if _claim_is_supported(part, claim.text)
+            if (
+                _claim_is_supported(prefix, claim)
+                and _claim_is_supported(text, claim)
+            )
         ]
         if not supported_claims:
             raise UncitedAnswerError(
@@ -453,21 +416,8 @@ def _validate_answer_markers(
             for citations in supported_claims
             for citation in citations
         }
-        if any(marker.citation_id not in allowed_ids for marker in markers):
-            raise UncitedAnswerError(
-                "A visible source marker does not match its structured claim."
-            )
-
-
-def _answer_parts_preserving_markers(answer: str) -> tuple[str, ...]:
-    return tuple(
-        part
-        for part in re.split(
-            r"(?<=[.!?])\s+(?!(?i:\[source:))|(?<=\])\s+(?=\S)|\n+",
-            answer.strip(),
-        )
-        if part.strip()
-    )
+        if marker.citation_id not in allowed_ids:
+            raise UncitedAnswerError(mismatch_message)
 
 
 def _resolved_markers(
