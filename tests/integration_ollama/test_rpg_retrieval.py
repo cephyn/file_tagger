@@ -66,6 +66,7 @@ def _lexical_rank(query: str, chunk_ids: Iterable[str]) -> tuple[str, ...]:
 
 def test_rpg_rrf_recall_is_not_regressive(real_ollama, integration_profile) -> None:
     chunks = tuple(chunk_id for chunk_id, _, _ in RPG_CORPUS)
+    recall_cutoff = 2
     query = "level 3 flooded temple encounters treasure"
     vectors = {
         chunk_id: real_ollama.embed(
@@ -98,19 +99,25 @@ def test_rpg_rrf_recall_is_not_regressive(real_ollama, integration_profile) -> N
         return hits / len(relevant)
 
     relevant = frozenset({"rpg-encounters", "rpg-treasure"})
-    lexical_recall = recall_at_k(lexical_rank, relevant, 4)
+    assert 0 < len(relevant) < len(chunks)
+    assert recall_cutoff < len(chunks)
+    lexical_recall = recall_at_k(lexical_rank, relevant, recall_cutoff)
     fused_recall = recall_at_k(
         tuple(hit.chunk_id for hit in fused),
         relevant,
-        4,
+        recall_cutoff,
     )
     real_ollama.metrics["recall_at_k"] = {
         "lexical": lexical_recall,
         "rrf": fused_recall,
+        "cutoff": recall_cutoff,
+        "relevant_count": len(relevant),
+        "corpus_count": len(chunks),
     }
 
-    assert fused_recall >= lexical_recall
+    assert lexical_recall == 0.5
     assert fused_recall >= 0.5
+    assert fused_recall >= lexical_recall
 
 
 def test_rpg_plan_covers_evidence_categories_and_citations(

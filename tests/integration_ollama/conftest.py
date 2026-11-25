@@ -266,6 +266,14 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_marker)
 
 
+def _close_gateway(gateway: OllamaGateway) -> None:
+    try:
+        asyncio.run(gateway.close())
+    except RuntimeError as exc:
+        if "Event loop is closed" not in str(exc):
+            raise
+
+
 @pytest.fixture(scope="session")
 def integration_profile() -> IntegrationProfile:
     if os.environ.get(OPT_IN_ENV) != "1":
@@ -277,67 +285,66 @@ def integration_profile() -> IntegrationProfile:
     except RemoteOllamaHostError as exc:
         pytest.fail(f"Remote Ollama hosts require loopback: {exc}")
 
-    required_models = {
-        "embedding": os.environ.get(
-            "FILE_TAGGER_OLLAMA_EMBED_MODEL",
-            DEFAULT_EMBED_MODEL,
-        ),
-        "decision": os.environ.get(
-            "FILE_TAGGER_OLLAMA_DECISION_MODEL",
-            DEFAULT_DECISION_MODEL,
-        ),
-        "generation": os.environ.get(
-            "FILE_TAGGER_OLLAMA_GENERATION_MODEL",
-            DEFAULT_GENERATION_MODEL,
-        ),
-    }
     try:
-        for model in required_models.values():
-            gateway._validate_model(model)
-    except Exception as exc:
-        asyncio.run(gateway.close())
-        pytest.fail(f"Cloud or missing Ollama model configuration: {exc}")
+        required_models = {
+            "embedding": os.environ.get(
+                "FILE_TAGGER_OLLAMA_EMBED_MODEL",
+                DEFAULT_EMBED_MODEL,
+            ),
+            "decision": os.environ.get(
+                "FILE_TAGGER_OLLAMA_DECISION_MODEL",
+                DEFAULT_DECISION_MODEL,
+            ),
+            "generation": os.environ.get(
+                "FILE_TAGGER_OLLAMA_GENERATION_MODEL",
+                DEFAULT_GENERATION_MODEL,
+            ),
+        }
+        try:
+            for model in required_models.values():
+                gateway._validate_model(model)
+        except Exception as exc:
+            pytest.fail(f"Cloud or missing Ollama model configuration: {exc}")
 
-    try:
-        readiness = asyncio.run(gateway.readiness(required_models))
-    except Exception as exc:
-        asyncio.run(gateway.close())
-        pytest.fail(f"Could not connect to local Ollama: {exc}")
+        try:
+            readiness = asyncio.run(gateway.readiness(required_models))
+        except Exception as exc:
+            pytest.fail(f"Could not connect to local Ollama: {exc}")
 
-    if not readiness.ready:
-        asyncio.run(gateway.close())
-        pytest.fail(
-            "Local Ollama integration profile is not ready: "
-            f"missing={readiness.missing_models}, "
-            f"incompatible={readiness.incompatible_models}, "
-            f"errors={readiness.errors}"
+        if not readiness.ready:
+            pytest.fail(
+                "Local Ollama integration profile is not ready: "
+                f"missing={readiness.missing_models}, "
+                f"incompatible={readiness.incompatible_models}, "
+                f"errors={readiness.errors}"
+            )
+
+        profile = IntegrationProfile(
+            embedding=required_models["embedding"],
+            decision=required_models["decision"],
+            generation=required_models["generation"],
+            embedding_profile=asyncio.run(
+                gateway.model_profile(
+                    "embedding",
+                    required_models["embedding"],
+                )
+            ),
+            decision_profile=asyncio.run(
+                gateway.model_profile(
+                    "decision",
+                    required_models["decision"],
+                )
+            ),
+            generation_profile=asyncio.run(
+                gateway.model_profile(
+                    "generation",
+                    required_models["generation"],
+                )
+            ),
         )
-
-    profile = IntegrationProfile(
-        embedding=required_models["embedding"],
-        decision=required_models["decision"],
-        generation=required_models["generation"],
-        embedding_profile=asyncio.run(
-            gateway.model_profile(
-                "embedding",
-                required_models["embedding"],
-            )
-        ),
-        decision_profile=asyncio.run(
-            gateway.model_profile(
-                "decision",
-                required_models["decision"],
-            )
-        ),
-        generation_profile=asyncio.run(
-            gateway.model_profile(
-                "generation",
-                required_models["generation"],
-            )
-        ),
-    )
-    yield profile
-    asyncio.run(gateway.close())
+        yield profile
+    finally:
+        _close_gateway(gateway)
 
 
 @pytest.fixture(scope="session")
@@ -349,10 +356,14 @@ def real_ollama(integration_profile: IntegrationProfile):
         gateway=gateway,
         report_dir=report_dir,
     )
-    yield wrapper
-    asyncio.run(wrapper.close())
-    recall = wrapper.metrics.get("recall_at_k")
-    wrapper.write_reports(
-        integration_profile,
-        recall=recall if isinstance(recall, dict) else None,
-    )
+    try:
+        yield wrapper
+    finally:
+        recall = wrapper.metrics.get("recall_at_k")
+        try:
+            wrapper.write_reports(
+                integration_profile,
+                recall=recall if isinstance(recall, dict) else None,
+            )
+        finally:
+            _close_gateway(wrapper.gateway)
