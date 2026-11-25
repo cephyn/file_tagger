@@ -192,6 +192,137 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     assert answer.citations == evidence[0].citations
 
 
+def test_structured_answer_accepts_contiguous_markers_for_same_claim() -> None:
+    claim = "A dragon guards the flooded temple."
+    first = make_result(
+        {
+            "file_path": r"C:\campaign\first.md",
+            "stable_id": "a",
+            "page_number": 1,
+            "text": claim,
+        },
+        source="hybrid",
+    )
+    second = make_result(
+        {
+            "file_path": r"C:\campaign\second.md",
+            "stable_id": "b",
+            "page_number": 1,
+            "text": claim,
+        },
+        source="hybrid",
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": f"{claim} [source: a] [source: b]",
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": claim,
+                        "chunk_ids": ["a", "b"],
+                    }
+                ],
+            }
+        )
+    )
+
+    answer = answer_question(
+        "Find suitable encounters",
+        (first, second),
+        gateway=fake_model,
+    )
+
+    assert answer.claims[0].chunk_ids == ("a", "b")
+    assert answer.citations == (first.citations[0], second.citations[0])
+
+
+def test_structured_answer_rejects_grouped_marker_outside_claim_chunks() -> None:
+    claim = "A dragon guards the flooded temple."
+    first = make_result(
+        {
+            "file_path": r"C:\campaign\first.md",
+            "stable_id": "a",
+            "page_number": 1,
+            "text": claim,
+        },
+        source="hybrid",
+    )
+    unrelated = make_result(
+        {
+            "file_path": r"C:\campaign\unrelated.md",
+            "stable_id": "b",
+            "page_number": 1,
+            "text": claim,
+        },
+        source="hybrid",
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": f"{claim} [source: a] [source: b]",
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": claim,
+                        "chunk_ids": ["a"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="does not match"):
+        answer_question(
+            "Find suitable encounters",
+            (first, unrelated),
+            gateway=fake_model,
+        )
+
+
+def test_structured_answer_rejects_grouped_marker_with_different_full_quote() -> None:
+    claim = "A dragon guards the flooded temple."
+    first = make_result(
+        {
+            "file_path": r"C:\campaign\first.md",
+            "stable_id": "a",
+            "page_number": 1,
+            "text": claim,
+        },
+        source="hybrid",
+    )
+    second = make_result(
+        {
+            "file_path": r"C:\campaign\second.md",
+            "stable_id": "b",
+            "page_number": 1,
+            "text": "A dragon guards the northern tower.",
+        },
+        source="hybrid",
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": f"{claim} [source: a] [source: b]",
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": claim,
+                        "chunk_ids": ["a", "b"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete full cited chunk"):
+        answer_question(
+            "Find suitable encounters",
+            (first, second),
+            gateway=fake_model,
+        )
+
+
 def test_structured_claim_accepts_safe_unicode_case_and_whitespace_normalization(
 ) -> None:
     quote = "Ａ DRAGON\nguards the flooded temple！"

@@ -370,17 +370,22 @@ def _validate_marker_bindings(
         normalized_claims.append(_normalize_text(claim))
         claim_prefixes.append(" ".join(normalized_claims))
     previous_marker_end = 0
+    previous_supported_claims: list[Sequence[SearchCitation]] = []
     for match, marker in zip(matches, markers, strict=True):
         prefix = _normalize_text(text[: match.start()])
         segment = _normalize_text(text[previous_marker_end : match.start()])
-        supported_claims = [
-            resolved_claims[index][1]
-            for index, claim_prefix in enumerate(claim_prefixes)
-            if (
-                prefix == claim_prefix
-                and segment == normalized_claims[index]
-            )
-        ]
+        supported_claims = (
+            previous_supported_claims
+            if not segment and previous_marker_end
+            else [
+                resolved_claims[index][1]
+                for index, claim_prefix in enumerate(claim_prefixes)
+                if (
+                    prefix == claim_prefix
+                    and segment == normalized_claims[index]
+                )
+            ]
+        )
         if not supported_claims:
             raise UncitedAnswerError(
                 "A visible source marker is not bound to a structured claim."
@@ -393,6 +398,7 @@ def _validate_marker_bindings(
         if marker.citation_id not in allowed_ids:
             raise UncitedAnswerError(mismatch_message)
         previous_marker_end = match.end()
+        previous_supported_claims = supported_claims
 
 
 def _resolved_markers(
