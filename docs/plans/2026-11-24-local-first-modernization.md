@@ -41,7 +41,10 @@ Last updated: 2026-11-24
 | 22: citation-validated RAG answers | Complete | `e67bb06`, `484f5c1`, `621a118`, `da9c1d9`, `4015089`, `210e038`, `89a84ae`, `072830b`, `bf92703`, `1f23a19`, `f761fb4`, `ae330c3` |
 | 23: Ollama readiness settings UI | Complete | `bccb13a`, `b71d123`, `52f67f8`, `04826c9`, `ec35f5e` |
 | 24: resumable indexing UI | Complete | `5298446`, `8d35480`, `70c3709`, `0d173d1`, `1907872`, `9faa796`, `7e5edc3`, `4015089`, `210e038` |
-| 25-29 | Not started | — |
+| 25: contextual Markdown search and chat | Complete | `59d4209`, `70351f8`, `f4e55da`, `77cc525`, `52d4a64`, `cd076f0`, `154347c` |
+| 26: remove cloud and legacy runtime stacks | Complete | `f994df67`, `e137eb0`, `89d9e54`, `d23a07a` |
+| 27: golden migration/retrieval acceptance | Complete | `eb2e9fd`, `76f6713` |
+| 28-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -1229,6 +1232,8 @@ git commit -m "feat: expose resumable indexing in desktop UI"
 
 ### Task 25: Add Contextual Markdown Search and Chat
 
+**Status: Complete**
+
 **Files:**
 - Modify: `src/file_tagger/file_tag_manager.py`
 - Modify: `src/file_tagger/search.py`
@@ -1272,6 +1277,8 @@ git commit -m "feat: add Markdown-contextual local search"
 ## Phase 8: Cleanup, Packaging, and Acceptance
 
 ### Task 26: Remove Cloud and Competing Runtime Stacks
+
+**Status: Complete**
 
 **Files:**
 - Delete: `src/file_tagger/ai_service.py` if not already removed
@@ -1336,6 +1343,8 @@ git commit -m "refactor: remove cloud and legacy model stacks"
 ```
 
 ### Task 27: Add Golden Migration and Retrieval Acceptance Tests
+
+**Status: Complete**
 
 **Files:**
 - Create: `tests/acceptance/test_full_upgrade.py`
