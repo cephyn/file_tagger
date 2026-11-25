@@ -77,6 +77,7 @@ class IndexingStatus(QWidget):
         self._job_id: int | None = None
         self._worker: _IndexingWorker | None = None
         self._pending: deque[_PendingIndexJob] = deque()
+        self._observed_job_ids: set[int] = set()
         self._active_path = ""
         self._active_service: Any = service
         self._worker_generation = 0
@@ -117,6 +118,7 @@ class IndexingStatus(QWidget):
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._refresh_progress)
         self._restore_resumable_job()
+        self._timer.start()
 
     @property
     def previous_revision_available(self) -> bool:
@@ -151,9 +153,7 @@ class IndexingStatus(QWidget):
         queue_index = getattr(active_service, "queue", None)
         if self._worker is not None and self._worker.isRunning():
             if callable(queue_index):
-                self._pending.append(
-                    _PendingIndexJob(int(queue_index(path)), path)
-                )
+                self._enqueue_pending(int(queue_index(path)), path)
             else:
                 self._pending.append(_PendingIndexJob(None, path))
             return None
@@ -171,6 +171,8 @@ class IndexingStatus(QWidget):
         file_path: str,
     ) -> None:
         self._active_path = file_path
+        if job_id is not None:
+            self._observed_job_ids.add(job_id)
         self._active_service = active_service
         setattr(self._active_service, "cancel_requested", False)
         setattr(self.service, "cancel_requested", False)
@@ -203,10 +205,11 @@ class IndexingStatus(QWidget):
             job_ids = tuple(int(queue_one(path)) for path in paths)
         else:
             job_ids = (None,) * len(paths)
-        self._pending.extend(
-            _PendingIndexJob(job_id, path)
-            for job_id, path in zip(job_ids, paths, strict=True)
-        )
+        for job_id, path in zip(job_ids, paths, strict=True):
+            if job_id is None:
+                self._pending.append(_PendingIndexJob(None, path))
+            else:
+                self._enqueue_pending(job_id, path)
         if self._worker is not None and self._worker.isRunning():
             return
         self._start_next()
@@ -295,8 +298,13 @@ class IndexingStatus(QWidget):
         self._timer.start()
 
     def _refresh_progress(self) -> None:
+        if self._closing:
+            return
+        self._discover_resumable_jobs()
         if self._worker is None and self._pending:
             self._start_next()
+            return
+        if self._worker is None:
             return
         if self._job_id is None:
             self._set_progress(
@@ -352,7 +360,6 @@ class IndexingStatus(QWidget):
             return
         self._result_handled = True
         self._last_result = result
-        self._timer.stop()
         self.cancel_button.setEnabled(False)
         self.finished.emit(result)
         status = str(getattr(result, "status", "completed"))
@@ -368,7 +375,6 @@ class IndexingStatus(QWidget):
         self._terminal_state(result)
 
     def _terminal_state(self, result: Any) -> None:
-        self._timer.stop()
         self.cancel_button.setEnabled(False)
         failure = getattr(result, "failure", None)
         summary = (
@@ -401,7 +407,6 @@ class IndexingStatus(QWidget):
         if not self._is_current_worker(worker, generation) or self._result_handled:
             return
         self._result_handled = True
-        self._timer.stop()
         self.cancel_button.setEnabled(False)
         self._completed = False
         self._set_progress(
@@ -468,7 +473,6 @@ class IndexingStatus(QWidget):
             return False
         if self._worker is worker:
             self._worker = None
-            self._timer.stop()
             self.cancel_button.setEnabled(False)
             self.resume_button.setEnabled(False)
         worker.deleteLater()
@@ -505,11 +509,9 @@ class IndexingStatus(QWidget):
                     if job_id is None:
                         job_id = getattr(result, "id", None)
                     if job_id is not None:
-                        self._pending.append(
-                            _PendingIndexJob(
-                                int(job_id),
-                                str(getattr(result, "file_path", "")),
-                            )
+                        self._enqueue_pending(
+                            int(job_id),
+                            str(getattr(result, "file_path", "")),
                         )
                 self._timer.start()
                 self._start_next()
@@ -527,11 +529,45 @@ class IndexingStatus(QWidget):
         if job_id is None:
             return
         self._job_id = int(job_id)
+        self._observed_job_ids.add(self._job_id)
         self._active_path = str(getattr(result, "file_path", ""))
         self._active_service = self._resolved_service()
         self._result_handled = True
         self._completed = False
         self._terminal_state(result)
+
+    def _discover_resumable_jobs(self) -> None:
+        resumable_jobs = getattr(self.service, "resumable_jobs", None)
+        results: tuple[Any, ...]
+        if callable(resumable_jobs):
+            try:
+                results = tuple(resumable_jobs())
+            except Exception:
+                return
+        else:
+            latest = getattr(self.service, "latest_resumable_job", None)
+            if not callable(latest):
+                return
+            try:
+                result = latest()
+            except Exception:
+                return
+            results = () if result is None else (result,)
+        for result in results:
+            job_id = getattr(result, "job_id", getattr(result, "id", None))
+            if job_id is None:
+                continue
+            self._enqueue_pending(
+                int(job_id),
+                str(getattr(result, "file_path", "")),
+            )
+
+    def _enqueue_pending(self, job_id: int, file_path: str) -> bool:
+        if job_id in self._observed_job_ids:
+            return False
+        self._observed_job_ids.add(job_id)
+        self._pending.append(_PendingIndexJob(job_id, file_path))
+        return True
 
     def _is_current_worker(
         self,

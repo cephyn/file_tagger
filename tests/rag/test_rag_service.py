@@ -191,6 +191,36 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     assert answer.citations == evidence[0].citations
 
 
+@pytest.mark.parametrize("marker_position", ("leading", "separate_line"))
+def test_structured_answer_rejects_orphan_source_marker_fragments(
+    marker_position: str,
+) -> None:
+    evidence = _evidence()
+    marker = f"[source: {evidence[0].chunk_id}]"
+    answer = (
+        f"{marker} A dragon guards the temple."
+        if marker_position == "leading"
+        else f"A dragon guards the temple.\n{marker}"
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": answer,
+                "claims": [
+                    {
+                        "text": "A dragon guards the temple.",
+                        "evidence_quote": "A dragon guards the flooded temple.",
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="structured claim"):
+        answer_question("Find suitable encounters", evidence, gateway=fake_model)
+
+
 def test_structured_claim_marker_must_resolve_to_its_claim_chunks() -> None:
     first = make_result(
         {
@@ -297,15 +327,27 @@ def test_structured_answer_marker_must_match_the_preceding_claim() -> None:
         answer_question("What happened?", (first, second), gateway=fake_model)
 
 
-@pytest.mark.parametrize("qualifier", ("reportedly", "may", "believed"))
+@pytest.mark.parametrize(
+    "quote",
+    (
+        "The witness likely left before dawn.",
+        "The witness unlikely left before dawn.",
+        "The witness probably left before dawn.",
+        "The witness possibly left before dawn.",
+        "The witness may have left before dawn.",
+        "The witness might have left before dawn.",
+        "The witness reportedly left before dawn.",
+        "The witness allegedly left before dawn.",
+        "The witness purportedly left before dawn.",
+        "The witness apparently left before dawn.",
+        "The witness supposedly left before dawn.",
+        "Perhaps the witness left before dawn.",
+        "The witness is believed to have left before dawn.",
+    ),
+)
 def test_structured_claim_cannot_strengthen_qualified_evidence(
-    qualifier: str,
+    quote: str,
 ) -> None:
-    quote = {
-        "reportedly": "The witness reportedly left before dawn.",
-        "may": "The witness may have left before dawn.",
-        "believed": "The witness is believed to have left before dawn.",
-    }[qualifier]
     evidence = (
         make_result(
             {

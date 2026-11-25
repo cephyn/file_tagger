@@ -154,6 +154,112 @@ def test_indexing_queues_a_second_ui_request_while_worker_is_running(qtbot) -> N
     qtbot.waitUntil(lambda: resumed == [1, 2])
 
 
+def test_indexing_status_discovers_job_created_after_construction(qtbot) -> None:
+    resumed: list[int] = []
+    jobs: list[SimpleNamespace] = []
+
+    class Service:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def resumable_jobs(self):
+            return tuple(jobs)
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            del cancellation_check
+            resumed.append(job_id)
+            return SimpleNamespace(job_id=job_id, status="completed")
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+    jobs.append(
+        SimpleNamespace(
+            job_id=23,
+            file_path="C:\\library\\created-later.md",
+            status="queued",
+        )
+    )
+
+    qtbot.waitUntil(lambda: resumed == [23])
+
+    assert status._timer.isActive()
+    qtbot.wait(250)
+    assert resumed == [23]
+
+
+def test_indexing_status_discovers_late_latest_resumable_job(qtbot) -> None:
+    resumed: list[int] = []
+    latest: list[SimpleNamespace] = []
+
+    class Service:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def latest_resumable_job(self):
+            return latest[0] if latest else None
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            del cancellation_check
+            resumed.append(job_id)
+            return SimpleNamespace(job_id=job_id, status="completed")
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+    latest.append(
+        SimpleNamespace(
+            job_id=29,
+            file_path="C:\\library\\latest-later.md",
+            status="failed",
+        )
+    )
+
+    qtbot.waitUntil(lambda: resumed == [29])
+
+
+def test_indexing_status_starts_pending_job_after_late_readiness(
+    qtbot,
+) -> None:
+    resumed: list[int] = []
+    pending = SimpleNamespace(
+        job_id=31,
+        file_path="C:\\library\\needs-late-model.md",
+        status="pending",
+    )
+
+    class Runtime:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def __init__(self) -> None:
+            self._indexing_service = None
+
+        def resumable_jobs(self):
+            return (pending,)
+
+    class ReadyService:
+        def resume(self, job_id: int, *, cancellation_check=None):
+            del cancellation_check
+            resumed.append(job_id)
+            return SimpleNamespace(job_id=job_id, status="completed")
+
+    runtime = Runtime()
+    status = IndexingStatus(runtime)
+    qtbot.addWidget(status)
+
+    qtbot.waitUntil(lambda: status._timer.isActive())
+    assert status._worker is None
+
+    stale_service = object()
+    runtime._indexing_service = stale_service
+    ready_service = ReadyService()
+    runtime._indexing_service = ready_service
+
+    qtbot.waitUntil(lambda: resumed == [31])
+    assert status._active_service is ready_service
+    qtbot.wait(250)
+    assert resumed == [31]
+
+
 def test_close_mid_batch_restores_and_resumes_every_remaining_job(qtbot) -> None:
     entered = Event()
     paths = [
