@@ -60,6 +60,9 @@ include = [
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 testpaths = ["tests"]
+markers = [
+    "ollama: requires an opt-in local Ollama installation (FILE_TAGGER_RUN_OLLAMA_TESTS=1)",
+]
 
 [tool.coverage.run]
 branch = true
