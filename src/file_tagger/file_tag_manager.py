@@ -40,9 +40,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import QSize
 from .models import File, Tag
-from .api_settings import APISettingsDialog
+from .ollama.readiness import ReadinessReport
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
+from .ui.ollama_settings import OllamaSettingsDialog
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
 from .modern_context import ModernIndexingUnavailable
@@ -451,8 +452,8 @@ class FileTagManager(QMainWindow):
         help_menu = menubar.addMenu("Help")
 
         # Add settings menu actions
-        api_settings_action = settings_menu.addAction("API Settings")
-        api_settings_action.triggered.connect(self.show_api_settings)
+        ollama_settings_action = settings_menu.addAction("Ollama Readiness")
+        ollama_settings_action.triggered.connect(self.show_ollama_settings)
 
         home_dir_action = settings_menu.addAction("Set Home Directory")
         home_dir_action.triggered.connect(self.set_home_directory)
@@ -1603,12 +1604,30 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Error",
-                f"Could not start chat: {str(e)}\nPlease check your API settings and try again.",
+                f"Could not start chat: {str(e)}\nPlease check Ollama readiness and try again.",
             )
 
-    def show_api_settings(self):
-        """Show the API settings dialog."""
-        dialog = APISettingsDialog(config=self.config, parent=self)
+    def show_ollama_settings(self) -> None:
+        """Show the local Ollama readiness and installed-model dialog."""
+        runtime = getattr(self, "modern_runtime", None)
+        report = getattr(runtime, "readiness", None)
+        if not isinstance(report, ReadinessReport):
+            reason = (
+                runtime.unavailable_reason
+                if runtime is not None
+                else "the modern Ollama runtime is not initialized."
+            )
+            report = ReadinessReport(
+                ready=False,
+                blocked_roles=("indexing", "search", "tagging"),
+                instructions=(f"Ollama readiness unavailable: {reason}",),
+                errors=(str(reason),),
+            )
+        dialog = OllamaSettingsDialog(
+            report,
+            runtime_refresh_provider=runtime,
+            parent=self,
+        )
         dialog.exec()
 
     def show_password_management(self):

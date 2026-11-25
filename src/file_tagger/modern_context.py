@@ -144,7 +144,14 @@ class ModernRuntime:
             hardware = profile_hardware()
             recommendation = recommend_models(hardware)
             required = _required_models(recommendation)
-            report = asyncio.run(self._check_readiness(gateway, required))
+            report = asyncio.run(
+                self._check_readiness(gateway, required)
+            ).model_copy(
+                update={
+                    "hardware": hardware,
+                    "recommendation": recommendation,
+                }
+            )
             embedding_profile = None
             if "indexing" not in report.blocked_roles:
                 embedding_profile = next(

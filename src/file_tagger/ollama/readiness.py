@@ -6,13 +6,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .benchmarks import BenchmarkResult, run_model_benchmark
-from ..domain.contracts import ModelProfile
+from ..domain.contracts import HardwareReport, ModelProfile, OllamaReadiness
 from ..domain.errors import (
     ModelIncompatibleError,
     ModelMissingError,
     OllamaUnavailableError,
 )
 from ..persistence.models import ModelProfileRecord
+from .model_recommender import ModelRecommendation
 
 
 ROLE_FEATURES = {
@@ -47,6 +48,9 @@ class ReadinessReport(BaseModel):
     errors: tuple[str, ...] = ()
     profiles: tuple[ModelProfile, ...] = ()
     benchmarks: tuple[BenchmarkResult, ...] = ()
+    ollama: OllamaReadiness | None = None
+    hardware: HardwareReport | None = None
+    recommendation: ModelRecommendation | None = None
 
 
 def _cloud_model(model: str) -> bool:
@@ -166,6 +170,7 @@ class OllamaReadinessService:
             errors=tuple(dict.fromkeys(errors)),
             profiles=tuple(profiles),
             benchmarks=tuple(benchmarks),
+            ollama=gateway_report,
         )
 
     def _persist_profiles(
