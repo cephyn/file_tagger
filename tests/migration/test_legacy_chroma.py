@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,51 @@ def test_chroma_directory_requires_confirmation_for_cleanup(tmp_path) -> None:
 
     assert cleanup_legacy_chroma(chroma_dir, confirmed=True) is True
     assert not chroma_dir.exists()
+
+
+def test_chroma_cleanup_missing_directory_returns_false(tmp_path: Path) -> None:
+    chroma_dir = tmp_path / ".chroma"
+
+    assert cleanup_legacy_chroma(chroma_dir, confirmed=True) is False
+
+
+def test_chroma_cleanup_rejects_non_chroma_directory(tmp_path: Path) -> None:
+    chroma_dir = tmp_path / "other"
+    chroma_dir.mkdir()
+
+    with pytest.raises(ValueError, match="limited to a legacy .chroma"):
+        cleanup_legacy_chroma(chroma_dir, confirmed=True)
+
+    assert chroma_dir.is_dir()
+
+
+def test_chroma_cleanup_rejects_regular_file(tmp_path: Path) -> None:
+    chroma_file = tmp_path / ".chroma"
+    chroma_file.write_bytes(b"not a directory")
+
+    with pytest.raises(ValueError, match="not a regular directory"):
+        cleanup_legacy_chroma(chroma_file, confirmed=True)
+
+    assert chroma_file.is_file()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="platform does not support symlinks")
+def test_chroma_cleanup_rejects_symlink_and_preserves_target(tmp_path: Path) -> None:
+    target = tmp_path / "legacy-data"
+    target.mkdir()
+    (target / "chroma.sqlite3").write_bytes(b"legacy")
+    chroma_link = tmp_path / ".chroma"
+
+    try:
+        chroma_link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="not a regular directory"):
+        cleanup_legacy_chroma(chroma_link, confirmed=True)
+
+    assert chroma_link.is_symlink()
+    assert target.is_dir()
 
 
 def test_chroma_sqlite_inventory_reads_only_path_metadata(tmp_path: Path) -> None:

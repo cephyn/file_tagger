@@ -133,12 +133,21 @@ def inspect_legacy_chroma(
 def cleanup_legacy_chroma(chroma_dir: Path, *, confirmed: bool) -> bool:
     if not confirmed:
         raise ValueError("Legacy Chroma cleanup requires explicit confirmation.")
-    resolved = chroma_dir.expanduser().resolve()
+    original = chroma_dir.expanduser()
+    if original.name != ".chroma":
+        raise ValueError("Cleanup is limited to a legacy .chroma directory.")
+    if original.is_symlink():
+        raise ValueError("Legacy Chroma cleanup path is not a regular directory.")
+    if not original.exists():
+        return False
+    if not original.is_dir():
+        raise ValueError("Legacy Chroma cleanup path is not a regular directory.")
+
+    resolved = original.resolve()
     if resolved.name != ".chroma":
         raise ValueError("Cleanup is limited to a legacy .chroma directory.")
-    if not resolved.exists():
-        return False
     if resolved.is_symlink() or not resolved.is_dir():
         raise ValueError("Legacy Chroma cleanup path is not a regular directory.")
-    shutil.rmtree(resolved)
+
+    shutil.rmtree(original)
     return True
