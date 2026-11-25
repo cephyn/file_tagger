@@ -59,15 +59,15 @@ class StructuredClaim(DomainRecord):
     text: str = Field(
         min_length=1,
         description=(
-            "The factual claim. Its normalized text must equal the complete "
-            "evidence_quote and cited chunk."
+            "The factual claim. Its text must equal evidence_quote after only "
+            "Unicode NFKC, case, and whitespace normalization."
         ),
     )
     evidence_quote: str = Field(
         min_length=1,
         description=(
-            "The complete full text of exactly one cited chunk; do not quote "
-            "individual sentences or other fragments."
+            "The complete full text of every chunk listed in chunk_ids; do not "
+            "quote individual sentences or other fragments."
         ),
     )
     chunk_ids: tuple[str, ...] = Field(min_length=1)
@@ -162,7 +162,7 @@ def parse_cited_answer(
             raise UncitedAnswerError(
                 "The model answer contains a claim without retrieved evidence."
             )
-        if not any(
+        if not all(
             _quote_matches_full_evidence_chunk(
                 raw_claim.evidence_quote,
                 citation.text,
@@ -253,34 +253,23 @@ def _citation_indexes(
     return by_chunk, by_citation
 
 
-def _normalized_words(value: str, *, strip_markers: bool = True) -> tuple[str, ...]:
+def _normalize_text(value: str, *, strip_markers: bool = True) -> str:
     if strip_markers:
         value = SOURCE_MARKER_PATTERN.sub("", value)
     normalized = unicodedata.normalize("NFKC", value.casefold())
-    words: list[str] = []
-    current: list[str] = []
-    for character in normalized:
-        category = unicodedata.category(character)[0]
-        if category in {"L", "M", "N", "S"}:
-            current.append(character)
-        elif current:
-            words.append("".join(current))
-            current = []
-    if current:
-        words.append("".join(current))
-    return tuple(words)
+    return " ".join(normalized.split())
 
 
 def _claim_is_supported(claim: str, quote: str) -> bool:
-    claim_words = _normalized_words(claim)
-    quote_words = _normalized_words(quote)
-    return bool(claim_words) and claim_words == quote_words
+    normalized_claim = _normalize_text(claim)
+    normalized_quote = _normalize_text(quote)
+    return bool(normalized_claim) and normalized_claim == normalized_quote
 
 
 def _quote_matches_full_evidence_chunk(quote: str, evidence_text: str) -> bool:
-    quote_words = _normalized_words(quote, strip_markers=False)
-    evidence_words = _normalized_words(evidence_text, strip_markers=False)
-    return bool(quote_words) and quote_words == evidence_words
+    normalized_quote = _normalize_text(quote, strip_markers=False)
+    normalized_evidence = _normalize_text(evidence_text, strip_markers=False)
+    return bool(normalized_quote) and normalized_quote == normalized_evidence
 
 
 def _answer_is_supported(
@@ -289,15 +278,13 @@ def _answer_is_supported(
 ) -> bool:
     if not claims:
         return False
-    if any(
-        _claim_is_supported(answer, claim.text)
+    normalized_claims = tuple(
+        _normalize_text(claim.text)
         for claim in claims
-    ):
-        return True
-    answer_parts = _answer_parts_preserving_markers(answer)
-    return bool(answer_parts) and all(
-        any(_claim_is_supported(part, claim.text) for claim in claims)
-        for part in answer_parts
+    )
+    return (
+        all(normalized_claims)
+        and _normalize_text(answer) == " ".join(normalized_claims)
     )
 
 
@@ -328,85 +315,15 @@ def _validate_answer_markers(
     by_citation: Mapping[str, SearchCitation],
 ) -> None:
     _validate_marker_layout(answer)
-    if any(
-        _claim_is_supported(answer, claim.text)
-        for claim, _citations in resolved_claims
-    ):
-        _validate_marker_bindings(
-            answer,
-            tuple((claim.text, citations) for claim, citations in resolved_claims),
-            by_chunk,
-            by_citation,
-            mismatch_message=(
-                "A visible source marker does not match its structured claim."
-            ),
-        )
-        return
-    for part in _answer_parts_preserving_markers(answer):
-        _validate_marker_bindings(
-            part,
-            tuple((claim.text, citations) for claim, citations in resolved_claims),
-            by_chunk,
-            by_citation,
-            mismatch_message=(
-                "A visible source marker does not match its structured claim."
-            ),
-        )
-
-
-def _answer_parts_preserving_markers(answer: str) -> tuple[str, ...]:
-    text = answer.strip()
-    parts: list[str] = []
-    start = 0
-    index = 0
-    while index < len(text):
-        if text[index] in "\r\n":
-            part = text[start:index].strip()
-            if part:
-                parts.append(part)
-            while index < len(text) and text[index] in "\r\n":
-                index += 1
-            start = index
-            continue
-        if text[index] not in ".!?":
-            index += 1
-            continue
-
-        sentence_end = index + 1
-        cursor = sentence_end
-        while cursor < len(text) and text[cursor] in " \t":
-            cursor += 1
-        marker_end = cursor
-        marker_found = False
-        while match := SOURCE_MARKER_PATTERN.match(text, marker_end):
-            marker_found = True
-            marker_end = match.end()
-            while marker_end < len(text) and text[marker_end] in " \t":
-                marker_end += 1
-        if marker_found:
-            part = text[start:marker_end].strip()
-            if part:
-                parts.append(part)
-            start = marker_end
-            index = marker_end
-            continue
-        if (
-            cursor == len(text)
-            or cursor > sentence_end
-            or text[cursor] in "\r\n"
-        ):
-            part = text[start:sentence_end].strip()
-            if part:
-                parts.append(part)
-            start = cursor
-            index = cursor
-            continue
-        index += 1
-
-    final_part = text[start:].strip()
-    if final_part:
-        parts.append(final_part)
-    return tuple(parts)
+    _validate_marker_bindings(
+        answer,
+        tuple((claim.text, citations) for claim, citations in resolved_claims),
+        by_chunk,
+        by_citation,
+        mismatch_message=(
+            "A visible source marker does not match its structured claim."
+        ),
+    )
 
 
 def _validate_marker_layout(text: str) -> None:
@@ -447,14 +364,21 @@ def _validate_marker_bindings(
     if not matches:
         return
     markers = _resolved_markers(text, by_chunk, by_citation)
+    claim_prefixes: list[str] = []
+    normalized_claims: list[str] = []
+    for claim, _citations in resolved_claims:
+        normalized_claims.append(_normalize_text(claim))
+        claim_prefixes.append(" ".join(normalized_claims))
+    previous_marker_end = 0
     for match, marker in zip(matches, markers, strict=True):
-        prefix = text[: match.start()]
+        prefix = _normalize_text(text[: match.start()])
+        segment = _normalize_text(text[previous_marker_end : match.start()])
         supported_claims = [
-            citations
-            for claim, citations in resolved_claims
+            resolved_claims[index][1]
+            for index, claim_prefix in enumerate(claim_prefixes)
             if (
-                _claim_is_supported(prefix, claim)
-                and _claim_is_supported(text, claim)
+                prefix == claim_prefix
+                and segment == normalized_claims[index]
             )
         ]
         if not supported_claims:
@@ -468,6 +392,7 @@ def _validate_marker_bindings(
         }
         if marker.citation_id not in allowed_ids:
             raise UncitedAnswerError(mismatch_message)
+        previous_marker_end = match.end()
 
 
 def _resolved_markers(

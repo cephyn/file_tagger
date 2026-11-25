@@ -192,8 +192,9 @@ def test_structured_answer_accepts_a_known_chunk_source_marker() -> None:
     assert answer.citations == evidence[0].citations
 
 
-def test_structured_claim_accepts_normalized_unicode_text() -> None:
-    quote = "Ａ DRAGON guards—the flooded temple!"
+def test_structured_claim_accepts_safe_unicode_case_and_whitespace_normalization(
+) -> None:
+    quote = "Ａ DRAGON\nguards the flooded temple！"
     evidence = (
         make_result(
             {
@@ -205,7 +206,7 @@ def test_structured_claim_accepts_normalized_unicode_text() -> None:
             source="hybrid",
         ),
     )
-    claim = "a  dragon guards the flooded temple."
+    claim = "a  dragon guards\tthe flooded temple!"
     fake_model = FakeModel(
         json.dumps(
             {
@@ -224,6 +225,233 @@ def test_structured_claim_accepts_normalized_unicode_text() -> None:
     answer = answer_question("What guards the temple?", evidence, gateway=fake_model)
 
     assert answer.text == claim
+
+
+def test_structured_claim_requires_quote_to_match_every_cited_chunk() -> None:
+    dragon = make_result(
+        {
+            "file_path": r"C:\campaign\dragon.md",
+            "stable_id": "dragon",
+            "page_number": 1,
+            "text": "A dragon guards the flooded temple.",
+        },
+        source="hybrid",
+    )
+    knight = make_result(
+        {
+            "file_path": r"C:\campaign\knight.md",
+            "stable_id": "knight",
+            "page_number": 1,
+            "text": "A knight patrols the western bridge.",
+        },
+        source="hybrid",
+    )
+    claim = "A dragon guards the flooded temple."
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": claim,
+                        "chunk_ids": ["dragon", "knight"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete full cited chunk"):
+        answer_question("Describe the guards", (dragon, knight), gateway=fake_model)
+
+
+@pytest.mark.parametrize(
+    ("claim", "evidence_quote"),
+    (
+        ("The success rate is 50.", "The success rate is 50%."),
+        ("The result was 'approved'.", "The result was “approved”."),
+        ("The route is east-west.", "The route is east—west."),
+    ),
+)
+def test_structured_claim_preserves_punctuation_and_symbols(
+    claim: str,
+    evidence_quote: str,
+) -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\punctuation.md",
+                "stable_id": "punctuation",
+                "page_number": 1,
+                "text": evidence_quote,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": evidence_quote,
+                        "chunk_ids": ["punctuation"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("Summarize the result", evidence, gateway=fake_model)
+
+
+def test_structured_quote_preserves_percent_symbol_from_cited_chunk() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\percentage.md",
+                "stable_id": "percentage",
+                "page_number": 1,
+                "text": "The success rate is 50%.",
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The success rate is 50.",
+                "claims": [
+                    {
+                        "text": "The success rate is 50.",
+                        "evidence_quote": "The success rate is 50.",
+                        "chunk_ids": ["percentage"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete full cited chunk"):
+        answer_question("What is the success rate?", evidence, gateway=fake_model)
+
+
+@pytest.mark.parametrize("visible_markers", ("none", "first", "all"))
+def test_structured_answer_matches_mt_claims_without_sentence_segmentation(
+    visible_markers: str,
+) -> None:
+    mountain = make_result(
+        {
+            "file_path": r"C:\geography\mountain.md",
+            "stable_id": "mountain",
+            "page_number": 1,
+            "text": "Mt. Everest is the highest mountain above sea level.",
+        },
+        source="hybrid",
+    )
+    knight = make_result(
+        {
+            "file_path": r"C:\campaign\knight.md",
+            "stable_id": "knight",
+            "page_number": 1,
+            "text": "The knight crossed the eastern bridge.",
+        },
+        source="hybrid",
+    )
+    claims = (
+        "Mt. Everest is the highest mountain above sea level.",
+        "The knight crossed the eastern bridge.",
+    )
+    answer = " ".join(claims)
+    if visible_markers == "first":
+        answer = f"{claims[0]} [source: mountain] {claims[1]}"
+    elif visible_markers == "all":
+        answer = (
+            f"{claims[0]} [source: mountain] "
+            f"{claims[1]} [source: knight]"
+        )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": answer,
+                "claims": [
+                    {
+                        "text": claims[0],
+                        "evidence_quote": claims[0],
+                        "chunk_ids": ["mountain"],
+                    },
+                    {
+                        "text": claims[1],
+                        "evidence_quote": claims[1],
+                        "chunk_ids": ["knight"],
+                    },
+                ],
+            }
+        )
+    )
+
+    answer = answer_question(
+        "Summarize the mountain and the knight",
+        (mountain, knight),
+        gateway=fake_model,
+    )
+
+    assert [claim.text for claim in answer.claims] == list(claims)
+
+
+def test_structured_answer_marker_cannot_cover_multiple_claim_spans() -> None:
+    mountain = make_result(
+        {
+            "file_path": r"C:\geography\mountain.md",
+            "stable_id": "mountain",
+            "page_number": 1,
+            "text": "Mt. Everest is above sea level.",
+        },
+        source="hybrid",
+    )
+    knight = make_result(
+        {
+            "file_path": r"C:\campaign\knight.md",
+            "stable_id": "knight",
+            "page_number": 1,
+            "text": "The knight crossed the bridge.",
+        },
+        source="hybrid",
+    )
+    mountain_claim = "Mt. Everest is above sea level."
+    knight_claim = "The knight crossed the bridge."
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": (
+                    f"{mountain_claim} {knight_claim} "
+                    "[source: knight]"
+                ),
+                "claims": [
+                    {
+                        "text": mountain_claim,
+                        "evidence_quote": mountain_claim,
+                        "chunk_ids": ["mountain"],
+                    },
+                    {
+                        "text": knight_claim,
+                        "evidence_quote": knight_claim,
+                        "chunk_ids": ["knight"],
+                    },
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not bound"):
+        answer_question(
+            "Summarize both",
+            (mountain, knight),
+            gateway=fake_model,
+        )
 
 
 @pytest.mark.parametrize(
@@ -555,11 +783,11 @@ def test_structured_claim_accepts_full_chunk_text_beyond_display_snippet() -> No
     assert answer.claims[0].evidence_quote == full_text
     prompt = fake_model.chat_calls[0]["messages"][-1]["content"]
     assert full_text in prompt
-    assert "complete full text of exactly one cited chunk" in (
+    assert "complete full text of every cited chunk" in (
         fake_model.chat_calls[0]["messages"][0]["content"]
     )
     schema = json.dumps(fake_model.chat_calls[0]["schema"])
-    assert "complete full text of exactly one cited chunk" in schema
+    assert "complete full text of every chunk" in schema
 
 
 def test_structured_claim_rejects_quote_omitting_later_qualifier() -> None:
