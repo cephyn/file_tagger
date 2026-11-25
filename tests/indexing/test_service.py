@@ -780,7 +780,7 @@ def test_cancellation_checkpoint_resumes_with_retry_count(tmp_path: Path) -> Non
     def cancel_after_first_chunk() -> bool:
         nonlocal checks
         checks += 1
-        return checks >= 3
+        return checks >= 4
 
     paused = service.resume(
         job_id,
@@ -854,7 +854,7 @@ def test_resume_invalidates_checkpoint_when_source_content_changes(
     def cancel_after_first_chunk() -> bool:
         nonlocal checks
         checks += 1
-        return checks >= 3
+        return checks >= 4
 
     paused = service.resume(job_id, cancellation_check=cancel_after_first_chunk)
     source.write_text("update", encoding="utf-8")

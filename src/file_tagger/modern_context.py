@@ -283,7 +283,27 @@ class ModernRuntime:
                 )
             if file_still_exists is None:
                 return None
-        return service.reindex(request.file_path, job_id=job_id)
+        return service.reindex(
+            request.file_path,
+            job_id=job_id,
+            cancellation_check=lambda: self._index_request_cancelled(request),
+        )
+
+    def _index_request_cancelled(self, request: _IndexRequest) -> bool:
+        with self._lock:
+            if (
+                self._index_generations.get(request.file_path, 0)
+                != request.generation
+                or self.session_factory is None
+            ):
+                return True
+            with self.session_factory() as session:
+                file_exists = session.scalar(
+                    select(File.id).where(
+                        File.canonical_path == request.file_path
+                    )
+                )
+            return file_exists is None
 
     def _invalidate_index_paths_locked(self, file_paths: Iterable[str]) -> None:
         invalidated = set(file_paths)

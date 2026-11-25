@@ -1,16 +1,21 @@
 from dataclasses import replace
+from hashlib import sha256
 import logging
 from pathlib import Path
 import sqlite3
 import sys
 import threading
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
-from threading import Event
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 import pytest
 
+from file_tagger.domain.contracts import ModelProfile
+from file_tagger.extraction.docling_adapter import ExtractedDocument, ExtractedPage
+from file_tagger.indexing.repository import IndexingRepository
+from file_tagger.indexing.service import IndexingService
 from file_tagger.modern_context import (
     ModernIndexingUnavailable,
     ModernRuntime,
@@ -425,8 +430,14 @@ def test_runtime_indexes_queued_files_through_one_worker(
             self._next_job_id += 1
             return job_id
 
-        def reindex(self, path: str, *, job_id: int | None = None):
-            del job_id
+        def reindex(
+            self,
+            path: str,
+            *,
+            cancellation_check: Any = None,
+            job_id: int | None = None,
+        ):
+            del cancellation_check, job_id
             calls.append(path)
             worker_ids.add(threading.get_ident())
             return SimpleNamespace(status="completed")
@@ -471,8 +482,14 @@ def test_runtime_removes_pending_queue_entry_when_file_is_deleted(
             self._next_job_id += 1
             return job_id
 
-        def reindex(self, path: str, *, job_id: int | None = None):
-            del job_id
+        def reindex(
+            self,
+            path: str,
+            *,
+            cancellation_check: Any = None,
+            job_id: int | None = None,
+        ):
+            del cancellation_check, job_id
             calls.append(str(path))
             if Path(path).resolve() == first.resolve():
                 first_started.set()
@@ -519,7 +536,14 @@ def test_runtime_deletion_during_worker_does_not_resurrect_file(
         def queue(self, path: str) -> int:
             return 1
 
-        def reindex(self, path: str, *, job_id: int | None = None):
+        def reindex(
+            self,
+            path: str,
+            *,
+            cancellation_check: Any = None,
+            job_id: int | None = None,
+        ):
+            del cancellation_check
             worker_started.set()
             assert release_worker.wait(5)
             if job_id is None:
@@ -539,6 +563,127 @@ def test_runtime_deletion_during_worker_does_not_resurrect_file(
         assert session.scalar(
             select(File).where(File.canonical_path == str(source.resolve()))
         ) is None
+
+
+def test_runtime_deletion_cancels_slow_active_embedding(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = initialize_modern_runtime(
+        paths,
+        ReloadableConfig(paths),
+        "password",
+        start_readiness=False,
+    )
+    source = tmp_path / "active.txt"
+    source.write_text("source text", encoding="utf-8")
+    runtime.sync_file(str(source), ())
+    assert runtime.session_factory is not None
+    document = ExtractedDocument(
+        file_path=str(source.resolve()),
+        file_hash=sha256(source.read_bytes()).hexdigest(),
+        parser_version="test",
+        status="complete",
+        pages=(
+            ExtractedPage(
+                number=1,
+                ordinal=0,
+                text="source text",
+                markdown="source text",
+            ),
+        ),
+    )
+
+    class Extractor:
+        def extract(self, file_path: str) -> ExtractedDocument:
+            assert Path(file_path) == source.resolve()
+            return document
+
+    embed_started = Event()
+    release_embed = Event()
+
+    class BlockingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str,
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: str = "5m",
+        ) -> tuple[tuple[float, ...],]:
+            del model, truncate, keep_alive
+            assert text == "source text"
+            embed_started.set()
+            assert release_embed.wait(5)
+            assert dimensions is not None
+            return (tuple(0.0 for _ in range(dimensions)),)
+
+    repository = IndexingRepository(runtime.session_factory)
+    checkpoints_after_delete = 0
+    deleted = False
+    original_checkpoint = repository.checkpoint
+
+    def tracked_checkpoint(*args, **kwargs):
+        nonlocal checkpoints_after_delete
+        if deleted:
+            checkpoints_after_delete += 1
+        return original_checkpoint(*args, **kwargs)
+
+    repository.checkpoint = tracked_checkpoint  # type: ignore[method-assign]
+    service = IndexingService(
+        repository,
+        Extractor(),
+        embedding_gateway=BlockingGateway(),
+        embedding_profile=ModelProfile(
+            role="embedding",
+            model="embeddinggemma-2:270m",
+            digest="sha256:embedding",
+            context_length=1_000,
+            dimensions=256,
+        ),
+        recover_on_startup=False,
+    )
+    active_cancellation_check = None
+    original_reindex = service.reindex
+
+    def tracked_reindex(
+        path: str,
+        *,
+        cancellation_check: Any = None,
+        job_id: int | None = None,
+    ):
+        nonlocal active_cancellation_check
+        active_cancellation_check = cancellation_check
+        return original_reindex(
+            path,
+            cancellation_check=cancellation_check,
+            job_id=job_id,
+        )
+
+    service.reindex = tracked_reindex  # type: ignore[method-assign]
+    runtime._indexing_service = service
+
+    runtime.index_file_async(source)
+    assert embed_started.wait(5)
+    runtime.delete_file(str(source))
+    deleted = True
+    cancellation_detected = bool(
+        active_cancellation_check is not None and active_cancellation_check()
+    )
+    release_embed.set()
+    runtime._index_queue.join()
+
+    assert cancellation_detected
+    assert checkpoints_after_delete == 0
+    with runtime.session_factory() as session:
+        assert session.scalar(
+            select(File).where(File.canonical_path == str(source.resolve()))
+        ) is None
+        vector_count = session.execute(
+            text("SELECT COUNT(*) FROM chunk_embeddings_256")
+        ).scalar_one()
+        assert vector_count == 0
 
 
 def test_legacy_commit_failure_does_not_touch_modern_database(monkeypatch) -> None:

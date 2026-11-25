@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import inspect
 from pathlib import Path
@@ -20,6 +20,10 @@ from .repository import IndexingRepository, JobCheckpoint, JobState
 
 CancellationCheck = Callable[[], bool]
 T = TypeVar("T")
+
+
+class _IndexingCancelled(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -126,7 +130,7 @@ class IndexingService:
         try:
             if self._cancelled(job_id, cancellation_check):
                 return IndexingResult.from_state(
-                    self._pause_owned(job_id, lease_token)
+                    self._pause_owned(job_id, lease_token, state)
                 )
 
             checkpoint = self._with_lease_heartbeat(
@@ -215,12 +219,13 @@ class IndexingService:
                         total_count=total_count,
                     )
                     return IndexingResult.from_state(
-                        self._pause_owned(job_id, lease_token)
+                        self._pause_owned(job_id, lease_token, state)
                     )
                 result = self._with_lease_heartbeat(
                     job_id,
                     lease_token,
                     lambda: self._run_embedding((chunk,)),
+                    cancellation_check=cancellation_check,
                 )
                 if not result.complete_source_coverage:
                     raise ModelIncompatibleError(
@@ -249,7 +254,7 @@ class IndexingService:
 
             if self._cancelled(job_id, cancellation_check):
                 return IndexingResult.from_state(
-                    self._pause_owned(job_id, lease_token)
+                    self._pause_owned(job_id, lease_token, state)
                 )
 
             dimensions = self._profile.dimensions
@@ -258,6 +263,7 @@ class IndexingService:
                 job_id,
                 lease_token,
                 lambda: self._source_signature(state.file_path),
+                cancellation_check=cancellation_check,
             )
             if current_signature != (
                 source_size,
@@ -281,9 +287,13 @@ class IndexingService:
                 source_hash=source_hash,
             )
             return IndexingResult.from_state(completed)
+        except _IndexingCancelled:
+            return IndexingResult.from_state(
+                self._pause_owned(job_id, lease_token, state)
+            )
         except asyncio.CancelledError:
             return IndexingResult.from_state(
-                self._pause_owned(job_id, lease_token)
+                self._pause_owned(job_id, lease_token, state)
             )
         except Exception as exc:
             return IndexingResult.from_state(
@@ -306,6 +316,8 @@ class IndexingService:
         job_id: int,
         lease_token: str,
         operation: Callable[[], T],
+        *,
+        cancellation_check: CancellationCheck | None = None,
     ) -> T:
         interval = self._repository.heartbeat_interval
         self._repository.heartbeat(job_id, lease_token=lease_token)
@@ -322,6 +334,8 @@ class IndexingService:
                     if future.done():
                         raise
                     self._repository.heartbeat(job_id, lease_token=lease_token)
+        if self._cancelled(job_id, cancellation_check):
+            raise _IndexingCancelled
         self._repository.heartbeat(job_id, lease_token=lease_token)
         return result
 
@@ -374,15 +388,29 @@ class IndexingService:
         job_id: int,
         cancellation_check: CancellationCheck | None,
     ) -> bool:
-        return self._repository.cancellation_requested(job_id) or bool(
-            cancellation_check and cancellation_check()
+        return bool(cancellation_check and cancellation_check()) or (
+            self._repository.cancellation_requested(job_id)
         )
 
-    def _pause_owned(self, job_id: int, lease_token: str) -> JobState:
+    def _pause_owned(
+        self,
+        job_id: int,
+        lease_token: str,
+        fallback: JobState,
+    ) -> JobState:
         try:
             return self._repository.pause(job_id, lease_token=lease_token)
         except IndexTransactionError:
-            return self._repository.state(job_id)
+            try:
+                return self._repository.state(job_id)
+            except IndexTransactionError:
+                return replace(
+                    fallback,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    status="queued",
+                    failure=None,
+                )
 
     def _fail_owned(
         self,
