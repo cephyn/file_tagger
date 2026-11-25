@@ -1,10 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 from importlib.util import find_spec
+from pathlib import Path
 
 from PyInstaller.exceptions import HookError
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
+
+try:
+    SPEC_DIR = Path(__file__).resolve().parent
+except NameError:
+    spec_path = Path(SPECPATH).resolve()
+    SPEC_DIR = spec_path if spec_path.is_dir() else spec_path.parent
+PROJECT_ROOT = SPEC_DIR.parent
+PACKAGING_ROOT = SPEC_DIR
+SRC_ROOT = PROJECT_ROOT / "src"
 
 hiddenimports = []
 datas = []
@@ -61,9 +71,26 @@ for package in optional_packages:
 hiddenimports += collect_submodules("file_tagger")
 hiddenimports += collect_submodules("sqlite_vec")
 
+try:
+    package_datas, package_binaries, package_hiddenimports = collect_all("file_tagger")
+except Exception as exc:
+    raise HookError(
+        f"PyInstaller collection failed for required package 'file_tagger': {exc}"
+    ) from exc
+datas += package_datas
+binaries += package_binaries
+hiddenimports += package_hiddenimports
+
+alembic_ini = PROJECT_ROOT / "alembic.ini"
+alembic_dir = PROJECT_ROOT / "alembic"
+if alembic_ini.is_file():
+    datas.append((str(alembic_ini), "."))
+if alembic_dir.is_dir():
+    datas.append((str(alembic_dir), "alembic"))
+
 a = Analysis(
-    ["launcher.py"],
-    pathex=["../src"],
+    [str(PACKAGING_ROOT / "launcher.py")],
+    pathex=[str(SRC_ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

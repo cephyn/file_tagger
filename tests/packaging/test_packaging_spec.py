@@ -14,3 +14,7 @@ def test_packaging_spec_collects_required_packages_and_fails_closed() -> None:
     assert "HookError" in spec
     assert "collect_all(package)" in spec
     assert "except Exception:\n        pass" not in spec
+    assert "PROJECT_ROOT" in spec
+    assert "SPECPATH" in spec
+    assert 'pathex=[str(SRC_ROOT)]' in spec
+    assert 'str(PACKAGING_ROOT / "launcher.py")' in spec

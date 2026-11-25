@@ -45,21 +45,14 @@ def test_main_log_path_uses_discovered_logs_directory(tmp_path, monkeypatch) -> 
     assert log_file.parent == tmp_path / "logs"
 
 
-def test_init_db_defaults_to_discovered_legacy_database(tmp_path, monkeypatch) -> None:
+def test_init_db_requires_explicit_database_path() -> None:
     from file_tagger.models import init_db
 
-    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
-    working_dir = tmp_path / "working"
-    working_dir.mkdir()
-    monkeypatch.chdir(working_dir)
-    paths = AppPaths.discover()
-
-    session = init_db()
-
-    assert session.bind is not None
-    assert session.bind.url.database is not None
-    assert Path(session.bind.url.database).resolve() == paths.legacy_database
-    assert paths.legacy_database.is_file()
+    try:
+        init_db()
+    except TypeError:
+        return
+    raise AssertionError("init_db must require an explicit legacy/migration database")
 
 
 def test_init_db_accepts_explicit_legacy_database(tmp_path, monkeypatch) -> None:

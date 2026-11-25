@@ -18,6 +18,7 @@ from .models import File, Tag, TagSuggestionCache as LegacySuggestionCache
 from .search.hybrid import HybridSearch
 from .tagging.cache import (
     CachedTagRecommendations,
+    DatabaseTagRecommendationCache,
     TagRecommendationCache,
 )
 from .tagging.candidate_service import CandidateService
@@ -130,8 +131,6 @@ class TagSuggester:
                 force_refresh=force_refresh,
             )
 
-        from .models import init_db
-
         modern_factory = getattr(
             getattr(self, "modern_runtime", None),
             "session_factory",
@@ -147,8 +146,8 @@ class TagSuggester:
         selected_cache = self._cache
         try:
             if selected_cache is None:
-                cache_session = init_db()  # type: ignore[no-untyped-call]
-                selected_cache = _LegacyTagRecommendationCache(cache_session)
+                cache_session = search_session
+                selected_cache = DatabaseTagRecommendationCache(cache_session)
             embedding_profile = _runtime_embedding_profile(self.modern_runtime)
             candidate_model = _runtime_selected_model(
                 self.modern_runtime,

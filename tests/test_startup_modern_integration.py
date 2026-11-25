@@ -1956,10 +1956,9 @@ def test_initialization_worker_exposes_modern_runtime_to_login(
     monkeypatch.setitem(sys.modules, "file_tagger.vector_search", vector_search_module)
     from file_tagger import initialization
 
-    legacy_session = object()
+    modern_session = object()
     config = SimpleNamespace(paths=SimpleNamespace())
-    runtime = object()
-    monkeypatch.setattr(initialization, "init_db", lambda: legacy_session)
+    runtime = SimpleNamespace(session_factory=lambda: modern_session)
     monkeypatch.setattr(initialization, "Config", lambda password: config)
     monkeypatch.setattr(
         initialization,
@@ -1974,16 +1973,18 @@ def test_initialization_worker_exposes_modern_runtime_to_login(
     worker.run()
 
     assert len(results) == 1
-    assert results[0] == (legacy_session, config, runtime)
+    assert results[0] == (modern_session, config, runtime)
 
 
 def test_initialization_worker_failure_emits_three_tuple(monkeypatch) -> None:
     from file_tagger import initialization
 
-    def fail_init_db():
-        raise RuntimeError("database unavailable")
+    def fail_modern_runtime(*args, **kwargs):
+        raise RuntimeError("modern database unavailable")
 
-    monkeypatch.setattr(initialization, "init_db", fail_init_db)
+    config = SimpleNamespace(paths=SimpleNamespace())
+    monkeypatch.setattr(initialization, "Config", lambda password: config)
+    monkeypatch.setattr(initialization, "initialize_modern_runtime", fail_modern_runtime)
     results = []
 
     worker = initialization.InitializationWorker("password")

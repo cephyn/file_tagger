@@ -50,6 +50,7 @@ packages = ["src/file_tagger"]
 include = [
     "/src",
     "/tests",
+    "/packaging",
     "/README.md",
     "/pyproject.toml",
 ]

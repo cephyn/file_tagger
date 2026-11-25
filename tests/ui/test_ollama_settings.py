@@ -444,7 +444,7 @@ def test_manager_settings_menu_opens_ollama_readiness(qtbot) -> None:
 
     manager.setup_menus()
 
-    settings_actions = manager.menuBar().actions()[0].menu().actions()
+    settings_actions = manager.settings_menu.actions()
     assert "Ollama Readiness" in [action.text() for action in settings_actions]
     assert "API Settings" not in [action.text() for action in settings_actions]
 

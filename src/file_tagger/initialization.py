@@ -4,7 +4,6 @@ import traceback
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QPixmap
-from .models import init_db
 from .config import Config
 from .infrastructure.app_paths import AppPaths
 from .migration.legacy_chroma import inspect_legacy_chroma
@@ -35,12 +34,6 @@ class InitializationWorker(QThread):
     def run(self):
         logger.debug("InitializationWorker.run() started")
         try:
-            # Initialize database
-            logger.debug("Starting database initialization")
-            self.progress_signal.emit("Initializing database...", 10)
-            db_session = init_db()
-            logger.debug("Database initialized successfully")
-            
             # Initialize config
             logger.debug("Starting config initialization")
             self.progress_signal.emit("Loading configuration...", 30)
@@ -61,6 +54,8 @@ class InitializationWorker(QThread):
                 self.password,
             )
             logger.debug("Modern sidecar initialization completed")
+            modern_factory = getattr(modern_runtime, "session_factory", None)
+            db_session = modern_factory() if modern_factory is not None else None
 
             # Inventory legacy search data without deleting or reusing it.
             self.progress_signal.emit(

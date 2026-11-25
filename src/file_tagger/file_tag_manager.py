@@ -502,10 +502,19 @@ class FileTagManager(QMainWindow):
     def setup_menus(self):
         """Set up the application menus."""
         menubar = self.menuBar()
+        self._menubar = menubar
         settings_menu = menubar.addMenu("Settings")
         indexing_menu = menubar.addMenu("Indexing")
         search_menu = menubar.addMenu("Search")
         help_menu = menubar.addMenu("Help")
+        self._settings_menu = settings_menu
+        self._indexing_menu = indexing_menu
+        self._search_menu = search_menu
+        self._help_menu = help_menu
+        self.settings_menu = settings_menu
+        self.indexing_menu = indexing_menu
+        self.search_menu = search_menu
+        self.help_menu = help_menu
 
         # Add settings menu actions
         contextual_search_action = search_menu.addAction("Contextual Markdown Chat")
