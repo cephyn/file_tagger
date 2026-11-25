@@ -1939,6 +1939,61 @@ def test_context_rejection_reduces_already_budgeted_evidence_again() -> None:
     assert len(second_chunk_ids) < len(first_chunk_ids)
 
 
+def test_rag_stream_emits_gateway_fragments_before_answer_is_complete() -> None:
+    evidence = _evidence()
+    claim = "A dragon guards the flooded temple."
+
+    class SlowStreamingGateway:
+        def __init__(self) -> None:
+            self.fragments: list[str] = []
+
+        async def chat_stream(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ):
+            del model, messages, schema, keep_alive
+            response = json.dumps(
+                {
+                    "answer": claim,
+                    "claims": [
+                        {
+                            "text": claim,
+                            "evidence_quote": claim,
+                            "chunk_ids": [evidence[0].chunk_id],
+                        }
+                    ],
+                }
+            )
+            split = (0, 18, 41, len(response))
+            for start, end in zip(split, split[1:]):
+                await asyncio.sleep(0.01)
+                yield response[start:end]
+
+    gateway = SlowStreamingGateway()
+    service = RagService(gateway=gateway)
+
+    async def run() -> tuple[list[str], object]:
+        fragments: list[str] = []
+        async for fragment in service.answer_question_stream_async(
+            "Find suitable encounters",
+            evidence,
+            session_id="conversation-stream",
+        ):
+            fragments.append(fragment)
+            await asyncio.sleep(0)
+        return fragments, service.get_session_answer("conversation-stream")
+
+    fragments, answer = asyncio.run(run())
+
+    assert "".join(fragments) == claim
+    assert answer.text == claim
+    assert answer.citations == evidence[0].citations
+
+
 def test_follow_up_reuses_evidence_for_changed_question_and_same_retrieval_context() -> None:
     evidence = _evidence()
     search = FakeSearch({"initial": evidence})

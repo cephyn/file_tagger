@@ -51,17 +51,28 @@ def test_submission_is_frozen_typed_value() -> None:
 
 
 def test_contextual_worker_streams_answer_and_evidence(qtbot) -> None:
+    import asyncio
+
     class Service:
-        def answer_question(self, question, markdown_context="", **kwargs):
+        async def answer_question_stream_async(
+            self,
+            question,
+            markdown_context,
+            **kwargs,
+        ):
             del kwargs
             assert question == "Find the clue"
             assert markdown_context == ""
+            for fragment in ("The clue ", "is in ", "the archive."):
+                await asyncio.sleep(0.01)
+                yield fragment
+
+        def get_session_answer(self, session_id):
+            del session_id
             return SimpleNamespace(
                 text="The clue is in the archive.",
                 citations=(SimpleNamespace(path="C:\\library\\archive.md"),),
-                evidence=(
-                    SimpleNamespace(path="C:\\library\\archive.md"),
-                ),
+                evidence=(SimpleNamespace(path="C:\\library\\archive.md"),),
             )
 
     submission = ContextualSearchSubmission(question="Find the clue")
@@ -77,3 +88,42 @@ def test_contextual_worker_streams_answer_and_evidence(qtbot) -> None:
     qtbot.waitUntil(lambda: len(chunks) > 0)
 
     assert "".join(chunks) == "The clue is in the archive."
+
+
+def test_contextual_worker_emits_slow_gateway_fragments_incrementally(qtbot) -> None:
+    import asyncio
+
+    class Service:
+        async def answer_question_stream_async(
+            self,
+            question,
+            markdown_context,
+            **kwargs,
+        ):
+            del question, markdown_context, kwargs
+            for fragment in ("The ", "clue ", "arrives ", "slowly."):
+                await asyncio.sleep(0.01)
+                yield fragment
+
+        def get_session_answer(self, session_id):
+            del session_id
+            return SimpleNamespace(
+                citations=(SimpleNamespace(path="C:\\library\\archive.md"),),
+                evidence=(SimpleNamespace(path="C:\\library\\archive.md"),),
+                text="The clue arrives slowly.",
+            )
+
+    submission = ContextualSearchSubmission(question="Find the clue")
+    worker = ContextualSearchWorker(
+        Service(),
+        submission,
+        session_id="ui:slow-fragments",
+    )
+
+    chunks: list[str] = []
+    worker.answer_chunk.connect(chunks.append)
+    worker.start()
+    assert worker.wait(2000)
+    qtbot.waitUntil(lambda: len(chunks) == 4)
+
+    assert chunks == ["The ", "clue ", "arrives ", "slowly."]

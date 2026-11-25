@@ -1125,6 +1125,64 @@ def test_modern_runtime_search_uses_active_profile_and_embedding_gateway(
     )
 
 
+def test_modern_runtime_reuses_contextual_rag_service_for_conversation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    created = []
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class FakeFactory:
+        def __call__(self):
+            return FakeSession()
+
+    class FakeSearch:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeRag:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            created.append(self)
+
+    monkeypatch.setattr("file_tagger.modern_context.HybridSearch", FakeSearch)
+    monkeypatch.setattr("file_tagger.modern_context.RagService", FakeRag)
+
+    runtime = ModernRuntime(_paths(tmp_path, monkeypatch), FakeFactory())
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-active",
+        digest="sha256:embedding",
+        context_length=4096,
+        capabilities=("embedding",),
+    )
+    generation = ModelProfile(
+        role="generation",
+        model="generation-active",
+        digest="sha256:generation",
+        context_length=4096,
+        capabilities=("completion",),
+    )
+
+    first_id, first = runtime._get_contextual_rag_service(
+        "conversation-1",
+        profile=profile,
+        generation_profile=generation,
+    )
+    second_id, second = runtime._get_contextual_rag_service(
+        "conversation-1",
+        profile=profile,
+        generation_profile=generation,
+    )
+
+    assert first_id == second_id == "conversation-1"
+    assert first is second
+    assert len(created) == 1
+
+
 def test_modern_runtime_search_reports_unavailable_without_active_profile(
     tmp_path, monkeypatch
 ) -> None:

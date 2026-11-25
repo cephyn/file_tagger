@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 import json
@@ -33,6 +33,7 @@ from .ollama.readiness import OllamaReadinessService, ReadinessReport, RequiredM
 from .persistence.models import File, FileTag, Tag
 from .persistence.vector_cleanup import delete_file_embeddings
 from .rag.planner import SearchPlan
+from .rag.citations import CitedAnswer
 from .rag.service import RagService, execute_search_plan
 from .search.hybrid import HybridSearch
 from .search.results import SearchResult, merge_results
@@ -113,6 +114,15 @@ class ModernRuntime:
         self._index_recovery_thread: threading.Thread | None = None
         self._indexing_service_generation = 0
         self._lock = threading.Lock()
+        self._contextual_rag_lock = threading.Lock()
+        self._contextual_rag_services: dict[
+            str,
+            tuple[
+                str,
+                RagService,
+                Any,
+            ],
+        ] = {}
         self._unavailable_reason = unavailable_reason
         self._readiness_generation = 0
         self._model_overrides = self._load_model_overrides()
@@ -743,6 +753,115 @@ class ModernRuntime:
         finally:
             session.close()
 
+    def _get_contextual_rag_service(
+        self,
+        conversation_id: str | None,
+        *,
+        profile: ModelProfile,
+        generation_profile: ModelProfile,
+    ) -> tuple[str, RagService]:
+        checked_id = conversation_id or "default"
+        key = "\0".join(
+            (
+                str(id(self.session_factory)),
+                profile.digest,
+                profile.default_index_version or "",
+                generation_profile.model,
+                generation_profile.digest,
+            )
+        )
+        with self._contextual_rag_lock:
+            cached = self._contextual_rag_services.get(checked_id)
+            if cached is not None and cached[0] == key:
+                return checked_id, cached[1]
+            if cached is not None:
+                try:
+                    cached[2].close()
+                except Exception:
+                    pass
+
+            if self.session_factory is None:
+                raise ModernSearchUnavailable(self.unavailable_reason)
+            session = self.session_factory()
+            search = HybridSearch(
+                session,
+                model_digest=profile.digest,
+                index_version=profile.default_index_version,
+                embedding_profile=profile,
+            )
+            gateway = OllamaGateway()
+            rag = RagService(
+                search=search,
+                gateway=gateway,
+                embedding_gateway=_FreshOllamaEmbeddingGateway(),
+                model=generation_profile.model,
+                model_digest=generation_profile.digest,
+                index_version=profile.default_index_version,
+                embedding_profile=profile,
+            )
+            self._contextual_rag_services[checked_id] = (key, rag, session)
+            return checked_id, rag
+
+    def get_session_answer(self, session_id: str) -> CitedAnswer | None:
+        checked_id = session_id or "default"
+        with self._contextual_rag_lock:
+            cached = self._contextual_rag_services.get(checked_id)
+        if cached is None:
+            return None
+        return cached[1].get_session_answer(checked_id)
+
+    async def answer_contextual_question_stream_async(
+        self,
+        question: str,
+        markdown_context: str = "",
+        *,
+        conversation_id: str | None = None,
+    ) -> AsyncIterator[str]:
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("A nonempty search question is required.")
+        profile = self.embedding_profile
+        readiness = self.readiness
+        generation_profile = (
+            readiness.selected_profile("generation")
+            if readiness is not None
+            else None
+        )
+        if (
+            readiness is None
+            or not readiness.ready
+            or profile is None
+            or self.session_factory is None
+            or generation_profile is None
+        ):
+            raise ModernSearchUnavailable(self.unavailable_reason)
+
+        repository = self._indexing_repository
+        if repository is not None:
+            try:
+                repository.queue_vector_reindex(profile)
+                vector_ready = repository.vector_readiness(profile)
+            except Exception as exc:
+                raise ModernSearchUnavailable(
+                    "the committed vector index readiness could not be verified."
+                ) from exc
+            if not vector_ready.ready:
+                raise ModernSearchUnavailable(
+                    "the active embedding profile requires a full reindex "
+                    f"({vector_ready.pending_files} file(s) pending)."
+                )
+
+        checked_id, rag = self._get_contextual_rag_service(
+            conversation_id,
+            profile=profile,
+            generation_profile=generation_profile,
+        )
+        async for fragment in rag.answer_question_stream_async(
+            question,
+            markdown_context,
+            conversation_id=checked_id,
+        ):
+            yield fragment
+
     def answer_contextual_question(
         self,
         question: str,
@@ -786,31 +905,25 @@ class ModernRuntime:
                     f"({vector_ready.pending_files} file(s) pending)."
                 )
 
-        gateway = OllamaGateway()
-        session = factory()
-        try:
-            search = HybridSearch(
-                session,
-                model_digest=profile.digest,
-                index_version=profile.default_index_version,
-                embedding_profile=profile,
-            )
-            rag = RagService(
-                search=search,
-                gateway=gateway,
-                embedding_gateway=_FreshOllamaEmbeddingGateway(),
-                model=generation_profile.model,
-                model_digest=generation_profile.digest,
-                index_version=profile.default_index_version,
-                embedding_profile=profile,
-            )
-            return rag.answer_question(
+        checked_id, rag = self._get_contextual_rag_service(
+            conversation_id,
+            profile=profile,
+            generation_profile=generation_profile,
+        )
+
+        async def collect() -> CitedAnswer | None:
+            async for _fragment in rag.answer_question_stream_async(
                 question,
                 markdown_context,
-                conversation_id=conversation_id,
-            )
-        finally:
-            session.close()
+                conversation_id=checked_id,
+            ):
+                pass
+            return rag.get_session_answer(checked_id)
+
+        answer = asyncio.run(collect())
+        if answer is None:
+            raise ModernSearchUnavailable("the contextual RAG answer could not be produced.")
+        return answer
 
     def index_file_async(self, file_path: str | Path) -> None:
         canonical_path = _canonical_path(file_path)

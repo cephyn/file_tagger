@@ -88,6 +88,14 @@ class GenerationGateway(Protocol):
         schema: Mapping[str, Any] | None = None,
         keep_alive: float | str | None = "5m",
     ) -> str: ...
+    def chat_stream(
+        self,
+        model: str,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        schema: Mapping[str, Any] | None = None,
+        keep_alive: float | str | None = "5m",
+    ) -> AsyncIterator[str]: ...
 
 
 class EmbeddingGateway(Protocol):
@@ -117,6 +125,7 @@ class _SessionState:
     version: int
     evidence: tuple[SearchResult, ...]
     history: ChatHistory
+    answer: CitedAnswer | None = None
 
 
 class RagService:
@@ -165,6 +174,15 @@ class RagService:
                 for state in self._session_states.values()
                 for result in state.evidence
             )
+
+    def get_session_answer(self, session_id: str) -> CitedAnswer | None:
+        checked_session = _validate_session_identity(session_id, None)
+        with self._session_registry_lock:
+            state = self._session_states.get(checked_session)
+            if state is None:
+                return None
+            answer = state.answer
+        return answer
 
     def answer_question(
         self,
@@ -337,10 +355,171 @@ class RagService:
                 version=version + 1,
                 evidence=selected,
                 history=(*previous_history[-4:], (checked_question, answer.text)),
+                answer=answer,
             )
             with self._session_registry_lock:
                 self._session_states[checked_session] = updated
             return answer
+
+    async def answer_question_stream_async(
+        self,
+        question: str,
+        markdown_context: str | EvidenceInput = "",
+        evidence: EvidenceInput | None = None,
+        *,
+        rerank: bool = False,
+        rerank_top_k: int = DEFAULT_RERANK_TOP_K,
+        max_context_retries: int = MAX_CONTEXT_RETRIES,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        retrieval_question: str | None = None,
+    ) -> AsyncIterator[str]:
+        checked_question = _validate_question(question)
+        if not isinstance(markdown_context, str):
+            if evidence is not None:
+                raise TypeError(
+                    "Evidence cannot be supplied in both positional arguments."
+                )
+            evidence = markdown_context
+            checked_context = ""
+        else:
+            checked_context = markdown_context.strip()
+        checked_session = _validate_session_identity(session_id, conversation_id)
+        if session_id is None and conversation_id is None:
+            checked_session = (
+                "default:"
+                + sha256(
+                    f"{checked_question}\0{checked_context}".encode("utf-8")
+                ).hexdigest()
+            )
+        explicit_retrieval_question = (
+            _validate_question(retrieval_question)
+            if retrieval_question is not None
+            else None
+        )
+        supplied_evidence = (
+            _bounded_evidence(
+                _coerce_evidence(evidence),
+                limit=self.evidence_limit,
+                max_sections_per_file=self.max_sections_per_file,
+            )
+            if evidence is not None
+            else None
+        )
+
+        async with self._session_guard(checked_session):
+            with self._session_registry_lock:
+                previous_state = self._session_states.get(checked_session)
+            profile = _embedding_profile(self._search, self._embedding_profile)
+            identity = _index_identity(
+                self._search,
+                profile,
+                model_digest=self._model_digest,
+                index_version=self._index_version,
+            )
+            can_reuse_retrieval = (
+                previous_state is not None
+                and previous_state.key.markdown_context == checked_context
+                and previous_state.key.index_identity == identity
+            )
+            original_question = (
+                explicit_retrieval_question
+                or (
+                    previous_state.key.original_question
+                    if can_reuse_retrieval and previous_state is not None
+                    else checked_question
+                )
+            )
+            supplied_identity = (
+                _evidence_identity(supplied_evidence)
+                if supplied_evidence is not None
+                else None
+            )
+            evidence_identity = (
+                supplied_identity
+                if supplied_evidence is not None
+                else (
+                    previous_state.key.evidence_identity
+                    if can_reuse_retrieval and previous_state is not None
+                    else None
+                )
+            )
+            key = _SessionStateKey(
+                session_id=checked_session,
+                original_question=original_question,
+                markdown_context=checked_context,
+                index_identity=identity,
+                evidence_identity=evidence_identity,
+            )
+            reuse = previous_state is not None and previous_state.key == key
+            if reuse:
+                assert previous_state is not None
+                selected = previous_state.evidence
+                previous_history = previous_state.history
+                version = previous_state.version
+            else:
+                if supplied_evidence is not None:
+                    selected = supplied_evidence
+                else:
+                    if self._search is None:
+                        raise ValueError(
+                            "Search evidence or a HybridSearch service is required."
+                        )
+                    planned = self._planner(
+                        original_question,
+                        checked_context,
+                        gateway=self._gateway,
+                    )
+                    plan = (
+                        planned
+                        if isinstance(planned, SearchPlan)
+                        else await planned
+                    )
+                    selected = await execute_search_plan_async(
+                        plan,
+                        self._search,
+                        embedding_gateway=self._embedding_gateway,
+                        embedding_profile=profile,
+                        model_digest=self._model_digest,
+                        index_version=self._index_version,
+                        per_query_limit=self.per_query_limit,
+                        limit=self.evidence_limit,
+                        max_sections_per_file=self.max_sections_per_file,
+                    )
+                previous_history = ()
+                version = previous_state.version if previous_state is not None else 0
+
+            answer: CitedAnswer | None = None
+            async for fragment, final_answer in _generate_answer_stream_async(
+                checked_question,
+                selected,
+                model=self.model,
+                gateway=self._gateway,
+                markdown_context=checked_context,
+                rerank=rerank,
+                rerank_top_k=rerank_top_k,
+                max_context_retries=max_context_retries,
+                history=previous_history,
+            ):
+                if fragment:
+                    yield fragment
+                if final_answer is not None:
+                    answer = final_answer
+            if answer is None:
+                answer = CitedAnswer(
+                    question=checked_question,
+                    text=NOT_FOUND_ANSWER,
+                    evidence=selected,
+                )
+            updated = _SessionState(
+                key=key,
+                version=version + 1,
+                evidence=selected,
+                history=(*previous_history[-4:], (checked_question, answer.text)),
+                answer=answer,
+            )
+            with self._session_registry_lock:
+                self._session_states[checked_session] = updated
 
     @asynccontextmanager
     async def _session_guard(self, session_id: str) -> AsyncIterator[None]:
@@ -916,6 +1095,137 @@ async def answer_question_async(
     finally:
         if owns_gateway:
             await _close_gateway(selected_gateway)
+
+
+async def _generate_answer_stream_async(
+    question: str,
+    evidence: Sequence[SearchResult],
+    *,
+    model: str,
+    gateway: GenerationGateway,
+    markdown_context: str,
+    rerank: bool,
+    rerank_top_k: int,
+    max_context_retries: int,
+    history: ChatHistory = (),
+) -> AsyncIterator[tuple[str, CitedAnswer | None]]:
+    if rerank_top_k <= 0:
+        raise ValueError("The rerank top-k must be positive.")
+    if max_context_retries < 0:
+        raise ValueError("The context retry limit cannot be negative.")
+
+    selected = tuple(evidence)
+    if not selected:
+        yield "", CitedAnswer(
+            question=question,
+            text=NOT_FOUND_ANSWER,
+            evidence=(),
+        )
+        return
+
+    profile = await _generation_profile(gateway, model)
+    if rerank:
+        selected = await _rerank_evidence_async(
+            question,
+            selected[:rerank_top_k],
+            selected[rerank_top_k:],
+            model=model,
+            gateway=gateway,
+            markdown_context=markdown_context,
+            profile=profile,
+            max_context_retries=max_context_retries,
+        )
+
+    remaining = selected
+    retries = 0
+    while True:
+        bounded = _fit_evidence_to_profile(
+            question,
+            remaining,
+            history=history,
+            markdown_context=markdown_context,
+            profile=profile,
+        )
+        messages = _answer_messages(
+            question,
+            bounded,
+            history,
+            markdown_context=markdown_context,
+        )
+        chat_stream = getattr(gateway, "chat_stream", None)
+        if not callable(chat_stream):
+            response = await gateway.chat(
+                model,
+                messages=messages,
+                schema=answer_schema(),
+            )
+            yield response, parse_cited_answer(question, response, bounded)
+            return
+
+        accumulated = ""
+        emitted_answer = ""
+        mode: str | None = None
+        try:
+            async for fragment in chat_stream(
+                model,
+                messages=messages,
+                schema=answer_schema(),
+            ):
+                if not isinstance(fragment, str) or not fragment:
+                    continue
+                accumulated += fragment
+                if mode is None:
+                    stripped = accumulated.lstrip()
+                    if stripped:
+                        mode = "json" if stripped.startswith("{") else "plain"
+                if mode == "plain":
+                    yield fragment, None
+                    emitted_answer += fragment
+                    continue
+
+                match = re.search(r'"answer"\s*:\s*"', accumulated)
+                if match is None:
+                    continue
+                raw_answer = accumulated[match.end():]
+                closing = _find_unescaped_quote(raw_answer)
+                candidate = raw_answer if closing is None else raw_answer[:closing]
+                try:
+                    decoded = json.loads('"' + candidate + '"')
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(decoded, str) and decoded.startswith(emitted_answer):
+                    delta = decoded[len(emitted_answer):]
+                    if delta:
+                        emitted_answer = decoded
+                        yield delta, None
+
+            if mode == "json" or (mode is None and accumulated.lstrip().startswith("{")):
+                answer = parse_cited_answer(question, accumulated, bounded)
+            else:
+                answer = CitedAnswer(
+                    question=question,
+                    text=accumulated,
+                    evidence=bounded,
+                )
+            yield "", answer
+            return
+        except GenerationContextRejectedError:
+            if len(bounded) <= 1 or retries >= max_context_retries:
+                raise
+            remaining = bounded[: max(1, len(bounded) // 2)]
+            retries += 1
+
+
+def _find_unescaped_quote(text: str) -> int | None:
+    escaped = False
+    for index, char in enumerate(text):
+        if char == '"' and not escaped:
+            return index
+        if char == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    return None
 
 
 async def _generate_answer_async(

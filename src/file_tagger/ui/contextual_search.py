@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 import threading
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -76,34 +76,81 @@ class ContextualSearchWorker(QThread):
                     encoding="utf-8"
                 )
 
-            answer_method = getattr(self._service, "answer_contextual_question", None)
-            if callable(answer_method):
-                answer = answer_method(
-                    self.submission.question,
-                    markdown_context,
-                    conversation_id=self._session_id,
+            stream_method = getattr(
+                self._service,
+                "answer_contextual_question_stream_async",
+                None,
+            )
+            if not callable(stream_method):
+                stream_method = getattr(
+                    self._service,
+                    "answer_question_stream_async",
+                    None,
                 )
+
+            answer = None
+            if callable(stream_method):
+                async def consume_stream() -> object | None:
+                    nonlocal answer
+                    if hasattr(self._service, "answer_contextual_question_stream_async"):
+                        stream = stream_method(
+                            self.submission.question,
+                            markdown_context,
+                            conversation_id=self._session_id,
+                        )
+                    else:
+                        stream = stream_method(
+                            self.submission.question,
+                            markdown_context,
+                            session_id=self._session_id,
+                        )
+                    async for fragment in stream:
+                        if self._cancel_requested.is_set():
+                            return None
+                        if fragment:
+                            self.answer_chunk.emit(fragment)
+                            self.answer_delta.emit(fragment)
+
+                    get_answer = getattr(
+                        self._service,
+                        "get_session_answer",
+                        None,
+                    )
+                    if callable(get_answer):
+                        return cast(object, get_answer(self._session_id))
+                    return None
+
+                answer = asyncio.run(consume_stream())
             else:
-                rag_method = getattr(self._service, "answer_question", None)
-                if not callable(rag_method):
-                    raise RuntimeError("The contextual RAG service is not initialized.")
-                answer = rag_method(
-                    self.submission.question,
-                    markdown_context,
-                    session_id=self._session_id,
+                answer_method = getattr(
+                    self._service,
+                    "answer_contextual_question",
+                    None,
                 )
+                if callable(answer_method):
+                    answer = answer_method(
+                        self.submission.question,
+                        markdown_context,
+                        conversation_id=self._session_id,
+                    )
+                else:
+                    rag_method = getattr(self._service, "answer_question", None)
+                    if not callable(rag_method):
+                        raise RuntimeError("The contextual RAG service is not initialized.")
+                    answer = rag_method(
+                        self.submission.question,
+                        markdown_context,
+                        session_id=self._session_id,
+                    )
 
             if self._cancel_requested.is_set():
                 self.cancelled.emit()
                 return
 
-            text = str(getattr(answer, "text", getattr(answer, "answer", answer)))
-            for start in range(0, len(text), 24):
-                if self._cancel_requested.is_set():
-                    self.cancelled.emit()
-                    return
-                self.answer_chunk.emit(text[start : start + 24])
-                self.answer_delta.emit(text[start : start + 24])
+            if answer is None:
+                get_answer = getattr(self._service, "get_session_answer", None)
+                if callable(get_answer):
+                    answer = get_answer(self._session_id)
 
             citations = tuple(getattr(answer, "citations", ()) or ())
             evidence = tuple(getattr(answer, "evidence", ()) or ())
