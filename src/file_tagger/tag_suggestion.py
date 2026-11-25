@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
-                            QLabel, QListWidget, QMessageBox, QProgressDialog,
+                            QLabel, QListWidget, QMessageBox,
                             QListWidgetItem, QProgressBar, QWidget, QApplication,
                             QTextEdit)
 from PySide6.QtCore import Qt, QSize, Signal, QEvent
@@ -663,14 +663,9 @@ class TagSuggestionDialog(QDialog):
             
             # Get or create file record
             file_obj = self.db_session.query(File).filter_by(path=self.file_path).first()
-            is_new_file = False
             if not file_obj:
                 file_obj = File(path=self.file_path)
                 self.db_session.add(file_obj)
-                is_new_file = True
-            
-            # Track if file had tags before this operation
-            had_tags_before = len(file_obj.tags) > 0
             
             # Add existing tags
             for tag_name in selected_existing:
@@ -701,104 +696,12 @@ class TagSuggestionDialog(QDialog):
                         self.file_path,
                         [(tag.name, tag.color) for tag in file_obj.tags],
                     )
-                    parent = self.parent()
-                    if parent is not None and hasattr(parent, "_index_modern_file"):
-                        parent._index_modern_file(self.file_path)
                 except Exception:
                     pass
-              # Check if this is the first time the file has been tagged
-            # If so, add it to the vector database for search
-            if is_new_file or not had_tags_before:
-                try:
-                    print(f"Indexing newly tagged file (via AI suggestions): {self.file_path}")
-                    # Get vector search from parent window if possible
-                    from .vector_search.content_extractor import ContentExtractor
-                    from .vector_search import VectorSearch
-                    
-                    # Get vector search instance (either from parent or create new)
-                    vector_search = None
-                    if hasattr(self.parent(), 'vector_search'):
-                        vector_search = self.parent().vector_search
-                    else:
-                        vector_search = VectorSearch(self.db_session)
-                    
-                    # Create progress dialog for extraction
-                    progress = QProgressDialog("Extracting content...", "Cancel", 0, 0, self)
-                    progress.setWindowTitle("Extracting Content")
-                    progress.setWindowModality(Qt.WindowModal)
-                    progress.setMinimumDuration(0)
-                    progress.setValue(0)
-                    progress.setAutoClose(False)
-                    progress.setAutoReset(False)
-                    progress.setCancelButton(None)  # No cancel button
-                    progress.setRange(0, 0)  # Show busy indicator (spinner)
-                    progress.show()
-                    
-                    # Variable to track completion state for the accept() call
-                    self.content_extraction_complete = False
-                    
-                    # Define callbacks for the async extraction
-                    def on_progress(message):
-                        progress.setLabelText(message)
-                        QApplication.processEvents()
-                    
-                    def on_extraction_complete(result):
-                        progress.close()
-                        content = result.get('content', '')
-                        
-                        if content:
-                            try:
-                                # Add file to vector database
-                                vector_search.index_file(self.file_path, content)
-                                print(f"Added newly tagged file to vector search index: {self.file_path}")
-                            except Exception as e:
-                                import traceback
-                                print(f"Error indexing file: {str(e)}")
-                                traceback.print_exc()
-                        else:
-                            print(f"Warning: No content could be extracted from file: {self.file_path}")
-                        
-                        # Mark extraction as complete and accept the dialog
-                        self.content_extraction_complete = True
-                        self.accept()
-                      # Get the PDF extractor preference from config
-                    pdf_extractor = self.config.get_pdf_extractor()
-                    print(f"Starting async content extraction using {pdf_extractor} mode")
-                    
-                    # Start async content extraction with the chosen extractor mode
-                    ContentExtractor.extract_file_content_async(
-                        self.file_path, 
-                        on_extraction_complete, 
-                        on_progress,
-                        pdf_extractor=pdf_extractor
-                    )
-                    
-                    # Return without accepting the dialog - the callback will handle it
-                    return
-                    
-                except Exception as e:
-                    import traceback
-                    print(f"Error adding file to vector search: {str(e)}")
-                    traceback.print_exc()
-            else:
-                # If the file was already tagged before, just update the tags metadata
-                try:
-                    # Get vector search from parent window if possible
-                    vector_search = None
-                    if hasattr(self.parent(), 'vector_search'):
-                        vector_search = self.parent().vector_search
-                    else:
-                        from .vector_search import VectorSearch
-                        vector_search = VectorSearch(self.db_session)
-                    
-                    vector_search.update_metadata(self.file_path)
-                    print(f"Updated tags metadata for file in vector search: {self.file_path}")
-                except Exception as e:
-                    import traceback
-                    print(f"Error updating vector search metadata: {str(e)}")
-                    traceback.print_exc()
-                    traceback.print_exc()
-                    
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_index_modern_file"):
+                parent._index_modern_file(self.file_path)
+
             self.accept()
             
         except Exception as e:

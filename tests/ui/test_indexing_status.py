@@ -81,6 +81,50 @@ def test_indexing_runs_off_the_ui_thread_and_commits_after_success(qtbot) -> Non
     assert status.previous_revision_available is True
 
 
+def test_indexing_queues_a_second_ui_request_while_worker_is_running(qtbot) -> None:
+    release_first = Event()
+    first_started = Event()
+    resumed: list[int] = []
+
+    class Service:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def __init__(self) -> None:
+            self.next_job_id = 1
+
+        def queue(self, path: str) -> int:
+            del path
+            job_id = self.next_job_id
+            self.next_job_id += 1
+            return job_id
+
+        def state(self, job_id: int):
+            return SimpleNamespace(
+                status="running",
+                total_count=1,
+                processed_count=0,
+            )
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            del cancellation_check
+            resumed.append(job_id)
+            if job_id == 1:
+                first_started.set()
+                assert release_first.wait(2)
+            return SimpleNamespace(status="completed")
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+
+    assert status.start("C:\\library\\one.md") == 1
+    assert first_started.wait(1)
+    assert status.start("C:\\library\\two.md") is None
+
+    release_first.set()
+    qtbot.waitUntil(lambda: resumed == [1, 2])
+
+
 def test_failed_job_is_resumable_without_losing_previous_revision(qtbot) -> None:
     attempts = 0
 
@@ -273,10 +317,17 @@ def test_single_file_reindex_does_not_require_legacy_vector_search(
             )
         )
     )
-    manager.indexing_status = SimpleNamespace(start=lambda path: 9)
+    started: list[str] = []
+    manager.indexing_status = SimpleNamespace(start=started.append)
+    manager.modern_runtime = SimpleNamespace(
+        index_file=lambda path: (_ for _ in ()).throw(
+            AssertionError("the UI thread must not perform modern indexing")
+        )
+    )
     manager.vector_search = SimpleNamespace()
 
     assert manager.force_reindex_file(str(source)) is True
+    assert started == [str(source)]
 
 
 def test_indexing_menu_exposes_resume_inventory_and_safe_cleanup(qtbot) -> None:

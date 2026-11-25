@@ -108,19 +108,6 @@ class InitializationWorker(QThread):
                         inventory_error.__class__.__name__,
                     )
 
-            # Keep the compatibility search engine available during Task 25 migration.
-            logger.debug("Starting vector search initialization")
-            self.progress_signal.emit("Setting up search compatibility layer...", 58)
-            try:
-                from .vector_search import VectorSearch
-
-                vector_search = VectorSearch(db_session, config)
-                logger.debug("Vector search initialized successfully")
-            except Exception as vs_error:
-                logger.error(f"Vector search initialization failed: {str(vs_error)}")
-                logger.error(traceback.format_exc())
-                raise
-            
             # Loading existing files and tags
             logger.debug("Loading existing files and tags")
             self.progress_signal.emit("Loading files and tags...", 70)
@@ -134,7 +121,7 @@ class InitializationWorker(QThread):
             # Send the results back to the main thread
             logger.debug("Initialization completed successfully, emitting signal")
             self.finished_signal.emit(
-                (db_session, config, vector_search, modern_runtime)
+                (db_session, config, None, modern_runtime)
             )
             
         except Exception as e:

@@ -328,13 +328,14 @@ def test_manager_uses_atomic_modern_snapshot_when_supported(monkeypatch) -> None
 def test_manager_reports_unavailable_modern_index_without_affecting_legacy(
     tmp_path, monkeypatch
 ) -> None:
-    class Unavailable:
-        def index_file(self, path: str) -> None:
+    class Status:
+        def start(self, path: str) -> None:
             raise ModernIndexingUnavailable("Ollama embedding profile is not ready.")
 
     manager_class = _manager_class(monkeypatch)
     manager = manager_class.__new__(manager_class)
-    manager.modern_runtime = Unavailable()
+    manager.indexing_status = Status()
+    manager.modern_runtime = object()
     manager.logger = logging.getLogger("startup-reindex-test")
     manager.modern_index_status_text = ""
 
@@ -344,40 +345,46 @@ def test_manager_reports_unavailable_modern_index_without_affecting_legacy(
     )
 
 
-def test_manager_delegates_available_reindex_to_modern_service(
+def test_manager_delegates_available_reindex_to_threaded_ui_status(
     tmp_path, monkeypatch
 ) -> None:
-    indexed: list[str] = []
+    started: list[str] = []
 
     class Available:
         def index_file(self, path: str) -> None:
-            indexed.append(path)
+            raise AssertionError("the UI thread must not perform modern indexing")
 
     manager_class = _manager_class(monkeypatch)
     manager = manager_class.__new__(manager_class)
     manager.modern_runtime = Available()
+    manager.indexing_status = SimpleNamespace(start=started.append)
     manager.logger = logging.getLogger("startup-reindex-success-test")
     manager.modern_index_status_text = ""
     path = str(tmp_path / "file.txt")
 
     assert manager._index_modern_file(path) is True
-    assert indexed == [path]
-    assert manager.modern_index_status_text == "Modern index updated."
+    assert started == [path]
+    assert manager.modern_index_status_text == "Modern indexing started."
 
 
-def test_manager_reports_failed_modern_index_result(tmp_path, monkeypatch) -> None:
-    class Failed:
+def test_manager_never_falls_back_to_synchronous_modern_index(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class SynchronousOnly:
         def index_file(self, path: str):
-            return SimpleNamespace(status="failed")
+            calls.append(path)
+            return SimpleNamespace(status="completed")
 
     manager_class = _manager_class(monkeypatch)
     manager = manager_class.__new__(manager_class)
-    manager.modern_runtime = Failed()
+    manager.modern_runtime = SynchronousOnly()
     manager.logger = logging.getLogger("startup-reindex-failed-test")
     manager.modern_index_status_text = ""
 
     assert manager._index_modern_file(str(tmp_path / "file.txt")) is False
-    assert "ended with status failed" in manager.modern_index_status_text
+    assert calls == []
 
 
 def test_manager_queues_modern_index_work_without_calling_sync_path(
@@ -402,6 +409,116 @@ def test_manager_queues_modern_index_work_without_calling_sync_path(
     assert manager._index_modern_file(path) is True
     assert queued == [path]
     assert manager.modern_index_status_text == "Modern indexing queued."
+
+
+@pytest.mark.parametrize("had_existing_tags", [False, True])
+def test_tag_suggestion_never_uses_legacy_vector_search_for_indexing(
+    monkeypatch, had_existing_tags: bool
+) -> None:
+    from types import ModuleType
+
+    from file_tagger import tag_suggestion
+
+    class ItemList:
+        def __init__(self, selected: bool) -> None:
+            self.selected = selected
+
+        def selectedItems(self) -> list[object]:
+            return [object()] if self.selected else []
+
+        def itemWidget(self, item: object) -> SimpleNamespace:
+            del item
+            return SimpleNamespace(tag_name="research")
+
+    class FileRecord:
+        def __init__(self) -> None:
+            self.tags = (
+                [SimpleNamespace(name="existing", color="#111111")]
+                if had_existing_tags
+                else []
+            )
+
+    class Session:
+        def __init__(self) -> None:
+            self.file = FileRecord()
+            self.tag = SimpleNamespace(name="research", color="#123456")
+            self.queries = 0
+
+        def query(self, model: Any):
+            del model
+            self.queries += 1
+            selected = self.file if self.queries == 1 else self.tag
+            return SimpleNamespace(
+                filter_by=lambda **kwargs: SimpleNamespace(
+                    first=lambda: selected
+                )
+            )
+
+        def commit(self) -> None:
+            return None
+
+        def rollback(self) -> None:
+            raise AssertionError("tag application unexpectedly failed")
+
+        def add(self, value: object) -> None:
+            del value
+
+    legacy_calls: list[str] = []
+    queued: list[str] = []
+    accepted: list[bool] = []
+    runtime_syncs: list[str] = []
+
+    class LegacySearch:
+        def index_file(self, path: str, content: str) -> None:
+            del content
+            legacy_calls.append(path)
+
+        def update_metadata(self, path: str) -> None:
+            legacy_calls.append(path)
+
+    class Runtime:
+        def sync_file(self, path: str, tags: Any) -> None:
+            del tags
+            runtime_syncs.append(path)
+
+    parent = SimpleNamespace(
+        vector_search=LegacySearch(),
+        _index_modern_file=lambda path: queued.append(path),
+    )
+    session = Session()
+    dialog = SimpleNamespace(
+        existing_list=ItemList(True),
+        new_list=ItemList(False),
+        file_path="C:\\library\\guide.md",
+        db_session=session,
+        modern_runtime=Runtime(),
+        config=SimpleNamespace(),
+        parent=lambda: parent,
+        accept=lambda: accepted.append(True),
+    )
+    extractor_module = ModuleType("file_tagger.vector_search.content_extractor")
+
+    class CompatExtractor:
+        @staticmethod
+        def extract_file_content_async(
+            path, complete, progress, *, pdf_extractor
+        ) -> None:
+            del path, progress, pdf_extractor
+            complete({"content": "guide"})
+
+    extractor_module.ContentExtractor = CompatExtractor
+    monkeypatch.setitem(
+        sys.modules,
+        "file_tagger.vector_search.content_extractor",
+        extractor_module,
+    )
+
+    tag_suggestion.TagSuggestionDialog.apply_tags(dialog)
+
+    assert runtime_syncs == ["C:\\library\\guide.md"]
+    assert queued == ["C:\\library\\guide.md"]
+    assert legacy_calls == []
+    assert accepted == [True]
 
 
 def test_runtime_indexes_queued_files_through_one_worker(
@@ -983,7 +1100,9 @@ def test_initialization_worker_exposes_modern_runtime_to_login(
     from types import ModuleType
 
     vector_search_module = ModuleType("file_tagger.vector_search")
-    vector_search_module.VectorSearch = lambda session, config: object()
+    vector_search_module.VectorSearch = lambda session, config: (_ for _ in ()).throw(
+        AssertionError("startup must not construct legacy VectorSearch")
+    )
     monkeypatch.setitem(sys.modules, "file_tagger.vector_search", vector_search_module)
     from file_tagger import initialization
 
@@ -1005,4 +1124,40 @@ def test_initialization_worker_exposes_modern_runtime_to_login(
     worker.run()
 
     assert len(results) == 1
-    assert results[0] == (legacy_session, config, results[0][2], runtime)
+    assert results[0] == (legacy_session, config, None, runtime)
+
+
+def test_login_accepts_modern_runtime_without_legacy_search(
+    qtbot, monkeypatch
+) -> None:
+    from types import ModuleType
+
+    from PySide6.QtWidgets import QWidget
+
+    from file_tagger.login import LoginScreen
+
+    constructed: list[tuple[object, object, object, object]] = []
+
+    class Window(QWidget):
+        def __init__(self, *args: object) -> None:
+            super().__init__()
+            constructed.append((args[0], args[1], args[2], args[3]))
+
+    manager_module = ModuleType("file_tagger.file_tag_manager")
+    manager_module.FileTagManager = Window
+    monkeypatch.setitem(sys.modules, "file_tagger.file_tag_manager", manager_module)
+    screen = LoginScreen()
+    qtbot.addWidget(screen)
+    monkeypatch.setattr(screen, "hide", lambda: None)
+    monkeypatch.setattr(screen, "close", lambda: None)
+    modern_runtime = object()
+    legacy_session = object()
+    config = object()
+
+    screen.on_initialization_finished(
+        (legacy_session, config, None, modern_runtime)
+    )
+
+    assert constructed == [
+        (legacy_session, config, None, modern_runtime)
+    ]

@@ -2,7 +2,7 @@ import os
 import logging
 import traceback
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -191,7 +191,7 @@ class AboutDialog(QDialog):
 class FileTagManager(QMainWindow):
     """Main window for the File Tagger application."""
 
-    def __init__(self, db_session, config, vector_search, modern_runtime=None):
+    def __init__(self, db_session, config, vector_search=None, modern_runtime=None):
         # Set up logging for the main window
         self.logger = logging.getLogger("FileTagManager")
         # Add a file handler for main window-specific issues
@@ -260,6 +260,8 @@ class FileTagManager(QMainWindow):
         indexing_status = getattr(self, "indexing_status", None)
         if indexing_status is not None:
             try:
+                if callable(getattr(indexing_status, "setVisible", None)):
+                    indexing_status.setVisible(True)
                 indexing_status.start(file_path)
                 self._set_modern_index_status("Modern indexing started.")
                 return True
@@ -286,16 +288,13 @@ class FileTagManager(QMainWindow):
             return False
         try:
             queue_index = getattr(runtime, "index_file_async", None)
-            if queue_index is not None:
-                queue_index(file_path)
-                self._set_modern_index_status("Modern indexing queued.")
-                return True
-            result = runtime.index_file(file_path)
-            status = getattr(result, "status", "completed")
-            if status != "completed":
+            if not callable(queue_index):
                 raise ModernIndexingUnavailable(
-                    f"modern indexing ended with status {status}."
+                    "the modern indexing background queue is unavailable."
                 )
+            queue_index(file_path)
+            self._set_modern_index_status("Modern indexing queued.")
+            return True
         except ModernIndexingUnavailable as exc:
             self._set_modern_index_status(
                 f"Modern indexing unavailable: {exc}"
@@ -311,8 +310,6 @@ class FileTagManager(QMainWindow):
                 exc.__class__.__name__,
             )
             return False
-        self._set_modern_index_status("Modern index updated.")
-        return True
 
     def _commit_legacy_changes(
         self,
@@ -1312,7 +1309,14 @@ class FileTagManager(QMainWindow):
 
         # Perform search
         try:
-            results = self.vector_search.search(
+            vector_search = self.vector_search
+            if vector_search is None:
+                from .vector_search import VectorSearch
+
+                legacy_search = cast(Any, VectorSearch)
+                vector_search = legacy_search(self.db_session, self.config)
+                self.vector_search = vector_search
+            results = vector_search.search(
                 query,
                 tag_filter=tag_filters,
                 use_and=self.rag_and_radio.isChecked(),

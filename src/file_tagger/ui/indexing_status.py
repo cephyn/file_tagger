@@ -115,6 +115,9 @@ class IndexingStatus(QWidget):
 
     def start(self, file_path: str | Path) -> int | None:
         path = str(Path(file_path)) if not isinstance(file_path, str) else file_path
+        if self._worker is not None and self._worker.isRunning():
+            self._pending.append(path)
+            return None
         self._active_path = path
         self._active_service = self._resolved_service()
         setattr(self._active_service, "cancel_requested", False)
@@ -138,7 +141,7 @@ class IndexingStatus(QWidget):
         raise RuntimeError("Modern indexing is not available.")
 
     def start_many(self, file_paths: Iterable[str | Path]) -> None:
-        self._pending = deque(str(path) for path in file_paths)
+        self._pending.extend(str(path) for path in file_paths)
         if self._worker is not None and self._worker.isRunning():
             return
         self._start_next()

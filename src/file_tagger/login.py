@@ -244,7 +244,7 @@ class LoginScreen(QWidget):
                 db_session, config, vector_search, modern_runtime = result
             logger.debug(f"Unpacked result: db_session={db_session is not None}, config={config is not None}, vector_search={vector_search is not None}, modern_runtime={modern_runtime is not None}")
             
-            if db_session and config and vector_search:
+            if db_session and config and (modern_runtime or vector_search):
                 logger.debug("Initialization succeeded, preparing to show main window")
                 try:
                     # Hide the login window
