@@ -38,9 +38,9 @@ Last updated: 2026-11-24
 | 19: typed Ollama tag decisions | Complete | `eae8b89`, `862df67`, `50e588c`, `3ab3ebe`, `3b7dc81` |
 | 20: cached typed tag recommendations | Complete | `b1bd9bc`, `1b3e677`, `d2e1681`, `3b7dc81`, `10a9fd5`, `d44bbdd`, `7ae3dd2`, `cd5ede3`, `6817c13`, `fa87cea` |
 | 21: Markdown-context search planning | Complete | `43f17f4`, `37c8aaf`, `89fba5a`, `321f312`, `3b7dc81` |
-| 22: citation-validated RAG answers | Complete | `e67bb06`, `484f5c1`, `621a118`, `da9c1d9` |
+| 22: citation-validated RAG answers | Complete | `e67bb06`, `484f5c1`, `621a118`, `da9c1d9`, `4015089`, `210e038`, `89a84ae`, `072830b`, `bf92703`, `1f23a19`, `f761fb4`, `ae330c3` |
 | 23: Ollama readiness settings UI | Complete | `bccb13a`, `b71d123`, `52f67f8`, `04826c9`, `ec35f5e` |
-| 24: resumable indexing UI | Complete | `5298446`, `8d35480`, `70c3709`, `0d173d1`, `1907872`, `9faa796`, `7e5edc3` |
+| 24: resumable indexing UI | Complete | `5298446`, `8d35480`, `70c3709`, `0d173d1`, `1907872`, `9faa796`, `7e5edc3`, `4015089`, `210e038` |
 | 25-29 | Not started | — |
 
 Completed work is marked below with `Status: Complete`. Any task without that
