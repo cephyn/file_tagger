@@ -1225,7 +1225,7 @@ def test_runtime_readiness_completion_ignores_stale_overlapping_result(
     )
     monkeypatch.setattr(
         "file_tagger.modern_context.IndexingService",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: SimpleNamespace(recover_abandoned=lambda: ()),
     )
 
     async def check_readiness(gateway, required):
@@ -1271,6 +1271,90 @@ def test_runtime_readiness_completion_ignores_stale_overlapping_result(
     assert runtime.readiness.warnings == ("result-1",)
     assert callbacks[-1] is None
     assert any(report and report.warnings == ("result-1",) for report in callbacks)
+
+
+def test_overlapping_readiness_only_recovers_published_service(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, object())  # type: ignore[arg-type]
+    started = (Event(), Event())
+    release = (Event(), Event())
+    call_count = 0
+    recovered_digests: list[str] = []
+
+    hardware = HardwareReport(
+        cpu_architecture="AMD64",
+        logical_processors=8,
+        total_ram_bytes=32 * 1024**3,
+        available_ram_bytes=24 * 1024**3,
+        available_disk_bytes=100 * 1024**3,
+    )
+    monkeypatch.setattr(
+        "file_tagger.modern_context.profile_hardware",
+        lambda: hardware,
+    )
+
+    class FakeIndexingService:
+        def __init__(
+            self,
+            *args,
+            embedding_profile,
+            recover_on_startup=True,
+            **kwargs,
+        ) -> None:
+            self.embedding_profile = embedding_profile
+            if recover_on_startup:
+                self.recover_abandoned()
+
+        def recover_abandoned(self) -> tuple[()]:
+            recovered_digests.append(self.embedding_profile.digest)
+            return ()
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.IndexingService",
+        FakeIndexingService,
+    )
+
+    async def check_readiness(gateway, required):
+        nonlocal call_count
+        call_index = call_count
+        call_count += 1
+        started[call_index].set()
+        release[call_index].wait()
+        return ReadinessReport(
+            ready=True,
+            profiles=(
+                ModelProfile(
+                    role="embedding",
+                    model=required.embedding,
+                    digest=f"embedding-{call_index}",
+                    context_length=8192,
+                    dimensions=768,
+                    capabilities=("embedding",),
+                ),
+            ),
+            ollama=OllamaReadiness(
+                available=True,
+                version="0.35.0",
+                base_url="http://127.0.0.1:11434",
+            ),
+            selected_models=required,
+        )
+
+    monkeypatch.setattr(runtime, "_check_readiness", check_readiness)
+
+    first = runtime.start_readiness()
+    assert started[0].wait(2)
+    second = runtime.start_readiness()
+    assert started[1].wait(2)
+
+    release[1].set()
+    assert second.result(timeout=2) is runtime.readiness
+    release[0].set()
+    assert first.result(timeout=2) is None
+
+    assert recovered_digests == ["embedding-1"]
 
 
 def test_initialization_worker_exposes_modern_runtime_to_login(

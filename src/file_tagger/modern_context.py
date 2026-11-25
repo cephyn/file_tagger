@@ -301,6 +301,7 @@ class ModernRuntime:
                     DoclingAdapter(),
                     embedding_gateway=embedding_gateway,
                     embedding_profile=embedding_profile,
+                    recover_on_startup=False,
                 )
             with self._lock:
                 if generation == self._readiness_generation:
@@ -309,6 +310,8 @@ class ModernRuntime:
                     self._indexing_service = indexing_service
                     self._embedding_gateway = embedding_gateway
                     self._unavailable_reason = None
+                    if indexing_service is not None:
+                        indexing_service.recover_abandoned()
                 else:
                     report = None
             logger.info(
