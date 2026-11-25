@@ -25,7 +25,9 @@ MAX_QUERY_TERMS = 64
 class SearchFilters:
     tags: tuple[str, ...] = ()
     path: str | None = None
+    paths: tuple[str, ...] = ()
     file_types: tuple[str, ...] = ()
+    excluded_file_types: tuple[str, ...] = ()
 
 
 def normalize_fts_query(query: str) -> str:
@@ -148,6 +150,7 @@ class HybridSearch:
         path: str | None = None,
         file_type: str | None = None,
         file_types: Sequence[str] = (),
+        excluded_file_types: Sequence[str] = (),
         filters: SearchFilters | None = None,
         limit: int = 10,
         model_digest: str | None = None,
@@ -166,6 +169,7 @@ class HybridSearch:
             path=path,
             file_type=file_type,
             file_types=file_types,
+            excluded_file_types=excluded_file_types,
         )
         lexical_query = normalize_fts_query(query)
         if not lexical_query:
@@ -340,6 +344,7 @@ class HybridSearch:
                     c.heading,
                     c.section,
                     c.text,
+                    f.mime_type,
                     COALESCE(
                         (
                             SELECT json_group_array(ordered.name)
@@ -403,6 +408,7 @@ def hybrid_search(
     path: str | None = None,
     file_type: str | None = None,
     file_types: Sequence[str] = (),
+    excluded_file_types: Sequence[str] = (),
     filters: SearchFilters | None = None,
     limit: int = 10,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
@@ -427,6 +433,7 @@ def hybrid_search(
         path=path,
         file_type=file_type,
         file_types=file_types,
+        excluded_file_types=excluded_file_types,
         filters=filters,
         limit=limit,
     )
@@ -439,19 +446,42 @@ def _merge_filters(
     path: str | None,
     file_type: str | None,
     file_types: Sequence[str],
+    excluded_file_types: Sequence[str],
 ) -> SearchFilters:
     selected_tags = tuple(filters.tags if filters is not None else ())
     selected_types = tuple(filters.file_types if filters is not None else ())
-    selected_path = filters.path if filters is not None else None
+    selected_excluded_types = tuple(
+        filters.excluded_file_types if filters is not None else ()
+    )
+    selected_paths = tuple(filters.paths if filters is not None else ())
+    if filters is not None and filters.path is not None:
+        selected_paths = (*selected_paths, filters.path)
+    if path is not None:
+        selected_paths = (*selected_paths, path)
+    merged_paths = tuple(
+        dict.fromkeys(item.strip() for item in selected_paths if item.strip())
+    )
     merged_types = (*selected_types, *(file_types or ()))
     if file_type:
         merged_types = (*merged_types, file_type)
+    merged_excluded_types = (
+        *selected_excluded_types,
+        *(excluded_file_types or ()),
+    )
     merged_tags = (*selected_tags, *(tags or ()))
     return SearchFilters(
         tags=tuple(dict.fromkeys(tag.strip() for tag in merged_tags if tag.strip())),
-        path=path if path is not None else selected_path,
+        path=merged_paths[0] if len(merged_paths) == 1 else None,
+        paths=merged_paths if len(merged_paths) > 1 else (),
         file_types=tuple(
             dict.fromkeys(item.strip() for item in merged_types if item.strip())
+        ),
+        excluded_file_types=tuple(
+            dict.fromkeys(
+                item.strip()
+                for item in merged_excluded_types
+                if item.strip()
+            )
         ),
     )
 
@@ -499,35 +529,66 @@ def _filter_sql(
         )
         parameters[name] = tag
 
-    if filters.path is not None and filters.path.strip():
-        normalized_path = normalize_unicode_key(filters.path.strip())
+    selected_paths = tuple(filters.paths)
+    if filters.path is not None:
+        selected_paths = (*selected_paths, filters.path)
+    path_clauses: list[str] = []
+    for index, selected_path in enumerate(
+        dict.fromkeys(item for item in selected_paths if item.strip())
+    ):
+        normalized_path = normalize_unicode_key(selected_path.strip())
         assert normalized_path is not None
-        clauses.append(
+        name = f"path_filter_{index}"
+        path_clauses.append(
             "unicode_normalize(f.canonical_path) "
-            "LIKE unicode_normalize(:path_filter) ESCAPE '\\'"
+            f"LIKE unicode_normalize(:{name}) ESCAPE '\\'"
         )
-        parameters["path_filter"] = f"%{_escape_like(normalized_path)}%"
+        parameters[name] = f"%{_escape_like(normalized_path)}%"
+    if path_clauses:
+        clauses.append(f"({' OR '.join(path_clauses)})")
 
-    type_clauses: list[str] = []
-    for index, file_type in enumerate(filters.file_types):
+    type_clauses = _file_type_clauses(
+        filters.file_types,
+        name_prefix="file_type",
+        parameters=parameters,
+    )
+    if type_clauses:
+        clauses.append(f"({' OR '.join(type_clauses)})")
+    excluded_type_clauses = _file_type_clauses(
+        filters.excluded_file_types,
+        name_prefix="excluded_file_type",
+        parameters=parameters,
+    )
+    if excluded_type_clauses:
+        clauses.append(f"NOT ({' OR '.join(excluded_type_clauses)})")
+    return " AND ".join(clauses), parameters
+
+
+def _file_type_clauses(
+    file_types: Sequence[str],
+    *,
+    name_prefix: str,
+    parameters: dict[str, object],
+) -> list[str]:
+    clauses: list[str] = []
+    for index, file_type in enumerate(file_types):
         normalized = normalize_unicode_key(file_type.strip())
         assert normalized is not None
-        name = f"file_type_{index}"
+        name = f"{name_prefix}_{index}"
         if "/" in normalized:
-            type_clauses.append(
-                f"unicode_normalize(f.mime_type) = unicode_normalize(:{name})"
+            clauses.append(
+                "(f.mime_type IS NOT NULL AND "
+                f"unicode_normalize(f.mime_type) = unicode_normalize(:{name}))"
             )
             parameters[name] = normalized
         else:
             extension = normalized.removeprefix(".")
-            type_clauses.append(
-                f"unicode_normalize(f.canonical_path) "
+            clauses.append(
+                "unicode_normalize(f.canonical_path) "
                 f"LIKE unicode_normalize(:{name}) ESCAPE '\\'"
             )
             parameters[name] = f"%.{_escape_like(extension)}"
-    if type_clauses:
-        clauses.append(f"({' OR '.join(type_clauses)})")
-    return " AND ".join(clauses), parameters
+    return clauses
 
 
 def _escape_like(value: str) -> str:

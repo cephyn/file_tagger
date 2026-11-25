@@ -205,6 +205,7 @@ def test_hybrid_search_hydrates_one_cited_result_per_file(
         assert len(results) == 1
         result = results[0]
         assert result.file_path.endswith("adventure.pdf")
+        assert result.mime_type == "application/pdf"
         assert result.stale
         assert result.tags == ("fiction", "travel")
         headings = [section.heading for section in result.matched_sections]

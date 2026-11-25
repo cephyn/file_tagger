@@ -615,6 +615,7 @@ def _plan_search_options(
     tags: list[str] = []
     paths: list[str] = []
     file_types: list[str] = []
+    excluded_file_types: list[str] = []
     retrieval_constraints: list[str] = []
     for constraint in (*plan.filters, *plan.normalized_constraints):
         key, value = _typed_constraint(constraint)
@@ -635,16 +636,35 @@ def _plan_search_options(
             file_types.extend(_constraint_values(value))
         else:
             retrieval_constraints.append(constraint)
-    if len(set(path.casefold() for path in paths)) > 1:
-        retrieval_constraints.extend(f"path: {path}" for path in paths)
-        paths = []
+    for exclusion in plan.exclusions:
+        key, value = _typed_constraint(exclusion)
+        if key in {
+            "filetype",
+            "filetypes",
+            "extension",
+            "extensions",
+            "ext",
+            "mime",
+            "mimetype",
+            "type",
+        }:
+            excluded_file_types.extend(_constraint_values(value))
+    unique_paths = tuple(
+        {
+            path.casefold(): path
+            for path in paths
+            if path.strip()
+        }.values()
+    )
     selected = (
         SearchFilters(
             tags=tuple(dict.fromkeys(tags)),
-            path=paths[0] if paths else None,
+            path=unique_paths[0] if len(unique_paths) == 1 else None,
+            paths=unique_paths if len(unique_paths) > 1 else (),
             file_types=tuple(dict.fromkeys(file_types)),
+            excluded_file_types=tuple(dict.fromkeys(excluded_file_types)),
         )
-        if tags or paths or file_types
+        if tags or unique_paths or file_types or excluded_file_types
         else None
     )
     return selected, tuple(retrieval_constraints)
@@ -703,8 +723,23 @@ def _result_is_excluded(
         }:
             normalized_path = _normalize_path(result.file_path)
             for file_type in _constraint_values(value):
-                extension = file_type.strip().casefold().removeprefix(".")
-                if "/" not in extension and normalized_path.endswith(f".{extension}"):
+                normalized_type = unicodedata.normalize(
+                    "NFKC",
+                    file_type,
+                ).strip().casefold()
+                if "/" in normalized_type:
+                    if (
+                        result.mime_type is not None
+                        and unicodedata.normalize(
+                            "NFKC",
+                            result.mime_type,
+                        ).strip().casefold()
+                        == normalized_type
+                    ):
+                        return True
+                elif normalized_path.endswith(
+                    f".{normalized_type.removeprefix('.')}"
+                ):
                     return True
         elif _normalize_match(value) in _normalize_match(text):
             return True
@@ -1073,6 +1108,7 @@ def _expand_evidence(
                         "section": section.section,
                         "text": section.snippet,
                         "tags": result.tags,
+                        "mime_type": result.mime_type,
                     },
                     source=result.source,
                     rank=result.rank,

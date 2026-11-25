@@ -38,6 +38,7 @@ Citation = SearchCitation
 
 class SearchResult(SearchCandidate):
     tags: tuple[str, ...] = ()
+    mime_type: str | None = None
     summary: str = Field(min_length=1)
     matched_sections: tuple[MatchedSection, ...] = Field(min_length=1)
     citations: tuple[SearchCitation, ...] = Field(min_length=1)
@@ -70,6 +71,7 @@ def make_result(
     path = _required_path(inputs[0])
     sections: list[MatchedSection] = []
     tags: set[str] = set()
+    mime_types: set[str] = set()
     stale = False
     seen_chunks: set[str] = set()
     for item in inputs:
@@ -77,6 +79,9 @@ def make_result(
         if item_path != path:
             continue
         tags.update(_tags(item))
+        mime_type = _mime_type(item)
+        if mime_type is not None:
+            mime_types.add(mime_type)
         stale = stale or _is_stale(item)
         chunk_id = _required_text(item, "stable_id", "chunk_id")
         if chunk_id in seen_chunks:
@@ -100,6 +105,7 @@ def make_result(
     return _result_from_sections(
         path=path,
         tags=tags,
+        mime_type=next(iter(sorted(mime_types)), None),
         sections=sections,
         stale=stale,
         source=source,
@@ -129,10 +135,13 @@ def merge_results(
     for path, file_results in grouped.items():
         sections: list[MatchedSection] = []
         tags: set[str] = set()
+        mime_types: set[str] = set()
         seen_chunks: set[str] = set()
         sources: set[SearchSource] = set()
         for result in file_results:
             tags.update(result.tags)
+            if result.mime_type is not None:
+                mime_types.add(result.mime_type)
             sources.add(result.source)
             for section in result.matched_sections:
                 if section.chunk_id in seen_chunks:
@@ -145,6 +154,7 @@ def merge_results(
             _result_from_sections(
                 path=path,
                 tags=tags,
+                mime_type=next(iter(sorted(mime_types, key=str.casefold)), None),
                 sections=sections,
                 stale=any(item.stale for item in file_results),
                 source=source,
@@ -179,6 +189,7 @@ def _result_from_sections(
     *,
     path: str,
     tags: set[str],
+    mime_type: str | None,
     sections: list[MatchedSection],
     stale: bool,
     source: SearchSource,
@@ -208,6 +219,7 @@ def _result_from_sections(
         rank=rank,
         score=score,
         tags=tuple(sorted(tags, key=lambda tag: (tag.casefold(), tag))),
+        mime_type=mime_type,
         summary=primary.snippet,
         matched_sections=tuple(sections),
         citations=citations,
@@ -303,6 +315,18 @@ def _is_stale(item: object) -> bool:
     return state is not None and str(state) != "indexed"
 
 
+def _mime_type(item: object) -> str | None:
+    value = _first_value(item, "mime_type")
+    if value is None:
+        page = _first_value(item, "page")
+        document = _first_value(page, "document") if page is not None else None
+        file = _first_value(document, "file") if document is not None else None
+        value = _first_value(file, "mime_type")
+    if value is None or not str(value).strip():
+        return None
+    return str(value)
+
+
 def _first_value(item: object | None, *names: str) -> object | None:
     if item is None:
         return None
@@ -329,6 +353,7 @@ def _result_order_key(
     str,
     str,
     tuple[str, ...],
+    tuple[bool, str],
     bool,
     tuple[tuple[str, int, tuple[bool, str], tuple[bool, str], str], ...],
 ]:
@@ -343,6 +368,7 @@ def _result_order_key(
         result.source,
         result.summary,
         result.tags,
+        _optional_order_key(result.mime_type),
         result.stale,
         tuple(_section_order_key(section) for section in result.matched_sections),
     )

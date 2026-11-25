@@ -493,6 +493,87 @@ def test_search_plan_constraints_filter_corpus_and_exclude_terms(
     assert [candidate.chunk_id for candidate in result] == ["plan-wanted"]
 
 
+def test_search_plan_enforces_every_allowed_path(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "reports" / "first"
+    second = tmp_path / "reports" / "second"
+    outside = tmp_path / "private"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    outside.mkdir()
+    for path, stable_id in (
+        (first / "first.md", "first-allowed"),
+        (second / "second.md", "second-allowed"),
+        (outside / "private.md", "outside"),
+    ):
+        _seed_chunk(
+            search_session,
+            path=path,
+            stable_id=stable_id,
+            text_value="Atlas annual report",
+            vector=_vector(1.0, 0.0),
+        )
+    search_session.commit()
+    plan = SearchPlan(
+        question="Find all allowed reports",
+        intent_names=("reports",),
+        exact_terms=("Atlas",),
+        paraphrase_queries=("annual report",),
+        filters=(f"path: {first}", f"path: {second}"),
+        evidence_categories=("reports",),
+    )
+
+    result = execute_search_plan(plan, HybridSearch(search_session), limit=20)
+
+    assert {candidate.chunk_id for candidate in result} == {
+        "first-allowed",
+        "second-allowed",
+    }
+
+
+def test_search_plan_applies_mime_exclusions_during_search(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "public.pdf",
+        stable_id="excluded-pdf",
+        text_value="Atlas annual report",
+        vector=_vector(1.0, 0.0),
+        mime_type="application/pdf",
+    )
+    _seed_chunk(
+        search_session,
+        path=tmp_path / "public.md",
+        stable_id="included-markdown",
+        text_value="Atlas annual report",
+        vector=_vector(1.0, 0.0),
+        mime_type="text/markdown",
+    )
+    search_session.commit()
+    plan = SearchPlan(
+        question="Find non-PDF reports",
+        intent_names=("reports",),
+        exact_terms=("Atlas",),
+        paraphrase_queries=("annual report",),
+        exclusions=("mime: application/pdf",),
+        evidence_categories=("reports",),
+    )
+
+    result = execute_search_plan(
+        plan,
+        HybridSearch(search_session, candidate_limit=1),
+        per_query_limit=20,
+        limit=20,
+    )
+
+    assert [candidate.chunk_id for candidate in result] == ["included-markdown"]
+    assert result[0].mime_type == "text/markdown"
+
+
 @pytest.mark.parametrize("file_type", ["strasse", "APPLICATION/STRASSE"])
 @pytest.mark.parametrize(
     ("query", "embedding"),

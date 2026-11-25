@@ -1092,7 +1092,7 @@ git commit -m "feat: plan searches from Markdown context"
 **Files:**
 - Create: `src/file_tagger/rag/service.py`
 - Create: `src/file_tagger/rag/citations.py`
-- Test: `tests/rag/test_service.py`
+- Test: `tests/rag/test_rag_service.py`
 
 **Step 1: Write the failing citation-validation test**
 
@@ -1107,7 +1107,7 @@ def test_answer_without_valid_citation_is_rejected(fake_model, evidence) -> None
 
 **Step 2: Run the test to verify it fails**
 
-Run: `pytest tests/rag/test_service.py -v`
+Run: `pytest tests/rag/test_rag_service.py -v`
 Expected: FAIL because citation-aware RAG is absent.
 
 **Step 3: Implement bounded RAG**
@@ -1119,7 +1119,7 @@ Use "not found in indexed files" when evidence is insufficient.
 
 **Step 4: Run RAG quality and failure tests**
 
-Run: `pytest tests/rag/test_service.py -v`
+Run: `pytest tests/rag/test_rag_service.py -v`
 Expected: citation IDs resolve, follow-up chat reuses evidence, unsupported
 claims fail, and model context overflow triggers further evidence reduction.
 

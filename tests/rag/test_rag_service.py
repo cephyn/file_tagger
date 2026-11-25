@@ -352,6 +352,49 @@ def test_structured_claim_cannot_reverse_relationships_from_evidence(
         answer_question("Who was hired?", evidence, gateway=fake_model)
 
 
+@pytest.mark.parametrize(
+    ("claim", "quote"),
+    [
+        ("Bob was hired by Alice.", "Bob hired Alice."),
+        ("Bob hired Alice.", "Bob was hired by Alice."),
+    ],
+)
+def test_structured_claim_cannot_reverse_passive_roles(
+    claim: str,
+    quote: str,
+) -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\appointment.md",
+                "stable_id": "passive-appointment",
+                "page_number": 1,
+                "text": quote,
+            },
+            source="hybrid",
+            rank=1,
+            score=0.9,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["passive-appointment"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("Who hired whom?", evidence, gateway=fake_model)
+
+
 def test_structured_claim_cannot_replace_evidence_with_an_arbitrary_paraphrase() -> None:
     evidence = (
         make_result(
@@ -677,6 +720,58 @@ def test_search_plan_applies_typed_filters_and_postfilters_exclusions() -> None:
         path="reports",
         file_types=("pdf",),
     )
+
+
+def test_search_plan_keeps_multiple_allowed_paths_as_filters() -> None:
+    result = _result("shared", r"C:\reports\wanted.md", 1, 0.9)
+    search_calls: list[tuple[str, object | None]] = []
+
+    class MultiPathRecordingSearch(FakeSearch):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "atlas": (result,),
+                    "annual report": (result,),
+                }
+            )
+
+        def search(
+            self,
+            query: str,
+            query_embedding: Sequence[float] | None = None,
+            *,
+            limit: int = 10,
+            filters: object | None = None,
+            model_digest: str | None = None,
+            index_version: str | None = None,
+        ) -> tuple[SearchResult, ...]:
+            del query_embedding, model_digest, index_version
+            search_calls.append((query, filters))
+            return super().search(query, limit=limit)
+
+    search = MultiPathRecordingSearch()
+    plan = SearchPlan(
+        question="Find reports in both locations",
+        intent_names=("reports",),
+        exact_terms=("atlas",),
+        paraphrase_queries=("annual report",),
+        filters=("path: reports/one", "path: reports/two"),
+        evidence_categories=("reports",),
+    )
+
+    evidence = execute_search_plan(plan, search)
+
+    assert [candidate.chunk_id for candidate in evidence] == ["shared"]
+    assert search_calls == [
+        (
+            "atlas",
+            SearchFilters(paths=("reports/one", "reports/two")),
+        ),
+        (
+            "annual report",
+            SearchFilters(paths=("reports/one", "reports/two")),
+        ),
+    ]
 
 
 def test_optional_rerank_uses_bounded_structured_chat() -> None:
