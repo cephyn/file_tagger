@@ -130,6 +130,7 @@ class ModernRuntime:
         ] = OrderedDict()
         self._contextual_rag_epochs: dict[str, int] = {}
         self._contextual_rag_active: dict[str, int] = {}
+        self._contextual_rag_closed: set[str] = set()
         self._retired_contextual_rag: dict[
             str,
             list[tuple[int, RagService, Any]],
@@ -792,6 +793,10 @@ class ModernRuntime:
                 raise ModernSearchUnavailable(
                     "the contextual RAG session was retired."
                 )
+            if checked_id in self._contextual_rag_closed:
+                raise ModernSearchUnavailable(
+                    "the contextual RAG session was retired."
+                )
             cached = self._contextual_rag_services.get(checked_id)
             if cached is not None and cached[0] == key:
                 self._contextual_rag_services.move_to_end(checked_id)
@@ -804,25 +809,41 @@ class ModernRuntime:
                     self._contextual_rag_epochs.get(checked_id, 0) + 1
                 )
 
-            if self.session_factory is None:
-                raise ModernSearchUnavailable(self.unavailable_reason)
-            session = self.session_factory()
-            search = HybridSearch(
-                session,
-                model_digest=profile.digest,
-                index_version=profile.default_index_version,
-                embedding_profile=profile,
-            )
-            gateway = OllamaGateway()
-            rag = RagService(
-                search=search,
-                gateway=gateway,
-                embedding_gateway=_FreshOllamaEmbeddingGateway(),
-                model=generation_profile.model,
-                model_digest=generation_profile.digest,
-                index_version=profile.default_index_version,
-                embedding_profile=profile,
-            )
+        if self.session_factory is None:
+            raise ModernSearchUnavailable(self.unavailable_reason)
+        session = self.session_factory()
+        search = HybridSearch(
+            session,
+            model_digest=profile.digest,
+            index_version=profile.default_index_version,
+            embedding_profile=profile,
+        )
+        gateway = OllamaGateway()
+        rag = RagService(
+            search=search,
+            gateway=gateway,
+            embedding_gateway=_FreshOllamaEmbeddingGateway(),
+            model=generation_profile.model,
+            model_digest=generation_profile.digest,
+            index_version=profile.default_index_version,
+            embedding_profile=profile,
+        )
+
+        with self._contextual_rag_condition:
+            if checked_id in self._contextual_rag_closed:
+                close_rag = getattr(rag, "close_session", None)
+                if callable(close_rag):
+                    try:
+                        close_rag(checked_id)
+                    except Exception:
+                        pass
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                raise ModernSearchUnavailable(
+                    "the contextual RAG session was retired."
+                )
             self._contextual_rag_services[checked_id] = (key, rag, session)
             self._contextual_rag_services.move_to_end(checked_id)
             while len(self._contextual_rag_services) > self._contextual_rag_cache_limit:
@@ -867,6 +888,10 @@ class ModernRuntime:
     ) -> tuple[str, RagService, int]:
         checked_id = conversation_id or "default"
         with self._contextual_rag_condition:
+            if checked_id in self._contextual_rag_closed:
+                raise ModernSearchUnavailable(
+                    "the contextual RAG session was retired."
+                )
             self._contextual_rag_active[checked_id] = (
                 self._contextual_rag_active.get(checked_id, 0) + 1
             )
@@ -893,7 +918,7 @@ class ModernRuntime:
             raise
         with self._contextual_rag_condition:
             current_epoch = self._contextual_rag_epochs.get(checked_id, 0)
-            if current_epoch != epoch:
+            if checked_id in self._contextual_rag_closed:
                 active = self._contextual_rag_active.get(checked_id, 0)
                 if active <= 1:
                     self._contextual_rag_active.pop(checked_id, None)
@@ -953,11 +978,12 @@ class ModernRuntime:
         checked_id = session_id or "default"
         retired: tuple[int, RagService, Any] | None = None
         with self._contextual_rag_condition:
+            old_epoch = self._contextual_rag_epochs.get(checked_id, 0)
+            self._contextual_rag_epochs[checked_id] = old_epoch + 1
+            self._contextual_rag_closed.add(checked_id)
             cached = self._contextual_rag_services.pop(checked_id, None)
             if cached is not None:
-                old_epoch = self._contextual_rag_epochs.get(checked_id, 0)
                 retired = (old_epoch, cached[1], cached[2])
-                self._contextual_rag_epochs[checked_id] = old_epoch + 1
                 self._retired_contextual_rag.setdefault(
                     checked_id,
                     [],

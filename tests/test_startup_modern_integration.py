@@ -1254,6 +1254,83 @@ def test_modern_runtime_timeout_retires_bundle_until_last_worker_ends(
     assert conversation_id not in runtime._retired_contextual_rag
 
 
+def test_modern_runtime_close_before_cache_insert_retires_future_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import threading
+
+    created = []
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+
+    class FakeSession:
+        def close(self) -> None:
+            created.append("closed")
+
+    class FakeFactory:
+        def __call__(self):
+            created.append("factory")
+            factory_entered.set()
+            assert release_factory.wait(1)
+            return FakeSession()
+
+    class FakeSearch:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeRag:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    monkeypatch.setattr("file_tagger.modern_context.HybridSearch", FakeSearch)
+    monkeypatch.setattr("file_tagger.modern_context.RagService", FakeRag)
+
+    runtime = ModernRuntime(_paths(tmp_path, monkeypatch), FakeFactory())
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-active",
+        digest="sha256:embedding",
+        context_length=4096,
+        capabilities=("embedding",),
+    )
+    generation = ModelProfile(
+        role="generation",
+        model="generation-active",
+        digest="sha256:generation",
+        context_length=4096,
+        capabilities=("completion",),
+    )
+
+    outcome = []
+
+    def begin():
+        try:
+            runtime._begin_contextual_rag_use(
+                "conversation-before-cache",
+                profile=profile,
+                generation_profile=generation,
+            )
+        except Exception as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=begin)
+    worker.start()
+    assert factory_entered.wait(1)
+
+    runtime.close_contextual_session("conversation-before-cache")
+    assert runtime._contextual_rag_epochs["conversation-before-cache"] == 1
+    release_factory.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], ModernSearchUnavailable)
+    assert "retired" in str(outcome[0])
+    assert created == ["factory", "closed"]
+    assert "conversation-before-cache" not in runtime._contextual_rag_services
+
+
 def test_modern_runtime_active_stream_blocks_eviction_and_close(
     tmp_path,
     monkeypatch,
