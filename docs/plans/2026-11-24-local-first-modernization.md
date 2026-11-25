@@ -45,7 +45,7 @@ Last updated: 2026-11-24
 | 26: remove cloud and legacy runtime stacks | Complete | `f994df67`, `e137eb0`, `89d9e54`, `d23a07a` |
 | 27: golden migration/retrieval acceptance | Complete | `eb2e9fd`, `76f6713` |
 | 28: Windows packaging and per-user migration | Complete | `f5b4d76`, `637d926`, `2a2d0fd`, `35f4f27`, `0359291` |
-| 29 | Not started | — |
+| 29: opt-in real Ollama quality suite | Complete | `41a3fb3`, `839df2f`, `c7ff483` |
 
 Completed work is marked below with `Status: Complete`. Any task without that
 marker remains unimplemented unless this table is updated.
@@ -1457,6 +1457,8 @@ git commit -m "build: package local-first File Tagger"
 ```
 
 ### Task 29: Run the Opt-In Real Ollama Quality Suite
+
+**Status: Complete**
 
 **Files:**
 - Create: `tests/integration_ollama/conftest.py`
