@@ -2,12 +2,13 @@ import time
 import logging
 import traceback
 import os
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QProgressBar
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QPixmap
 from .models import init_db
 from .config import Config
 from .infrastructure.app_paths import AppPaths
+from .modern_context import initialize_modern_runtime
 
 # Set ONNX environment variable here too for the worker thread
 os.environ["CHROMADB_DISABLE_ONNX"] = "1"
@@ -29,7 +30,7 @@ logger = logging.getLogger("Initialization")
 logger.debug("Attempting to import potentially problematic modules...")
 try:
     logger.debug("Importing sentence_transformers...")
-    import sentence_transformers
+    import sentence_transformers  # noqa: F401
     logger.debug("Successfully imported sentence_transformers")
 except Exception as e:
     logger.error(f"Error importing sentence_transformers: {str(e)}")
@@ -37,7 +38,7 @@ except Exception as e:
 
 try:
     logger.debug("Importing onnxruntime...")
-    import onnxruntime
+    import onnxruntime  # noqa: F401
     logger.debug("Successfully imported onnxruntime")
 except Exception as e:
     logger.error(f"Error importing onnxruntime: {str(e)}")
@@ -62,7 +63,7 @@ class InitializationWorker(QThread):
             logger.debug("Database initialized successfully")
             
             # Initialize config
-            logger.debug(f"Starting config initialization with password (length: {len(self.password)})")
+            logger.debug("Starting config initialization")
             self.progress_signal.emit("Loading configuration...", 30)
             try:
                 config = Config(self.password)
@@ -71,6 +72,16 @@ class InitializationWorker(QThread):
                 logger.error(f"Config initialization failed: {str(config_error)}")
                 logger.error(traceback.format_exc())
                 raise
+
+            # Bring the modern local-first sidecar up without blocking on Ollama.
+            logger.debug("Starting modern sidecar initialization")
+            self.progress_signal.emit("Preparing local indexing database...", 45)
+            modern_runtime = initialize_modern_runtime(
+                config.paths,
+                config,
+                self.password,
+            )
+            logger.debug("Modern sidecar initialization completed")
             
             # Initialize vector search
             logger.debug("Starting vector search initialization")
@@ -97,13 +108,15 @@ class InitializationWorker(QThread):
             
             # Send the results back to the main thread
             logger.debug("Initialization completed successfully, emitting signal")
-            self.finished_signal.emit((db_session, config, vector_search))
+            self.finished_signal.emit(
+                (db_session, config, vector_search, modern_runtime)
+            )
             
         except Exception as e:
             logger.error(f"Initialization failed with error: {str(e)}")
             logger.error(traceback.format_exc())
             self.progress_signal.emit(f"Error: {str(e)}", 100)
-            self.finished_signal.emit((None, None, None))
+            self.finished_signal.emit((None, None, None, None))
 
 class SplashScreen(QPixmap):
     def __init__(self):

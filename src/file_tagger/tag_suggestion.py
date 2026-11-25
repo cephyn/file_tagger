@@ -18,7 +18,10 @@ from .infrastructure.database import create_session_factory, upgrade_database
 from .models import File, Tag, TagSuggestionCache as LegacySuggestionCache
 from .persistence.models import ModelProfileRecord
 from .search.hybrid import HybridSearch, VECTOR_DIMENSIONS
-from .tagging.cache import CachedTagRecommendations, TagRecommendationCache
+from .tagging.cache import (
+    CachedTagRecommendations,
+    TagRecommendationCache,
+)
 from .tagging.candidate_service import CandidateService
 from .vector_search.content_extractor import ContentExtractor
 
@@ -93,6 +96,7 @@ class TagSuggester:
         cache: TagRecommendationCache | None = None,
         gateway: Any | None = None,
         decision_gateway: Any | None = None,
+        modern_runtime: Any | None = None,
     ):
         """
         Initialize the tag suggester with configuration.
@@ -106,6 +110,7 @@ class TagSuggester:
         self._cache = cache
         self._gateway = gateway
         self._decision_gateway = decision_gateway
+        self.modern_runtime = modern_runtime
 
     def recommend_tags_for_file(
         self,
@@ -128,10 +133,17 @@ class TagSuggester:
 
         from .models import init_db
 
-        paths = AppPaths.discover()
-        paths.ensure_directories()
-        upgrade_database(paths.database)
-        search_session = create_session_factory(paths.database)()
+        modern_factory = getattr(
+            getattr(self, "modern_runtime", None),
+            "session_factory",
+            None,
+        )
+        if modern_factory is None:
+            paths = AppPaths.discover()
+            paths.ensure_directories()
+            upgrade_database(paths.database)
+            modern_factory = create_session_factory(paths.database)
+        search_session = modern_factory()
         cache_session = None
         selected_cache = self._cache
         try:
@@ -139,6 +151,16 @@ class TagSuggester:
                 cache_session = init_db()  # type: ignore[no-untyped-call]
                 selected_cache = _LegacyTagRecommendationCache(cache_session)
             embedding_profile = _latest_embedding_profile(search_session)
+            service_options = {}
+            if self.modern_runtime is not None:
+                if self.modern_runtime.candidate_model:
+                    service_options["candidate_model"] = (
+                        self.modern_runtime.candidate_model
+                    )
+                if self.modern_runtime.decision_model:
+                    service_options["decision_model"] = (
+                        self.modern_runtime.decision_model
+                    )
             service = CandidateService(
                 HybridSearch(
                     search_session,
@@ -147,6 +169,7 @@ class TagSuggester:
                 gateway=self._gateway,
                 decision_gateway=self._decision_gateway,
                 cache=selected_cache,
+                **service_options,
             )
             result = service.recommend(
                 document_state,
@@ -419,6 +442,8 @@ class TagSuggestionDialog(QDialog):
         db_session: Session,
         file_path: str,
         parent=None,
+        *,
+        modern_runtime: Any | None = None,
     ):
         super().__init__(parent)
         self.config = config
@@ -427,7 +452,12 @@ class TagSuggestionDialog(QDialog):
         self.using_cache = False
         self.explanation_text = ""
         self.tag_explanations: dict[str, str] = {}
-        self.tag_suggester = TagSuggester(config, db_session)
+        self.modern_runtime = modern_runtime
+        self.tag_suggester = TagSuggester(
+            config,
+            db_session,
+            modern_runtime=modern_runtime,
+        )
         self.initUI()
         self.analyze_file()
         
@@ -625,6 +655,18 @@ class TagSuggestionDialog(QDialog):
             
             # Commit changes to the database
             self.db_session.commit()
+            runtime = getattr(self, "modern_runtime", None)
+            if runtime is not None:
+                try:
+                    runtime.sync_file(
+                        self.file_path,
+                        [(tag.name, tag.color) for tag in file_obj.tags],
+                    )
+                    parent = self.parent()
+                    if parent is not None and hasattr(parent, "_index_modern_file"):
+                        parent._index_modern_file(self.file_path)
+                except Exception:
+                    pass
               # Check if this is the first time the file has been tagged
             # If so, add it to the vector database for search
             if is_new_file or not had_tags_before:

@@ -1,7 +1,7 @@
 import os
-import sys
 import logging
 import traceback
+from collections.abc import Iterable
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QComboBox,
     QHeaderView,
-    QMenuBar,
     QMenu,
     QFileDialog,
     QTabWidget,
@@ -27,31 +26,26 @@ from PySide6.QtWidgets import (
     QFrame,
     QListWidgetItem,
     QDialog,
-    QTextEdit,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QApplication,
     QStyle,
 )
-from PySide6.QtCore import Qt, QDir, QStorageInfo
+from PySide6.QtCore import Qt, QStorageInfo
 from PySide6.QtGui import (
     QColor,
-    QFont,
-    QDesktopServices,
     QTextDocument,
     QAction,
     QActionGroup,
 )
-from PySide6.QtCore import QUrl, QSize
-from sqlalchemy import and_, or_
+from PySide6.QtCore import QSize
 from .models import File, Tag
-from .config import Config
-from .vector_search import VectorSearch
 from .api_settings import APISettingsDialog
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
+from .modern_context import ModernIndexingUnavailable
 
 
 class HTMLDelegate(QStyledItemDelegate):
@@ -193,7 +187,7 @@ class AboutDialog(QDialog):
 class FileTagManager(QMainWindow):
     """Main window for the File Tagger application."""
 
-    def __init__(self, db_session, config, vector_search):
+    def __init__(self, db_session, config, vector_search, modern_runtime=None):
         # Set up logging for the main window
         self.logger = logging.getLogger("FileTagManager")
         # Add a file handler for main window-specific issues
@@ -224,6 +218,8 @@ class FileTagManager(QMainWindow):
                     f"Received vector_search: {vector_search is not None}"
                 )
                 self.vector_search = vector_search
+                self.modern_runtime = modern_runtime
+                self.modern_index_status_text = ""
 
                 self.current_file_path = None
                 self.current_search_results = []  # Initialize search results storage
@@ -249,6 +245,88 @@ class FileTagManager(QMainWindow):
                 "Please check the logs for more details.",
             )
             raise
+
+    def _set_modern_index_status(self, message: str) -> None:
+        self.modern_index_status_text = message
+        status_label = getattr(self, "modern_index_status_label", None)
+        if status_label is not None:
+            status_label.setText(message)
+
+    def _index_modern_file(self, file_path: str) -> bool:
+        runtime = getattr(self, "modern_runtime", None)
+        if runtime is None:
+            self._set_modern_index_status(
+                "Modern indexing unavailable: modern runtime is not initialized."
+            )
+            return False
+        try:
+            queue_index = getattr(runtime, "index_file_async", None)
+            if queue_index is not None:
+                queue_index(file_path)
+                self._set_modern_index_status("Modern indexing queued.")
+                return True
+            result = runtime.index_file(file_path)
+            status = getattr(result, "status", "completed")
+            if status != "completed":
+                raise ModernIndexingUnavailable(
+                    f"modern indexing ended with status {status}."
+                )
+        except ModernIndexingUnavailable as exc:
+            self._set_modern_index_status(
+                f"Modern indexing unavailable: {exc}"
+            )
+            self.logger.warning("Modern indexing unavailable for a requested file.")
+            return False
+        except Exception as exc:
+            self._set_modern_index_status(
+                f"Modern indexing failed: {exc.__class__.__name__}."
+            )
+            self.logger.warning(
+                "Modern indexing failed for a requested file (%s).",
+                exc.__class__.__name__,
+            )
+            return False
+        self._set_modern_index_status("Modern index updated.")
+        return True
+
+    def _commit_legacy_changes(
+        self,
+        *,
+        tag_upserts: Iterable[tuple[str, str | None]] = (),
+        tag_deletes: Iterable[str] = (),
+        file_paths: Iterable[tuple[str, Iterable[tuple[str, str | None]]]] = (),
+        file_deletes: Iterable[str] = (),
+    ) -> bool:
+        """Commit legacy UI state first, then best-effort mirror it to modern."""
+        self.db_session.commit()
+        runtime = getattr(self, "modern_runtime", None)
+        if runtime is None:
+            return False
+        try:
+            synchronize = getattr(runtime, "sync_legacy_changes", None)
+            if synchronize is not None:
+                synchronize(
+                    tag_upserts=list(tag_upserts),
+                    tag_deletes=list(tag_deletes),
+                    file_paths=[(path, list(tags)) for path, tags in file_paths],
+                    file_deletes=list(file_deletes),
+                )
+            else:
+                for name in tag_deletes:
+                    runtime.delete_tag(name)
+                for name, color in tag_upserts:
+                    runtime.sync_tag(name, color)
+                for path, tags in file_paths:
+                    runtime.sync_file(path, list(tags))
+                for path in file_deletes:
+                    runtime.delete_file(path)
+        except Exception as exc:
+            self.logger.warning(
+                "Modern database synchronization failed (%s); legacy state is safe.",
+                exc.__class__.__name__,
+            )
+            return False
+        return True
 
     def showEvent(self, event):
         """Override showEvent to log when window is shown"""
@@ -305,6 +383,14 @@ class FileTagManager(QMainWindow):
             self.main_tabs.addTab(tagging_tab, "Tagging Interface")
             self.main_tabs.addTab(search_tab, "Search Interface")
             self.logger.debug("Added tabs to main tabs widget")
+
+            runtime = getattr(self, "modern_runtime", None)
+            self.modern_index_status_label = QLabel(
+                "Modern index: initializing."
+                if runtime is not None
+                else "Modern index: unavailable."
+            )
+            main_layout.addWidget(self.modern_index_status_label)
 
             # Set initial directory from config
             self.logger.debug("Setting initial directory")
@@ -868,7 +954,7 @@ class FileTagManager(QMainWindow):
                 file_obj = self.db_session.query(File).filter_by(path=file_path).first()
                 if file_obj:
                     self.db_session.delete(file_obj)
-                    self.db_session.commit()
+                    self._commit_legacy_changes(file_deletes=[file_path])
                     success_tags = True
             except Exception as e:
                 print(f"Error removing file from tag database: {str(e)}")
@@ -951,7 +1037,9 @@ class FileTagManager(QMainWindow):
                 # Create new tag
                 new_tag = Tag(name=tag_name, color=color.name())
                 self.db_session.add(new_tag)
-                self.db_session.commit()
+                self._commit_legacy_changes(
+                    tag_upserts=[(tag_name, color.name())]
+                )
 
                 # Refresh tag lists
                 self.refresh_tags()
@@ -970,6 +1058,7 @@ class FileTagManager(QMainWindow):
             return
 
         # Get new name
+        old_name = tag.name
         new_name, ok = QInputDialog.getText(
             self, "Edit Tag", "Enter new tag name:", text=tag.name
         )
@@ -992,7 +1081,17 @@ class FileTagManager(QMainWindow):
             # Update tag
             tag.name = new_name
             tag.color = color.name()
-            self.db_session.commit()
+            self._commit_legacy_changes(
+                tag_upserts=[(new_name, color.name())],
+                tag_deletes=[old_name] if old_name != new_name else [],
+                file_paths=[
+                    (
+                        file.path,
+                        [(file_tag.name, file_tag.color) for file_tag in file.tags],
+                    )
+                    for file in tag.files
+                ],
+            )
 
             # Refresh tag lists
             self.refresh_tags()
@@ -1015,12 +1114,14 @@ class FileTagManager(QMainWindow):
         )
 
         if reply == QMessageBox.Yes:
+            deleted_names: list[str] = []
             for item in selected_items:
                 tag = self.db_session.query(Tag).filter_by(name=item.text()).first()
                 if tag:
+                    deleted_names.append(tag.name)
                     self.db_session.delete(tag)
 
-            self.db_session.commit()
+            self._commit_legacy_changes(tag_deletes=deleted_names)
             self.refresh_tags()
             self.refresh_file_tags()
 
@@ -1070,7 +1171,14 @@ class FileTagManager(QMainWindow):
         print(f"DEBUGGING: Added tags: {tags_added}")
 
         # Perform database commit - this will generate ID for new files
-        self.db_session.commit()
+        self._commit_legacy_changes(
+            file_paths=[
+                (
+                    self.current_file_path,
+                    [(tag.name, tag.color) for tag in file_obj.tags],
+                )
+            ]
+        )
         print("DEBUGGING: Database commit completed")
 
         # IMPORTANT: Check if this triggers vector indexing
@@ -1115,14 +1223,14 @@ class FileTagManager(QMainWindow):
                             )
                             if results and results["ids"] and len(results["ids"]) > 0:
                                 print(
-                                    f"DEBUGGING: Verification successful - file found in vector store"
+                                    "DEBUGGING: Verification successful - file found in vector store"
                                 )
                                 print(
                                     f"DEBUGGING: File metadata: {results['metadatas'][0]}"
                                 )
                             else:
                                 print(
-                                    f"DEBUGGING: VERIFICATION FAILED - file not found in vector store after indexing!"
+                                    "DEBUGGING: VERIFICATION FAILED - file not found in vector store after indexing!"
                                 )
                         except Exception as verify_err:
                             print(
@@ -1145,6 +1253,7 @@ class FileTagManager(QMainWindow):
                 print(f"DEBUGGING: Error adding file to vector search: {str(e)}")
                 print("DEBUGGING: Detailed error information:")
                 traceback.print_exc()
+            self._index_modern_file(self.current_file_path)
         else:
             # If the file was already tagged before, just update the tags metadata
             print("DEBUGGING: File already had tags, updating metadata only")
@@ -1183,7 +1292,14 @@ class FileTagManager(QMainWindow):
                 if tag in file_obj.tags:
                     file_obj.tags.remove(tag)
 
-            self.db_session.commit()
+            self._commit_legacy_changes(
+                file_paths=[
+                    (
+                        self.current_file_path,
+                        [(tag.name, tag.color) for tag in file_obj.tags],
+                    )
+                ]
+            )
             self.refresh_file_tags()
 
     def suggest_tags(self):
@@ -1193,7 +1309,11 @@ class FileTagManager(QMainWindow):
             return
 
         dialog = TagSuggestionDialog(
-            self.config, self.db_session, self.current_file_path, self
+            self.config,
+            self.db_session,
+            self.current_file_path,
+            self,
+            modern_runtime=getattr(self, "modern_runtime", None),
         )
         if dialog.exec():
             self.refresh_file_tags()
@@ -1411,6 +1531,8 @@ class FileTagManager(QMainWindow):
                 self.vector_search.reindex_all(
                     progress_callback=lambda msg, p: progress.setValue(p)
                 )
+                for file_obj in self.db_session.query(File).all():
+                    self._index_modern_file(file_obj.path)
                 QMessageBox.information(
                     self, "Success", "Files reindexed successfully!"
                 )
@@ -1530,11 +1652,12 @@ class FileTagManager(QMainWindow):
             )  # dictionary mapping file paths to tag suggestions
             scan_error = Signal(str)  # error message
 
-            def __init__(self, directory, db_session, config):
+            def __init__(self, directory, db_session, config, modern_runtime):
                 super().__init__()
                 self.directory = directory
                 self.db_session = db_session
                 self.config = config
+                self.modern_runtime = modern_runtime
                 self.stop_requested = False
 
             def run(self):
@@ -1556,7 +1679,10 @@ class FileTagManager(QMainWindow):
                     # and generate suggestions for each file
                     from .tag_suggestion import TagSuggester
 
-                    tag_suggester = TagSuggester(self.config)
+                    tag_suggester = TagSuggester(
+                        self.config,
+                        modern_runtime=getattr(self, "modern_runtime", None),
+                    )
 
                     untagged_files = {}
                     for idx, file_path in enumerate(files):
@@ -1591,7 +1717,12 @@ class FileTagManager(QMainWindow):
         progress.setValue(0)
 
         # Create and configure scan thread
-        self.scan_thread = ScanThread(dir_path, self.db_session, self.config)
+        self.scan_thread = ScanThread(
+            dir_path,
+            self.db_session,
+            self.config,
+            getattr(self, "modern_runtime", None),
+        )
 
         # Connect signals
         self.scan_thread.scan_progress.connect(
@@ -1818,6 +1949,7 @@ class FileTagManager(QMainWindow):
         applied_count = 0
         total_files = len(file_paths)
 
+        applied_paths = []
         for file_path in file_paths:
             if file_path in self.file_suggestions_map:
                 suggestions = self.file_suggestions_map[file_path]
@@ -1831,7 +1963,29 @@ class FileTagManager(QMainWindow):
                     if good_suggestions:
                         # Apply these tags
                         self.apply_tags_to_file(file_path, good_suggestions.keys())
+                        applied_paths.append(file_path)
                         applied_count += 1
+
+        if applied_paths:
+            self._commit_legacy_changes(
+                file_paths=[
+                    (
+                        file_path,
+                        [
+                            (tag.name, tag.color)
+                            for tag in (
+                                self.db_session.query(File)
+                                .filter_by(path=file_path)
+                                .one()
+                                .tags
+                            )
+                        ],
+                    )
+                    for file_path in applied_paths
+                ]
+            )
+            for file_path in applied_paths:
+                self._index_modern_file(file_path)
 
         # Show success message
         if applied_count > 0:
@@ -1903,7 +2057,7 @@ class FileTagManager(QMainWindow):
                     print(f"Content extracted, length: {len(content)} characters")
                     # Add file to vector database
                     print(f"Sending to vector search index: {file_path}")
-                    result = self.vector_search.index_file(file_path, content)
+                    self.vector_search.index_file(file_path, content)
                     print(
                         f"Added newly tagged file to vector search index: {file_path}"
                     )
@@ -1943,7 +2097,25 @@ class FileTagManager(QMainWindow):
             self.apply_tags_to_file(file_path, tag_names)
 
         # Commit all changes at once
-        self.db_session.commit()
+        self._commit_legacy_changes(
+            file_paths=[
+                (
+                    file_path,
+                    [
+                        (tag.name, tag.color)
+                        for tag in (
+                            self.db_session.query(File)
+                            .filter_by(path=file_path)
+                            .one()
+                            .tags
+                        )
+                    ],
+                )
+                for file_path in file_paths
+            ]
+        )
+        for file_path in file_paths:
+            self._index_modern_file(file_path)
 
         # Refresh tag lists
         self.refresh_tags()
@@ -1988,6 +2160,7 @@ class FileTagManager(QMainWindow):
                 return False
 
             print(f"\n=== Force reindexing file: {file_path} ===")
+            self._index_modern_file(file_path)
 
             from .vector_search.content_extractor import ContentExtractor
 
@@ -2055,7 +2228,7 @@ class FileTagManager(QMainWindow):
                         if results and results["ids"] and len(results["ids"]) > 0:
                             metadata = results["metadatas"][0]
                             print(
-                                f"Verification successful - file found in vector store"
+                                "Verification successful - file found in vector store"
                             )
                             if "summary" in metadata and metadata["summary"]:
                                 print(

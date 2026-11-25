@@ -1,7 +1,6 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                             QLineEdit, QPushButton, QFrame, QProgressBar, QDialog)
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
 import logging
 import traceback
 from .initialization import InitializationWorker
@@ -238,8 +237,12 @@ class LoginScreen(QWidget):
         """Handle completion of the initialization process."""
         logger.debug("on_initialization_finished called with result")
         try:
-            db_session, config, vector_search = result
-            logger.debug(f"Unpacked result: db_session={db_session is not None}, config={config is not None}, vector_search={vector_search is not None}")
+            if len(result) == 3:
+                db_session, config, vector_search = result
+                modern_runtime = None
+            else:
+                db_session, config, vector_search, modern_runtime = result
+            logger.debug(f"Unpacked result: db_session={db_session is not None}, config={config is not None}, vector_search={vector_search is not None}, modern_runtime={modern_runtime is not None}")
             
             if db_session and config and vector_search:
                 logger.debug("Initialization succeeded, preparing to show main window")
@@ -255,7 +258,12 @@ class LoginScreen(QWidget):
                     
                     # Create and show the main window
                     logger.debug("Creating FileTagManager instance")
-                    window = FileTagManager(db_session, config, vector_search)
+                    window = FileTagManager(
+                        db_session,
+                        config,
+                        vector_search,
+                        modern_runtime,
+                    )
                     logger.debug("FileTagManager instance created")
                     
                     # Save a reference to the window to prevent it from being garbage collected

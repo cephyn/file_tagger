@@ -123,9 +123,16 @@ class Config:
         self.paths = _get_app_paths()
         if not verify_password(password):
             raise ValueError("Invalid password")
-            
+
+        legacy_config_pending = (
+            self.paths.legacy_database.parent / "config.encrypted"
+        ).is_file() and not self.paths.config_file.is_file()
+
         # Store password hash if this is first time setup
-        if not os.path.exists(self.paths.password_hash_file):
+        if (
+            not legacy_config_pending
+            and not os.path.exists(self.paths.password_hash_file)
+        ):
             store_password_hash(password)
             
         self.password = password
@@ -133,7 +140,10 @@ class Config:
         self.config_data = self._load_config()
         
         # Generate recovery key on first setup
-        if not os.path.exists(self.paths.recovery_file):
+        if (
+            not legacy_config_pending
+            and not os.path.exists(self.paths.recovery_file)
+        ):
             recovery_key = generate_recovery_key()
             store_recovery_key(recovery_key, password)
     
@@ -161,6 +171,12 @@ class Config:
                 encrypted_data = f.read()
             decrypted_data = self.fernet.decrypt(encrypted_data)
             config = json.loads(decrypted_data)
+
+            config.setdefault(
+                'api_keys',
+                {'openai': '', 'gemini': '', 'anthropic': ''}
+            )
+            config.setdefault('selected_provider', 'openai')
             
             # Add home_directory if it doesn't exist in older config files
             if 'home_directory' not in config:
@@ -204,6 +220,13 @@ class Config:
         encrypted_data = self.fernet.encrypt(json.dumps(self.config_data).encode())
         with open(self.paths.config_file, 'wb') as f:
             f.write(encrypted_data)
+
+    def reload_after_migration(self) -> None:
+        """Reload encryption state and settings after legacy config migration."""
+        if not verify_password(self.password):
+            raise ValueError("Invalid password after configuration migration")
+        self.fernet = get_encryption_key(self.password)
+        self.config_data = self._load_config()
     
     def set_api_key(self, provider: str, key: str):
         """Set API key for a provider."""
@@ -271,10 +294,6 @@ class Config:
             
             # First verify the recovery key by trying to decrypt stored key
             old_passwords = []  # We'll collect working passwords
-            
-            if os.path.exists(self.paths.config_file):
-                with open(self.paths.config_file, 'rb') as f:
-                    config_data = f.read()
             
             for password in self._get_recent_passwords():
                 try:
