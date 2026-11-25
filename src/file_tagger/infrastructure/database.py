@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+import sys
 import unicodedata
 
 from alembic import command
@@ -94,11 +95,25 @@ def create_session_factory(database_path: Path) -> sessionmaker[Session]:
     return session_factory
 
 
-def upgrade_database(database_path: Path) -> None:
-    config_path = Path(__file__).resolve().parents[3] / "alembic.ini"
+def resolve_alembic_paths() -> tuple[Path, Path]:
+    bundle_path = getattr(sys, "_MEIPASS", None)
+    if bundle_path:
+        base_path = Path(bundle_path).resolve()
+    else:
+        base_path = Path(__file__).resolve().parents[3]
+
+    config_path = base_path / "alembic.ini"
+    script_directory = base_path / "alembic"
     if not config_path.is_file():
         raise FileNotFoundError(f"Alembic configuration not found: {config_path}")
+    if not script_directory.is_dir():
+        raise FileNotFoundError(f"Alembic migration directory not found: {script_directory}")
+    return config_path, script_directory
 
+
+def upgrade_database(database_path: Path) -> None:
+    config_path, script_directory = resolve_alembic_paths()
     alembic_config = Config(str(config_path))
+    alembic_config.set_main_option("script_location", str(script_directory))
     alembic_config.attributes["database_path"] = database_path.expanduser().resolve()
     command.upgrade(alembic_config, "head")

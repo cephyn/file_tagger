@@ -3,6 +3,42 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from file_tagger.infrastructure import database as database_module
+from file_tagger.infrastructure.database import upgrade_database
+
+
+def test_packaged_upgrade_resolves_migrations_from_meipass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "_MEIPASS"
+    (bundle / "alembic" / "versions").mkdir(parents=True)
+    config_path = bundle / "alembic.ini"
+    config_path.write_text("[alembic]\nscript_location = alembic\n", encoding="utf-8")
+    database_path = tmp_path / "packaged.sqlite3"
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setattr(
+        database_module.command,
+        "upgrade",
+        lambda config, revision: captured.update(
+            config=config,
+            revision=revision,
+        ),
+    )
+
+    upgrade_database(database_path)
+
+    config = captured["config"]
+    assert isinstance(config, database_module.Config)
+    assert config.config_file_name == str(config_path)
+    assert config.get_main_option("script_location") == str(bundle / "alembic")
+    assert config.attributes["database_path"] == database_path.expanduser().resolve()
+    assert captured["revision"] == "head"
+
 
 def test_installed_app_uses_per_user_data_directory(tmp_path: Path) -> None:
     data_dir = tmp_path / "user-data"

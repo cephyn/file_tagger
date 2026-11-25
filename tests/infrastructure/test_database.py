@@ -1,11 +1,43 @@
 import sqlite3
+import sys
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 
 from file_tagger.domain.errors import DatabaseExtensionError
+from file_tagger.infrastructure import database as database_module
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.persistence.models import Chunk, Document, File, Page
+
+
+def test_upgrade_database_resolves_migrations_from_pyinstaller_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "_MEIPASS"
+    (bundle / "alembic" / "versions").mkdir(parents=True)
+    config_path = bundle / "alembic.ini"
+    config_path.write_text("[alembic]\nscript_location = alembic\n", encoding="utf-8")
+    database_path = tmp_path / "frozen.sqlite3"
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+
+    def capture_upgrade(config, revision: str) -> None:
+        captured["config"] = config
+        captured["revision"] = revision
+
+    monkeypatch.setattr(database_module.command, "upgrade", capture_upgrade)
+
+    upgrade_database(database_path)
+
+    config = captured["config"]
+    assert isinstance(config, database_module.Config)
+    assert config.config_file_name == str(config_path)
+    assert config.get_main_option("script_location") == str(bundle / "alembic")
+    assert config.attributes["database_path"] == database_path.expanduser().resolve()
+    assert captured["revision"] == "head"
 
 
 def _add_indexed_file(session) -> int:

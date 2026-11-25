@@ -18,3 +18,5 @@ def test_packaging_spec_collects_required_packages_and_fails_closed() -> None:
     assert "SPECPATH" in spec
     assert 'pathex=[str(SRC_ROOT)]' in spec
     assert 'str(PACKAGING_ROOT / "launcher.py")' in spec
+    assert 'datas.append((str(alembic_ini), "."))' in spec
+    assert 'datas.append((str(alembic_dir), "alembic"))' in spec
