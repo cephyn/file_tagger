@@ -18,7 +18,7 @@ from file_tagger.indexing.service import IndexingService
 from file_tagger.infrastructure.app_paths import AppPaths
 from file_tagger.modern_context import ModernRuntime, initialize_modern_runtime
 from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
-from file_tagger.persistence.models import File
+from file_tagger.persistence.models import Chunk, File
 from file_tagger.rag.planner import SearchPlan, build_search_plan_async
 from file_tagger.rag.service import RagService
 from file_tagger.search.hybrid import HybridSearch
@@ -382,3 +382,43 @@ def test_upgrade_indexes_and_answers_from_local_evidence(
 
     with runtime.session_factory() as session:
         assert session.scalar(select(func.count()).select_from(File)) == 2
+        canonical_paths = set(
+            session.scalars(select(File.canonical_path)).all()
+        )
+        fixture_library = (
+            Path(__file__).parents[1] / "fixtures" / "library"
+        ).resolve()
+
+        for citation in answer.citations:
+            citation_path = Path(citation.path).resolve()
+            assert citation_path.is_file()
+            assert str(citation_path) in canonical_paths
+
+            fixture_file = (fixture_library / citation_path.name).resolve()
+            assert fixture_file.is_file()
+            assert fixture_file.read_bytes() == citation_path.read_bytes()
+
+            chunk = session.scalar(
+                select(Chunk).where(
+                    Chunk.stable_id == citation.chunk_id,
+                    Chunk.index_version
+                    == embedding_profile.default_index_version,
+                )
+            )
+            assert chunk is not None
+            assert citation.text == chunk.text
+
+        for claim in answer.claims:
+            assert claim.chunk_ids
+            assert claim.evidence_quote
+            for chunk_id in claim.chunk_ids:
+                chunk = session.scalar(
+                    select(Chunk).where(
+                        Chunk.stable_id == chunk_id,
+                        Chunk.index_version
+                        == embedding_profile.default_index_version,
+                    )
+                )
+                assert chunk is not None
+                assert claim.evidence_quote == chunk.text
+                assert claim.text == chunk.text
