@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Mapping, Sequence
 import ipaddress
+import re
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -23,6 +24,60 @@ ModelRole = Literal["embedding", "decision", "generation"]
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 MINIMUM_OLLAMA_VERSION = (0, 35, 0)
 CLOUD_MARKERS = (":cloud", "-cloud", "cloud:", ".cloud")
+_VERSION_PATTERN = re.compile(
+    r"v?(\d+)\.(\d+)\.(\d+)"
+    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+)
+
+
+def parse_ollama_version(version: str | None) -> tuple[int, int, int] | None:
+    if version is None:
+        return None
+    match = _VERSION_PATTERN.fullmatch(version)
+    if match is None:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+    )
+
+
+def validate_ollama_host(host: str) -> str:
+    try:
+        parsed = urlsplit(host)
+        port = parsed.port
+    except ValueError as exc:
+        raise RemoteOllamaHostError(
+            "Ollama host must be a local HTTP origin with a valid port."
+        ) from exc
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise RemoteOllamaHostError(
+            "Ollama host must be an absolute local HTTP origin."
+        )
+    if parsed.username or parsed.password:
+        raise RemoteOllamaHostError("Ollama host credentials are not supported.")
+    if parsed.path or parsed.query or parsed.fragment:
+        raise RemoteOllamaHostError(
+            "Ollama host must not include a path, query, or fragment."
+        )
+    if port is None or not 1 <= port <= 65535:
+        raise RemoteOllamaHostError(
+            "Ollama host must include a numeric port from 1 to 65535."
+        )
+
+    hostname = parsed.hostname.lower()
+    if hostname != "localhost":
+        try:
+            if not ipaddress.ip_address(hostname).is_loopback:
+                raise RemoteOllamaHostError(
+                    "Remote Ollama hosts are not supported."
+                )
+        except ValueError as exc:
+            raise RemoteOllamaHostError(
+                "Remote Ollama hosts are not supported."
+            ) from exc
+    return host
 
 
 class OllamaGateway:
@@ -33,7 +88,7 @@ class OllamaGateway:
         client: Any | None = None,
         timeout_seconds: float = 15.0,
     ) -> None:
-        self.host = self._validate_host(host)
+        self.host = validate_ollama_host(host)
         self._client: Any = (
             client
             if client is not None
@@ -46,26 +101,7 @@ class OllamaGateway:
 
     @staticmethod
     def _validate_host(host: str) -> str:
-        parsed = urlsplit(host)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise RemoteOllamaHostError("Ollama host must be an absolute loopback URL.")
-        if parsed.username or parsed.password:
-            raise RemoteOllamaHostError("Ollama host credentials are not supported.")
-        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
-            raise RemoteOllamaHostError("Ollama host must not include a path or query.")
-
-        hostname = parsed.hostname.lower()
-        if hostname != "localhost":
-            try:
-                if not ipaddress.ip_address(hostname).is_loopback:
-                    raise RemoteOllamaHostError(
-                        "Remote Ollama hosts are not supported."
-                    )
-            except ValueError as exc:
-                raise RemoteOllamaHostError(
-                    "Remote Ollama hosts are not supported."
-                ) from exc
-        return host
+        return validate_ollama_host(host)
 
     @staticmethod
     def _validate_model(model: str) -> None:
@@ -83,13 +119,7 @@ class OllamaGateway:
 
     @staticmethod
     def _version_tuple(version: str) -> tuple[int, int, int]:
-        values = version.split(".", 2)
-        try:
-            parsed = [int(part) for part in values[:3]]
-        except ValueError:
-            return (0, 0, 0)
-        padded = (parsed + [0, 0, 0])[:3]
-        return padded[0], padded[1], padded[2]
+        return parse_ollama_version(version) or (0, 0, 0)
 
     async def close(self) -> None:
         close = getattr(self._client, "close", None)
@@ -233,7 +263,13 @@ class OllamaGateway:
             available = False
             errors.append(str(exc))
 
-        if version and self._version_tuple(version) < MINIMUM_OLLAMA_VERSION:
+        parsed_version = parse_ollama_version(version)
+        if version is not None and parsed_version is None:
+            errors.append(
+                f"Ollama version {version!r} is unknown or invalid; "
+                "version 0.35.0 or newer is required."
+            )
+        elif parsed_version is not None and parsed_version < MINIMUM_OLLAMA_VERSION:
             errors.append(
                 f"Ollama {version} is too old; version 0.35.0 or newer is required."
             )

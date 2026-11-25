@@ -1,7 +1,5 @@
 from collections.abc import Callable
-import ipaddress
 from typing import Any
-from urllib.parse import urlsplit
 
 from PySide6.QtWidgets import (
     QComboBox,
@@ -16,13 +14,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..adapters.ollama.gateway import (
+    DEFAULT_OLLAMA_HOST,
+    MINIMUM_OLLAMA_VERSION,
+    parse_ollama_version,
+    validate_ollama_host,
+)
 from ..domain.contracts import HardwareReport
+from ..domain.errors import RemoteOllamaHostError
 from ..ollama.model_recommender import ModelRecommendation
 from ..ollama.readiness import ReadinessReport
 
 
 GIB = 1024**3
-MINIMUM_OLLAMA_VERSION = (0, 35, 0)
 
 RefreshProvider = Callable[[], ReadinessReport | None]
 
@@ -32,35 +36,15 @@ def _gib(byte_count: int) -> str:
 
 
 def _version_tuple(version: str | None) -> tuple[int, int, int] | None:
-    if version is None:
-        return None
-    parts = version.removeprefix("v").split(".", 2)
-    try:
-        numbers = [int(part.split("-", 1)[0]) for part in parts[:3]]
-    except ValueError:
-        return None
-    numbers.extend([0] * (3 - len(numbers)))
-    return numbers[0], numbers[1], numbers[2]
+    return parse_ollama_version(version)
 
 
 def _is_loopback_host(host: str) -> bool:
-    parsed = urlsplit(host)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
-        return False
-    if parsed.hostname.lower() == "localhost":
-        return True
     try:
-        return ipaddress.ip_address(parsed.hostname).is_loopback
-    except ValueError:
+        validate_ollama_host(host)
+    except RemoteOllamaHostError:
         return False
+    return True
 
 
 class OllamaSettingsDialog(QDialog):
@@ -181,7 +165,7 @@ class OllamaSettingsDialog(QDialog):
         host = (
             report.ollama.base_url
             if report.ollama is not None
-            else "http://127.0.0.1:11434 (default)"
+            else f"{DEFAULT_OLLAMA_HOST} (default)"
         )
         version = (
             report.ollama.version
@@ -207,20 +191,28 @@ class OllamaSettingsDialog(QDialog):
         valid_host = _is_loopback_host(
             report.ollama.base_url
             if report.ollama is not None
-            else "http://127.0.0.1:11434"
+            else DEFAULT_OLLAMA_HOST
         )
         version_value = _version_tuple(
             report.ollama.version if report.ollama is not None else None
         )
+        unknown_version = version_value is None
         outdated = (
             version_value is not None
             and version_value < MINIMUM_OLLAMA_VERSION
         )
         self.instructions.setText(
-            self._instruction_text(valid_host=valid_host, outdated=outdated)
+            self._instruction_text(
+                valid_host=valid_host,
+                unknown_version=unknown_version,
+                outdated=outdated,
+            )
         )
         self.ok_button.setEnabled(
-            report.ready and valid_host and not outdated
+            report.ready
+            and valid_host
+            and version_value is not None
+            and not outdated
         )
 
     def _hardware_text(self) -> str:
@@ -299,7 +291,13 @@ class OllamaSettingsDialog(QDialog):
             lines.append(line)
         return "\n".join(lines)
 
-    def _instruction_text(self, *, valid_host: bool, outdated: bool) -> str:
+    def _instruction_text(
+        self,
+        *,
+        valid_host: bool,
+        unknown_version: bool,
+        outdated: bool,
+    ) -> str:
         report = self._report
         lines = list(report.instructions)
         lines.extend(report.errors)
@@ -314,9 +312,16 @@ class OllamaSettingsDialog(QDialog):
             lines.append(
                 f"Ollama {version} is outdated; version 0.35.0 or newer is required."
             )
+        elif unknown_version:
+            lines.append(
+                "Ollama version is unknown or invalid; "
+                "version 0.35.0 or newer is required."
+            )
         if not valid_host:
             lines.append(
-                "Ollama must use an absolute local loopback host; remote hosts are not supported."
+                "Ollama must use an absolute local loopback HTTP origin "
+                "with a numeric port from 1 to 65535; paths, queries, "
+                "credentials, and remote hosts are not supported."
             )
         if not lines and report.ready:
             lines.append("Ready. No installation steps are required.")

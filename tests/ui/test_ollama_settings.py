@@ -3,6 +3,7 @@ import logging
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMainWindow, QPushButton
 
@@ -147,6 +148,105 @@ def test_outdated_and_remote_ollama_keep_settings_disabled(qtbot) -> None:
     assert "outdated" in dialog.instructions.text().lower()
 
 
+@pytest.mark.parametrize("version", [None, "", "not-a-version", "0.35"])
+def test_ready_report_without_a_valid_version_keeps_settings_disabled(
+    qtbot, version
+) -> None:
+    report = _report(ready=True).model_copy(
+        update={
+            "ollama": OllamaReadiness(
+                available=True,
+                version=version,
+                base_url="http://127.0.0.1:11434",
+            )
+        }
+    )
+
+    dialog = OllamaSettingsDialog(report)
+    qtbot.addWidget(dialog)
+
+    assert not dialog.ok_button.isEnabled()
+    assert "unknown or invalid" in dialog.instructions.text().lower()
+    assert "0.35.0" in dialog.instructions.text()
+
+
+def test_ready_report_with_an_outdated_version_keeps_settings_disabled(qtbot) -> None:
+    report = _report(ready=True).model_copy(
+        update={
+            "ollama": OllamaReadiness(
+                available=True,
+                version="0.34.9",
+                base_url="http://127.0.0.1:11434",
+            )
+        }
+    )
+
+    dialog = OllamaSettingsDialog(report)
+    qtbot.addWidget(dialog)
+
+    assert not dialog.ok_button.isEnabled()
+    assert "outdated" in dialog.instructions.text().lower()
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "http://localhost:11434",
+        "http://127.0.0.1:1",
+        "http://[::1]:65535",
+    ],
+)
+def test_local_http_origins_enable_ok_for_ready_reports(qtbot, host) -> None:
+    report = _report(ready=True).model_copy(
+        update={
+            "ollama": OllamaReadiness(
+                available=True,
+                version="0.35.0",
+                base_url=host,
+            )
+        }
+    )
+
+    dialog = OllamaSettingsDialog(report)
+    qtbot.addWidget(dialog)
+
+    assert dialog.ok_button.isEnabled()
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "https://localhost:11434",
+        "http://localhost",
+        "http://localhost:0",
+        "http://localhost:65536",
+        "http://localhost:not-a-port",
+        "http://localhost:11434/",
+        "http://localhost:11434/api",
+        "http://localhost:11434?query=1",
+        "http://localhost:11434#fragment",
+        "http://user:pass@localhost:11434",
+        "http://ollama.example.test:11434",
+    ],
+)
+def test_non_local_or_non_origin_hosts_disable_ok(qtbot, host) -> None:
+    report = _report(ready=True).model_copy(
+        update={
+            "ollama": OllamaReadiness(
+                available=True,
+                version="0.35.0",
+                base_url=host,
+            )
+        }
+    )
+
+    dialog = OllamaSettingsDialog(report)
+    qtbot.addWidget(dialog)
+
+    assert not dialog.ok_button.isEnabled()
+    assert "local loopback" in dialog.instructions.text().lower()
+
+
 def test_ready_report_enables_ok_and_renders_benchmarks(qtbot) -> None:
     from file_tagger.ollama.benchmarks import BenchmarkResult
 
@@ -208,6 +308,27 @@ def test_refresh_provider_is_lazy_and_replaces_report(qtbot) -> None:
     assert calls == 1
     assert dialog.ok_button.isEnabled()
     assert "No installation steps are required" in dialog.instructions.text()
+
+
+def test_provider_construction_does_not_start_refresh(qtbot) -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.readiness = _report(ready=True)
+
+        def start_readiness(self) -> None:
+            self.calls += 1
+
+    provider = Provider()
+
+    dialog = OllamaSettingsDialog(
+        _report(),
+        runtime_refresh_provider=provider,
+    )
+    qtbot.addWidget(dialog)
+
+    assert provider.calls == 0
+    assert not dialog.ok_button.isEnabled()
 
 
 def _manager_module(monkeypatch):

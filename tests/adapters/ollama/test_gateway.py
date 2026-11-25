@@ -92,15 +92,36 @@ class FakeAsyncClient:
 
 @pytest.mark.parametrize(
     "host",
-    ["http://localhost:11434", "http://127.0.0.1:11434"],
+    [
+        "http://localhost:11434",
+        "http://127.0.0.1:11435",
+        "http://[::1]:1",
+        "http://[::1]:65535",
+    ],
 )
 def test_loopback_host_is_allowed(host) -> None:
     assert OllamaGateway(host, client=FakeAsyncClient()).host == host
 
 
-def test_remote_host_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "host",
+    [
+        "https://localhost:11434",
+        "http://localhost",
+        "http://localhost:0",
+        "http://localhost:65536",
+        "http://localhost:not-a-port",
+        "http://localhost:11434/",
+        "http://localhost:11434/api",
+        "http://localhost:11434?query=1",
+        "http://localhost:11434#fragment",
+        "http://user:pass@localhost:11434",
+        "https://example.invalid:11434",
+    ],
+)
+def test_non_local_or_non_origin_host_is_rejected(host) -> None:
     with pytest.raises(RemoteOllamaHostError):
-        OllamaGateway("https://example.invalid", client=FakeAsyncClient())
+        OllamaGateway(host, client=FakeAsyncClient())
 
 
 def test_readiness_reports_local_models_and_profiles() -> None:
