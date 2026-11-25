@@ -624,6 +624,24 @@ class ModernRuntime:
         service = self._require_indexing_service()
         return service.reindex(file_path)
 
+    def reindex_all(self) -> tuple[IndexingResult, ...]:
+        """Rebuild every known file through the resumable indexing service."""
+        factory = self.session_factory
+        if factory is None:
+            raise ModernIndexingUnavailable(
+                self.unavailable_reason or "The modern database is unavailable."
+            )
+        service = self._require_indexing_service()
+        with factory() as session:
+            file_paths = tuple(
+                path
+                for path in session.scalars(
+                    select(File.canonical_path).order_by(File.id)
+                )
+                if path
+            )
+        return tuple(service.reindex(file_path) for file_path in file_paths)
+
     def queue(self, file_path: str | Path) -> int:
         return self._require_indexing_service().queue(file_path)
 
