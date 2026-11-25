@@ -1,7 +1,6 @@
 from collections.abc import Callable
 import logging
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import Qt
@@ -429,25 +428,14 @@ def test_failed_refresh_callback_does_not_restore_previous_report(qtbot) -> None
     assert "latest refresh failed" in dialog.instructions.text()
 
 
-def _manager_module(monkeypatch):
-    vector_search = ModuleType("file_tagger.vector_search")
-    vector_search.VectorSearch = object
-    content_extractor = ModuleType("file_tagger.vector_search.content_extractor")
-    content_extractor.ContentExtractor = object
-    monkeypatch.setitem(sys.modules, "file_tagger.vector_search", vector_search)
-    monkeypatch.setitem(
-        sys.modules,
-        "file_tagger.vector_search.content_extractor",
-        content_extractor,
-    )
-    sys.modules.pop("file_tagger.file_tag_manager", None)
+def _manager_module():
     from file_tagger import file_tag_manager
 
     return file_tag_manager
 
 
-def test_manager_settings_menu_opens_ollama_readiness(qtbot, monkeypatch) -> None:
-    module = _manager_module(monkeypatch)
+def test_manager_settings_menu_opens_ollama_readiness(qtbot) -> None:
+    module = _manager_module()
     manager = module.FileTagManager.__new__(module.FileTagManager)
     QMainWindow.__init__(manager)
     manager.logger = logging.getLogger("test-file-tagger-manager")
@@ -462,7 +450,7 @@ def test_manager_settings_menu_opens_ollama_readiness(qtbot, monkeypatch) -> Non
 
 
 def test_manager_passes_runtime_readiness_to_dialog(qtbot, monkeypatch) -> None:
-    module = _manager_module(monkeypatch)
+    module = _manager_module()
     manager = module.FileTagManager.__new__(module.FileTagManager)
     QMainWindow.__init__(manager)
     manager.logger = logging.getLogger("test-file-tagger-manager")
@@ -490,7 +478,7 @@ def test_manager_passes_runtime_readiness_to_dialog(qtbot, monkeypatch) -> None:
 
 
 def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
-    module = _manager_module(monkeypatch)
+    module = _manager_module()
     manager = module.FileTagManager.__new__(module.FileTagManager)
     QMainWindow.__init__(manager)
     manager.logger = logging.getLogger("test-file-tagger-manager")
@@ -522,3 +510,12 @@ def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
     manager.show_ollama_settings()
 
     assert applied == [selections]
+
+
+def test_manager_import_preserves_real_content_extractor() -> None:
+    module = _manager_module()
+    from file_tagger import tag_suggestion
+    from file_tagger.vector_search.content_extractor import ContentExtractor
+
+    assert module.TagSuggestionDialog is tag_suggestion.TagSuggestionDialog
+    assert tag_suggestion.ContentExtractor is ContentExtractor
