@@ -454,7 +454,7 @@ class ConfidenceWidget(QWidget):
         self.progress_bar = progress
         
         # Only make the progress bar use hand cursor to indicate it's clickable
-        self.progress_bar.setCursor(Qt.PointingHandCursor)
+        self.progress_bar.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
         
         # Add tooltip only to the progress bar
         self.progress_bar.setToolTip(f"Click for explanation of {tag} tag")
@@ -587,7 +587,7 @@ class TagSuggestionDialog(QDialog):
         confidence_widget.clicked.connect(self.show_tag_explanation)
         
         # Store the widget reference to prevent garbage collection
-        item.setData(Qt.UserRole, confidence_widget)
+        item.setData(Qt.UserRole, confidence_widget)  # type: ignore[attr-defined]
         
         list_widget.addItem(item)
         list_widget.setItemWidget(item, confidence_widget)

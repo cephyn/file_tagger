@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from file_tagger.extraction.docling_adapter import DoclingAdapter, extract_document
+from file_tagger.extraction.docling_adapter import extract_document
 
 
 class FakeDocument:

@@ -36,7 +36,6 @@ from PySide6.QtCore import Qt, QStorageInfo
 from PySide6.QtGui import (
     QColor,
     QTextDocument,
-    QAction,
 )
 from PySide6.QtCore import QSize
 from .models import File, Tag
@@ -997,8 +996,8 @@ class FileTagManager(QMainWindow):
             f"Are you sure you want to remove\n{file_path}\nfrom the system?\n\n"
             "This will remove the file from both the search index and the tag database.\n"
             "Note: This will not delete the actual file from your computer.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.Yes | QMessageBox.No,  # type: ignore[attr-defined]
+            QMessageBox.No,  # type: ignore[attr-defined]
         )
 
         if reply == QMessageBox.Yes:
@@ -1158,8 +1157,8 @@ class FileTagManager(QMainWindow):
             self,
             "Confirm Delete",
             f"Are you sure you want to delete {len(selected_items)} tag(s)?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.Yes | QMessageBox.No,  # type: ignore[attr-defined]
+            QMessageBox.No,  # type: ignore[attr-defined]
         )
 
         if reply == QMessageBox.Yes:
@@ -1558,7 +1557,7 @@ class FileTagManager(QMainWindow):
             "Are you sure you want to reindex all files?\n\n"
             "This will rebuild the search index for all files in the database.\n"
             "This operation may take a while depending on the number of files.",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes | QMessageBox.No,  # type: ignore[attr-defined]
             QMessageBox.No,
         )
 
@@ -1772,10 +1771,10 @@ class FileTagManager(QMainWindow):
             f"{inventory['legacy_chroma_path_count']} file path(s) were inventoried. "
             "Legacy embeddings are not reused, and the modern index must be rebuilt. "
             "Migration backups remain untouched.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.Yes | QMessageBox.No,  # type: ignore[attr-defined]
+            QMessageBox.No,  # type: ignore[attr-defined]
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.Yes:  # type: ignore[attr-defined]
             QMessageBox.information(
                 self,
                 "Legacy Search Cleanup",

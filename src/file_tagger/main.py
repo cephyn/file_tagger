@@ -1,5 +1,4 @@
 import sys
-import os
 import logging
 import traceback
 from datetime import datetime
@@ -35,7 +34,16 @@ def setup_logging():
     
     return log_file
 
-def main():
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--print-paths" in arguments:
+        paths = AppPaths.discover()
+        print(f"data_dir={paths.data_dir}")
+        print(f"config_dir={paths.config_dir}")
+        print(f"logs_dir={paths.logs_dir}")
+        print(f"database={paths.database}")
+        return
+
     # Initialize logging first
     log_file = setup_logging()
     

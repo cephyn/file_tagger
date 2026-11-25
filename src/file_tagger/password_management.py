@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QWidget,
     QInputDialog,
 )
-from PySide6.QtCore import Qt
 from .config import Config, get_recovery_key
 
 

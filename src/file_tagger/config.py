@@ -21,7 +21,7 @@ DEFAULT_SYSTEM_MESSAGE = """You are a helpful AI assistant for tagging and organ
 Your primary task is to analyze files and suggest relevant tags based on their names and contents.
 Suggest both existing tags that match and new tags that might be useful."""
 
-def generate_key(password: str, salt: bytes = None) -> bytes:
+def generate_key(password: str, salt: bytes | None = None) -> bytes:
     """Generate an encryption key from password and salt."""
     salt_file = _get_app_paths().salt_file
     if salt is None:
@@ -51,7 +51,7 @@ def get_encryption_key(password: str) -> Fernet:
     key = generate_key(password, salt)
     return Fernet(key)
 
-def hash_password(password: str, salt: bytes = None) -> tuple[str, bytes]:
+def hash_password(password: str, salt: bytes | None = None) -> tuple[str, bytes]:
     """Hash password with a salt using SHA256."""
     if salt is None:
         salt = os.urandom(32)
@@ -103,7 +103,7 @@ def store_recovery_key(recovery_key: str, password: str):
     with open(recovery_file, 'wb') as f:
         f.write(encrypted_key)
 
-def get_recovery_key(password: str) -> str:
+def get_recovery_key(password: str) -> str | None:
     """Get the recovery key using the current password."""
     recovery_file = _get_app_paths().recovery_file
     if not os.path.exists(recovery_file):

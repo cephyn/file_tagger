@@ -1,8 +1,9 @@
-from sqlalchemy import create_engine, Column, Integer, String, Table, ForeignKey, Float, JSON, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Table, ForeignKey, JSON, DateTime
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 import datetime
+from typing import Any
 
-Base = declarative_base()
+Base: Any = declarative_base()
 
 # Association table for many-to-many relationship between files and tags
 file_tags = Table(

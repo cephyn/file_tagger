@@ -102,6 +102,34 @@ A Windows file management application that allows users to add custom tags to fi
 python main.py
 ```
 
+## Packaging and installation
+
+File Tagger is a local-first application. Runtime database, configuration,
+logs, and extraction cache files are stored under the per-user application
+data directory (override with `FILE_TAGGER_DATA_DIR` for testing or portable
+deployments). The application does not create or use Ollama models itself:
+Ollama model downloads and management remain an explicit local Ollama operation.
+
+Build the source wheel and source distribution:
+
+```powershell
+uv sync --locked --all-extras
+python -m build
+```
+
+Build the Windows PyInstaller bundle:
+
+```powershell
+uv run pyinstaller --clean --noconfirm packaging/file-tagger.spec
+```
+
+The diagnostics entry point can print resolved paths without initializing Qt
+or creating runtime directories:
+
+```powershell
+python -m file_tagger --print-paths
+```
+
 ## Configuration
 
 ### Initial Setup

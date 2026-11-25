@@ -1,5 +1,4 @@
 from PySide6.QtGui import QColor
-from PySide6.QtCore import Qt
 import os
 import subprocess
 import sys
