@@ -116,6 +116,9 @@ class ModernRuntime:
         self._indexing_service_generation = 0
         self._lock = threading.Lock()
         self._contextual_rag_lock = threading.Lock()
+        self._contextual_rag_condition = threading.Condition(
+            self._contextual_rag_lock
+        )
         self._contextual_rag_cache_limit = _CONTEXTUAL_RAG_CACHE_LIMIT
         self._contextual_rag_services: OrderedDict[
             str,
@@ -125,6 +128,12 @@ class ModernRuntime:
                 Any,
             ],
         ] = OrderedDict()
+        self._contextual_rag_epochs: dict[str, int] = {}
+        self._contextual_rag_active: dict[str, int] = {}
+        self._retired_contextual_rag: dict[
+            str,
+            list[tuple[str, RagService, Any]],
+        ] = {}
         self._unavailable_reason = unavailable_reason
         self._readiness_generation = 0
         self._model_overrides = self._load_model_overrides()
@@ -772,20 +781,18 @@ class ModernRuntime:
                 generation_profile.digest,
             )
         )
-        with self._contextual_rag_lock:
+        retired: list[tuple[str, RagService, Any]] = []
+        with self._contextual_rag_condition:
             cached = self._contextual_rag_services.get(checked_id)
             if cached is not None and cached[0] == key:
                 self._contextual_rag_services.move_to_end(checked_id)
                 return checked_id, cached[1]
             if cached is not None:
-                try:
-                    cached[2].close()
-                except Exception:
-                    pass
-                close_rag = getattr(cached[1], "close_session", None)
-                if callable(close_rag):
-                    close_rag(checked_id)
+                retired.append((checked_id, cached[1], cached[2]))
                 del self._contextual_rag_services[checked_id]
+                self._contextual_rag_epochs[checked_id] = (
+                    self._contextual_rag_epochs.get(checked_id, 0) + 1
+                )
 
             if self.session_factory is None:
                 raise ModernSearchUnavailable(self.unavailable_reason)
@@ -809,28 +816,126 @@ class ModernRuntime:
             self._contextual_rag_services[checked_id] = (key, rag, session)
             self._contextual_rag_services.move_to_end(checked_id)
             while len(self._contextual_rag_services) > self._contextual_rag_cache_limit:
-                evicted_id, evicted = self._contextual_rag_services.popitem(last=False)
+                evicted_id: str | None = None
+                evicted: tuple[str, RagService, Any] | None = None
+                for candidate_id, candidate in self._contextual_rag_services.items():
+                    if self._contextual_rag_active.get(candidate_id, 0) == 0:
+                        evicted_id = candidate_id
+                        evicted = (candidate_id, candidate[1], candidate[2])
+                        break
+                if evicted_id is not None:
+                    assert evicted is not None
+                    del self._contextual_rag_services[evicted_id]
+                    retired.append((evicted_id, evicted[1], evicted[2]))
+                    continue
+                self._contextual_rag_condition.wait(timeout=0.05)
+            if retired:
+                for retired_id, retired_rag, retired_session in retired:
+                    self._retired_contextual_rag.setdefault(
+                        retired_id,
+                        [],
+                    ).append((retired_id, retired_rag, retired_session))
+                    if self._contextual_rag_active.get(retired_id, 0) == 0:
+                        self._close_retired_contextual_rag(
+                            retired_id,
+                            self._contextual_rag_epochs.get(retired_id, 0),
+                        )
+        return checked_id, rag
+
+    def _begin_contextual_rag_use(
+        self,
+        conversation_id: str | None,
+        *,
+        profile: ModelProfile,
+        generation_profile: ModelProfile,
+    ) -> tuple[str, RagService, int]:
+        checked_id = conversation_id or "default"
+        with self._contextual_rag_condition:
+            self._contextual_rag_active[checked_id] = (
+                self._contextual_rag_active.get(checked_id, 0) + 1
+            )
+        try:
+            checked_id, rag = self._get_contextual_rag_service(
+                conversation_id,
+                profile=profile,
+                generation_profile=generation_profile,
+            )
+        except Exception:
+            with self._contextual_rag_condition:
+                active = self._contextual_rag_active.get(checked_id, 0)
+                if active <= 1:
+                    self._contextual_rag_active.pop(checked_id, None)
+                else:
+                    self._contextual_rag_active[checked_id] = active - 1
+                self._contextual_rag_condition.notify_all()
+            raise
+        with self._contextual_rag_condition:
+            epoch = self._contextual_rag_epochs.get(checked_id, 0)
+        return checked_id, rag, epoch
+
+    def _end_contextual_rag_use(self, session_id: str, epoch: int) -> None:
+        with self._contextual_rag_condition:
+            active = self._contextual_rag_active.get(session_id, 0)
+            if active <= 1:
+                self._contextual_rag_active.pop(session_id, None)
+            else:
+                self._contextual_rag_active[session_id] = active - 1
+            self._contextual_rag_condition.notify_all()
+            if self._contextual_rag_active.get(session_id, 0) == 0:
+                self._close_retired_contextual_rag(
+                    session_id,
+                    self._contextual_rag_epochs.get(session_id, 0),
+                )
+
+    def _close_retired_contextual_rag(
+        self,
+        session_id: str,
+        epoch: int,
+    ) -> None:
+        if (
+            epoch != self._contextual_rag_epochs.get(session_id, 0)
+            or self._contextual_rag_active.get(session_id, 0) != 0
+        ):
+            return
+        retired = self._retired_contextual_rag.pop(session_id, ())
+        for retired_id, rag, session in retired:
+            close_rag = getattr(rag, "close_session", None)
+            if callable(close_rag):
                 try:
-                    evicted[2].close()
+                    close_rag(retired_id)
                 except Exception:
                     pass
-                close_rag = getattr(evicted[1], "close_session", None)
-                if callable(close_rag):
-                    close_rag(evicted_id)
-            return checked_id, rag
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def close_contextual_session(self, session_id: str) -> None:
         checked_id = session_id or "default"
-        with self._contextual_rag_lock:
+        retired: list[tuple[str, RagService, Any]] = []
+        with self._contextual_rag_condition:
             cached = self._contextual_rag_services.pop(checked_id, None)
             if cached is not None:
+                retired.append((checked_id, cached[1], cached[2]))
+            self._contextual_rag_epochs[checked_id] = (
+                self._contextual_rag_epochs.get(checked_id, 0) + 1
+            )
+            epoch = self._contextual_rag_epochs[checked_id]
+            while self._contextual_rag_active.get(checked_id, 0) > 0:
+                self._contextual_rag_condition.wait(timeout=0.05)
+        if retired:
+            for retired_id, rag, session in retired:
+                close_rag = getattr(rag, "close_session", None)
+                if callable(close_rag):
+                    try:
+                        close_rag(retired_id)
+                    except Exception:
+                        pass
                 try:
-                    cached[2].close()
+                    session.close()
                 except Exception:
                     pass
-                close_rag = getattr(cached[1], "close_session", None)
-                if callable(close_rag):
-                    close_rag(checked_id)
+        self._close_retired_contextual_rag(checked_id, epoch)
 
     def get_session_answer(self, session_id: str) -> CitedAnswer | None:
         checked_id = session_id or "default"
@@ -881,18 +986,21 @@ class ModernRuntime:
                     f"({vector_ready.pending_files} file(s) pending)."
                 )
 
-        checked_id, rag = self._get_contextual_rag_service(
+        checked_id, rag, epoch = self._begin_contextual_rag_use(
             conversation_id,
             profile=profile,
             generation_profile=generation_profile,
         )
-        async for fragment in rag.answer_question_stream_async(
-            question,
-            markdown_context,
-            conversation_id=checked_id,
-            cancellation_check=cancellation_check,
-        ):
-            yield fragment
+        try:
+            async for fragment in rag.answer_question_stream_async(
+                question,
+                markdown_context,
+                conversation_id=checked_id,
+                cancellation_check=cancellation_check,
+            ):
+                yield fragment
+        finally:
+            self._end_contextual_rag_use(checked_id, epoch)
 
     def answer_contextual_question(
         self,
@@ -938,23 +1046,26 @@ class ModernRuntime:
                     f"({vector_ready.pending_files} file(s) pending)."
                 )
 
-        checked_id, rag = self._get_contextual_rag_service(
+        checked_id, rag, epoch = self._begin_contextual_rag_use(
             conversation_id,
             profile=profile,
             generation_profile=generation_profile,
         )
 
-        async def collect() -> CitedAnswer | None:
-            async for _fragment in rag.answer_question_stream_async(
-                question,
-                markdown_context,
-                conversation_id=checked_id,
-                cancellation_check=cancellation_check,
-            ):
-                pass
-            return rag.get_session_answer(checked_id)
+        try:
+            async def collect() -> CitedAnswer | None:
+                async for _fragment in rag.answer_question_stream_async(
+                    question,
+                    markdown_context,
+                    conversation_id=checked_id,
+                    cancellation_check=cancellation_check,
+                ):
+                    pass
+                return rag.get_session_answer(checked_id)
 
-        answer = asyncio.run(collect())
+            answer = asyncio.run(collect())
+        finally:
+            self._end_contextual_rag_use(checked_id, epoch)
         if answer is None:
             raise ModernSearchUnavailable("the contextual RAG answer could not be produced.")
         return answer

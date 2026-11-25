@@ -1180,6 +1180,77 @@ def test_modern_runtime_evicts_contextual_service_and_closes_session(
     assert len(closed) == 2
 
 
+def test_modern_runtime_active_stream_blocks_eviction_and_close(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import threading
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class FakeFactory:
+        def __call__(self):
+            return FakeSession()
+
+    class FakeSearch:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeRag:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def close_session(self, session_id: str) -> None:
+            del session_id
+
+    monkeypatch.setattr("file_tagger.modern_context.HybridSearch", FakeSearch)
+    monkeypatch.setattr("file_tagger.modern_context.RagService", FakeRag)
+
+    runtime = ModernRuntime(_paths(tmp_path, monkeypatch), FakeFactory())
+    runtime._contextual_rag_cache_limit = 1
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-active",
+        digest="sha256:embedding",
+        context_length=4096,
+        capabilities=("embedding",),
+    )
+    generation = ModelProfile(
+        role="generation",
+        model="generation-active",
+        digest="sha256:generation",
+        context_length=4096,
+        capabilities=("completion",),
+    )
+
+    conversation_id, _rag, epoch = runtime._begin_contextual_rag_use(
+        "conversation-1",
+        profile=profile,
+        generation_profile=generation,
+    )
+    entered = threading.Event()
+    entered.set()
+
+    eviction = threading.Thread(
+        target=runtime._begin_contextual_rag_use,
+        args=("conversation-2",),
+        kwargs={"profile": profile, "generation_profile": generation},
+    )
+    eviction.start()
+    entered.wait(1)
+    eviction.join(timeout=0.05)
+
+    assert eviction.is_alive()
+    assert "conversation-1" in runtime._contextual_rag_services
+
+    runtime._end_contextual_rag_use(conversation_id, epoch)
+    eviction.join(timeout=1)
+
+    assert not eviction.is_alive()
+
+
 def test_modern_runtime_reuses_contextual_rag_service_for_conversation(
     tmp_path,
     monkeypatch,

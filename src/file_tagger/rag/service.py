@@ -165,6 +165,8 @@ class RagService:
         self._session_states: dict[str, _SessionState] = {}
         self._session_locks: dict[str, threading.Lock] = {}
         self._session_registry_lock = threading.Lock()
+        self._session_epochs: dict[str, int] = {}
+        self._session_active: dict[str, int] = {}
 
     @property
     def evidence(self) -> tuple[SearchResult, ...]:
@@ -187,13 +189,26 @@ class RagService:
     def close_session(self, session_id: str) -> None:
         checked_session = _validate_session_identity(session_id, None)
         with self._session_registry_lock:
+            self._session_epochs[checked_session] = (
+                self._session_epochs.get(checked_session, 0) + 1
+            )
             self._session_states.pop(checked_session, None)
-            self._session_locks.pop(checked_session, None)
+            lock = self._session_locks.get(checked_session)
+        if lock is not None:
+            acquired = lock.acquire(timeout=2.0)
+            if acquired:
+                with self._session_registry_lock:
+                    self._session_states.pop(checked_session, None)
+                lock.release()
 
     def close_all_sessions(self) -> None:
         with self._session_registry_lock:
+            session_ids = set(self._session_locks) | set(self._session_states)
+            for session_id in session_ids:
+                self._session_epochs[session_id] = (
+                    self._session_epochs.get(session_id, 0) + 1
+                )
             self._session_states.clear()
-            self._session_locks.clear()
 
     def answer_question(
         self,
@@ -271,7 +286,7 @@ class RagService:
             else None
         )
 
-        async with self._session_guard(checked_session):
+        async with self._session_guard(checked_session) as epoch:
             with self._session_registry_lock:
                 previous_state = self._session_states.get(checked_session)
             profile = _embedding_profile(self._search, self._embedding_profile)
@@ -374,7 +389,8 @@ class RagService:
                 answer=answer,
             )
             with self._session_registry_lock:
-                self._session_states[checked_session] = updated
+                if epoch == self._session_epochs.get(checked_session, 0):
+                    self._session_states[checked_session] = updated
             return answer
 
     async def answer_question_stream_async(
@@ -424,7 +440,7 @@ class RagService:
             else None
         )
 
-        async with self._session_guard(checked_session):
+        async with self._session_guard(checked_session) as epoch:
             with self._session_registry_lock:
                 previous_state = self._session_states.get(checked_session)
             profile = _embedding_profile(self._search, self._embedding_profile)
@@ -538,12 +554,17 @@ class RagService:
                 answer=answer,
             )
             with self._session_registry_lock:
-                self._session_states[checked_session] = updated
+                if epoch == self._session_epochs.get(checked_session, 0):
+                    self._session_states[checked_session] = updated
 
     @asynccontextmanager
-    async def _session_guard(self, session_id: str) -> AsyncIterator[None]:
+    async def _session_guard(self, session_id: str) -> AsyncIterator[int]:
         with self._session_registry_lock:
             lock = self._session_locks.setdefault(session_id, threading.Lock())
+            epoch = self._session_epochs.get(session_id, 0)
+            self._session_active[session_id] = (
+                self._session_active.get(session_id, 0) + 1
+            )
         acquired = asyncio.create_task(asyncio.to_thread(lock.acquire))
         try:
             await asyncio.shield(acquired)
@@ -552,9 +573,15 @@ class RagService:
             lock.release()
             raise
         try:
-            yield
+            yield epoch
         finally:
             lock.release()
+            with self._session_registry_lock:
+                active = self._session_active.get(session_id, 0)
+                if active <= 1:
+                    self._session_active.pop(session_id, None)
+                else:
+                    self._session_active[session_id] = active - 1
 
     async def answer_plan_async(
         self,

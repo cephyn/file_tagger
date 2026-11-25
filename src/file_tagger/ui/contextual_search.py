@@ -352,6 +352,8 @@ class ContextualSearchDialog(QDialog):
         if self._worker is not None and self._worker.isRunning():
             self._worker.request_cancel()
             self._stop_worker(self._worker)
+        if self._worker is not None:
+            self._close_contextual_session()
         self.answer_output.clear()
         self.citations_list.clear()
         self.evidence_list.clear()
