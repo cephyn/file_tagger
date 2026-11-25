@@ -703,7 +703,7 @@ def _result_is_excluded(
             result.file_path,
             *result.tags,
             *(section.heading or "" for section in result.matched_sections),
-            *(section.snippet for section in result.matched_sections),
+            *(section.text for section in result.matched_sections),
         )
     )
     for exclusion in exclusions:
@@ -825,7 +825,7 @@ def _evidence_identity(evidence: Sequence[SearchResult]) -> str:
                 "path": result.file_path,
                 "chunk_id": result.chunk_id,
                 "text": [
-                    section.snippet for section in result.matched_sections
+                    section.text for section in result.matched_sections
                 ],
             }
             for result in evidence
@@ -1120,7 +1120,7 @@ def _expand_evidence(
                         "page_number": section.page_number,
                         "heading": section.heading,
                         "section": section.section,
-                        "text": section.snippet,
+                        "text": section.text,
                         "tags": result.tags,
                         "mime_type": result.mime_type,
                     },
@@ -1156,7 +1156,7 @@ def _coerce_evidence(
                         "page_number": item.page_number,
                         "heading": item.heading,
                         "section": item.section,
-                        "text": item.excerpt,
+                        "text": item.text,
                     },
                     source="hybrid",
                 )
@@ -1277,7 +1277,7 @@ def _evidence_payload(
                     "page_number": citation.page_number,
                     "heading": citation.heading,
                     "section": citation.section,
-                    "text": citation.excerpt,
+                    "text": citation.text,
                 }
             )
     return tuple(payload)

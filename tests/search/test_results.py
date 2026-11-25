@@ -147,7 +147,13 @@ def test_make_result_bounds_indexed_text_and_merges_duplicate_chunks() -> None:
 
     assert isinstance(result, SearchResult)
     assert len(result.summary) <= DEFAULT_SNIPPET_LENGTH
-    assert all(len(section.snippet) <= DEFAULT_SNIPPET_LENGTH for section in result.matched_sections)
+    assert all(
+        len(section.snippet) <= DEFAULT_SNIPPET_LENGTH
+        for section in result.matched_sections
+    )
+    assert result.matched_sections[0].text == text_value
+    assert result.citations[0].text == text_value
+    assert result.citations[0].excerpt == result.matched_sections[0].snippet
     assert [citation.chunk_id for citation in result.citations] == [
         "adventure-page-12"
     ]
@@ -224,6 +230,12 @@ def test_hybrid_search_hydrates_one_cited_result_per_file(
         assert {citation.chunk_id for citation in result.citations} == {
             "adventure-opening",
             "adventure-crossing",
+        }
+        assert {
+            citation.text for citation in result.citations
+        } == {
+            "The adventure starts with a map and a compass.",
+            "The adventure continues across the mountain pass.",
         }
         stored_ids = set(
             session.scalars(select(Chunk.stable_id))

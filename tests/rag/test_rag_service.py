@@ -517,6 +517,116 @@ def test_structured_claim_accepts_complete_middle_evidence_sentence() -> None:
     assert answer.claims[0].evidence_quote == quote
 
 
+def test_structured_claim_accepts_full_chunk_text_beyond_display_snippet() -> None:
+    quote = "The eastern gate remains closed."
+    full_text = f"{'Patrol notes remain unchanged. ' * 20}{quote}"
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\witness.md",
+                "stable_id": "full-chunk-evidence",
+                "page_number": 1,
+                "text": full_text,
+            },
+            source="hybrid",
+            snippet_length=80,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": quote,
+                "claims": [
+                    {
+                        "text": quote,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["full-chunk-evidence"],
+                    }
+                ],
+            }
+        )
+    )
+
+    answer = answer_question("What happened at the gate?", evidence, gateway=fake_model)
+
+    assert answer.citations[0].excerpt != quote
+    assert answer.citations[0].text == full_text
+    assert answer.claims[0].evidence_quote == quote
+    prompt = fake_model.chat_calls[0]["messages"][-1]["content"]
+    assert quote in prompt
+
+
+def test_structured_claim_rejects_quote_omitting_later_qualifier() -> None:
+    qualifier = "However, it was not approved for production use."
+    full_text = (
+        "The release was approved. "
+        f"{'The supporting records remain archived. ' * 10}"
+        f"{qualifier}"
+    )
+    quote = "The release was approved."
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\release.md",
+                "stable_id": "qualified-release",
+                "page_number": 1,
+                "text": full_text,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": quote,
+                "claims": [
+                    {
+                        "text": quote,
+                        "evidence_quote": quote,
+                        "chunk_ids": ["qualified-release"],
+                    }
+                ],
+            }
+        )
+    )
+
+    assert qualifier not in evidence[0].citations[0].excerpt
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("Was the release approved?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_requires_full_chunk_for_abbreviation_split() -> None:
+    full_text = "Smith et al. recorded the observation."
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\research.md",
+                "stable_id": "abbreviation-boundary",
+                "page_number": 1,
+                "text": full_text,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "Smith et al.",
+                "claims": [
+                    {
+                        "text": "Smith et al.",
+                        "evidence_quote": "Smith et al.",
+                        "chunk_ids": ["abbreviation-boundary"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("Who recorded the observation?", evidence, gateway=fake_model)
+
+
 def test_structured_claim_rejects_partial_neighboring_sentences() -> None:
     evidence = (
         make_result(

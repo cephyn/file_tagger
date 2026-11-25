@@ -16,6 +16,7 @@ class MatchedSection(DomainRecord):
     page_number: int = Field(gt=0)
     heading: str | None = None
     section: str | None = None
+    text: str = Field(min_length=1)
     snippet: str = Field(min_length=1)
 
 
@@ -26,6 +27,7 @@ class SearchCitation(DomainRecord):
     chunk_id: str = Field(min_length=1)
     heading: str | None = None
     section: str | None = None
+    text: str = Field(min_length=1)
     excerpt: str = Field(min_length=1)
 
     @property
@@ -87,16 +89,15 @@ def make_result(
         if chunk_id in seen_chunks:
             continue
         seen_chunks.add(chunk_id)
+        text = _required_text(item, "text", "snippet", "excerpt")
         sections.append(
             MatchedSection(
                 chunk_id=chunk_id,
                 page_number=_required_int(item, "page_number"),
                 heading=_optional_text(item, "heading"),
                 section=_optional_text(item, "section"),
-                snippet=bounded_snippet(
-                    _required_text(item, "text", "snippet", "excerpt"),
-                    snippet_length,
-                ),
+                text=text,
+                snippet=bounded_snippet(text, snippet_length),
             )
         )
 
@@ -205,6 +206,7 @@ def _result_from_sections(
             chunk_id=section.chunk_id,
             heading=section.heading,
             section=section.section,
+            text=section.text,
             excerpt=section.snippet,
         )
         for section in sections
@@ -361,7 +363,7 @@ def _result_order_key(
     tuple[str, ...],
     tuple[bool, str],
     bool,
-    tuple[tuple[str, int, tuple[bool, str], tuple[bool, str], str], ...],
+    tuple[tuple[str, int, tuple[bool, str], tuple[bool, str], str, str], ...],
 ]:
     return (
         result.rank,
@@ -382,12 +384,13 @@ def _result_order_key(
 
 def _section_order_key(
     section: MatchedSection,
-) -> tuple[str, int, tuple[bool, str], tuple[bool, str], str]:
+) -> tuple[str, int, tuple[bool, str], tuple[bool, str], str, str]:
     return (
         section.chunk_id,
         section.page_number,
         _optional_order_key(section.heading),
         _optional_order_key(section.section),
+        section.text,
         section.snippet,
     )
 

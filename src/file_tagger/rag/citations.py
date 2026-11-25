@@ -20,33 +20,112 @@ _SENTENCE_TERMINATORS = frozenset(".!?。！？．")
 _SENTENCE_CLOSERS = frozenset("\"'”’»›）〕］】」』)]}")
 _COMMON_ABBREVIATIONS = frozenset(
     {
+        "a.m",
+        "al",
         "approx",
+        "apr",
+        "art",
+        "aug",
         "ave",
         "capt",
+        "cf",
+        "ch",
         "col",
         "corp",
+        "dec",
         "dept",
         "dr",
         "e.g",
+        "ed",
+        "eds",
+        "eq",
+        "esp",
+        "est",
         "etc",
+        "feb",
         "fig",
         "gen",
         "gov",
         "i.e",
+        "ibid",
         "inc",
+        "jan",
         "jr",
+        "jul",
+        "jun",
         "ltd",
+        "mar",
+        "may",
         "mr",
         "mrs",
         "ms",
         "no",
+        "nov",
+        "oct",
+        "op. cit",
+        "p.m",
+        "para",
+        "pp",
         "prof",
         "rep",
+        "sec",
         "sen",
+        "sept",
         "sgt",
         "sr",
         "st",
+        "vol",
         "vs",
+    }
+)
+_QUALIFYING_SUFFIX_WORDS = frozenset(
+    {
+        "alleged",
+        "allegedly",
+        "although",
+        "apparently",
+        "but",
+        "cannot",
+        "conditional",
+        "conditionally",
+        "could",
+        "despite",
+        "except",
+        "however",
+        "if",
+        "limited",
+        "likely",
+        "may",
+        "maybe",
+        "might",
+        "neither",
+        "nevertheless",
+        "no",
+        "nonetheless",
+        "nor",
+        "not",
+        "only",
+        "otherwise",
+        "possibly",
+        "probably",
+        "provisional",
+        "provisionally",
+        "purportedly",
+        "rather",
+        "reported",
+        "reportedly",
+        "should",
+        "sometimes",
+        "subject",
+        "supposedly",
+        "tentative",
+        "though",
+        "uncertain",
+        "unless",
+        "unlikely",
+        "until",
+        "without",
+        "yet",
     }
 )
 
@@ -186,13 +265,13 @@ def parse_cited_answer(
         if not any(
             _quote_matches_complete_evidence_span(
                 raw_claim.evidence_quote,
-                citation.excerpt,
+                citation.text,
             )
             for citation in resolved
         ):
             raise UncitedAnswerError(
-                "The model answer evidence quote is not a complete normalized "
-                "evidence sentence or full-excerpt quoted span from its cited chunk."
+                "The model answer evidence quote is not a complete, unambiguous, "
+                "exact quoted span or the full cited chunk."
             )
         if not _claim_is_supported(raw_claim.text, raw_claim.evidence_quote):
             raise UncitedAnswerError(
@@ -299,14 +378,29 @@ def _claim_is_supported(claim: str, quote: str) -> bool:
     return bool(claim_words) and claim_words == quote_words
 
 
-def _quote_matches_complete_evidence_span(quote: str, excerpt: str) -> bool:
-    normalized_quote = _normalized_words(quote, strip_markers=False)
-    if not normalized_quote:
+def _quote_matches_complete_evidence_span(quote: str, evidence_text: str) -> bool:
+    exact_quote = quote.strip()
+    exact_evidence = evidence_text.strip()
+    if not exact_quote or not exact_evidence:
         return False
-    return any(
-        normalized_quote
-        == _normalized_words(span, strip_markers=False)
-        for span in _evidence_sentence_spans(excerpt)
+    if exact_quote == exact_evidence:
+        return True
+
+    matches: list[tuple[int, str]] = []
+    for span in _evidence_sentence_spans(exact_evidence):
+        start = exact_evidence.find(span)
+        while start >= 0:
+            if exact_quote == span:
+                matches.append((start, span))
+            start = exact_evidence.find(span, start + 1)
+    if len(matches) != 1:
+        return False
+
+    start, span = matches[0]
+    suffix = exact_evidence[start + len(span) :]
+    return not any(
+        word in _QUALIFYING_SUFFIX_WORDS
+        for word in _normalized_words(suffix, strip_markers=False)
     )
 
 
@@ -380,6 +474,8 @@ def _period_is_internal(text: str, index: int) -> bool:
 
 def _period_is_abbreviation(text: str, index: int) -> bool:
     prefix = text[:index]
+    if re.search(r"\bet\s+al$", prefix, flags=re.IGNORECASE):
+        return True
     match = re.search(r"([^\W\d_]+(?:\.[^\W\d_]+)*)$", prefix, flags=re.UNICODE)
     if match is None:
         return False
