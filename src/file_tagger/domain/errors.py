@@ -34,6 +34,10 @@ class StructuredOutputError(ModelIncompatibleError, ValueError):
     """Raised when a model cannot produce the requested structured output."""
 
 
+class UncitedAnswerError(StructuredOutputError):
+    """Raised when an answer cannot be tied to retrieved indexed evidence."""
+
+
 class ModelRecommendationError(FileTaggerError):
     """Raised when local hardware cannot support a required model role."""
 
