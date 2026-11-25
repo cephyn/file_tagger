@@ -41,7 +41,10 @@ def main(argv=None):
         print(f"data_dir={paths.data_dir}")
         print(f"config_dir={paths.config_dir}")
         print(f"logs_dir={paths.logs_dir}")
-        print(f"database={paths.database}")
+        print(f"modern_database={paths.database}")
+        print(f"legacy_database={paths.legacy_database}")
+        print(f"legacy_chroma={paths.legacy_chroma}")
+        print(f"config_file={paths.config_file}")
         return
 
     # Initialize logging first
