@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
@@ -30,6 +32,12 @@ from .persistence.vector_cleanup import delete_file_embeddings
 logger = logging.getLogger("ModernRuntime")
 SessionFactory: TypeAlias = sessionmaker[Session]
 TagData = tuple[str, str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexRequest:
+    file_path: str
+    generation: int
 
 
 class ModernIndexingUnavailable(RuntimeError):
@@ -78,7 +86,8 @@ class ModernRuntime:
         self.required_models: RequiredModels | None = None
         self._indexing_service: IndexingService | None = None
         self._readiness_thread: threading.Thread | None = None
-        self._index_queue: queue.Queue[str | Path] = queue.Queue()
+        self._index_queue: queue.Queue[_IndexRequest] = queue.Queue()
+        self._index_generations: dict[str, int] = {}
         self._index_worker: threading.Thread | None = None
         self._lock = threading.Lock()
         self._unavailable_reason = unavailable_reason
@@ -199,13 +208,18 @@ class ModernRuntime:
         return service.reindex(file_path)
 
     def index_file_async(self, file_path: str | Path) -> None:
+        canonical_path = _canonical_path(file_path)
         with self._lock:
             service = self._indexing_service
             reason = self.unavailable_reason
         if service is None:
             raise ModernIndexingUnavailable(reason)
         with self._lock:
-            self._index_queue.put(file_path)
+            request = _IndexRequest(
+                canonical_path,
+                self._index_generations.get(canonical_path, 0),
+            )
+            self._index_queue.put(request)
             if self._index_worker is None or not self._index_worker.is_alive():
                 self._index_worker = threading.Thread(
                     target=self._run_index_queue,
@@ -216,9 +230,11 @@ class ModernRuntime:
 
     def _run_index_queue(self) -> None:
         while True:
-            file_path = self._index_queue.get()
+            request = self._index_queue.get()
             try:
-                result = self.index_file(file_path)
+                result = self._index_request(request)
+                if result is None:
+                    continue
                 if result.status != "completed":
                     logger.warning(
                         "Modern indexing ended with status %s.",
@@ -231,6 +247,63 @@ class ModernRuntime:
                 )
             finally:
                 self._index_queue.task_done()
+
+    def _index_request(self, request: _IndexRequest) -> IndexingResult | None:
+        with self._lock:
+            if (
+                self._index_generations.get(request.file_path, 0)
+                != request.generation
+                or self.session_factory is None
+            ):
+                return None
+            service = self._indexing_service
+            if service is None:
+                return None
+            with self.session_factory() as session:
+                file_exists = session.scalar(
+                    select(File.id).where(
+                        File.canonical_path == request.file_path
+                    )
+                )
+            if file_exists is None:
+                return None
+            job_id = service.queue(request.file_path)
+        with self._lock:
+            if (
+                self._index_generations.get(request.file_path, 0)
+                != request.generation
+                or self.session_factory is None
+            ):
+                return None
+            with self.session_factory() as session:
+                file_still_exists = session.scalar(
+                    select(File.id).where(
+                        File.canonical_path == request.file_path
+                    )
+                )
+            if file_still_exists is None:
+                return None
+        return service.reindex(request.file_path, job_id=job_id)
+
+    def _invalidate_index_paths_locked(self, file_paths: Iterable[str]) -> None:
+        invalidated = set(file_paths)
+        for file_path in invalidated:
+            self._index_generations[file_path] = (
+                self._index_generations.get(file_path, 0) + 1
+            )
+        with self._index_queue.mutex:
+            pending = self._index_queue.queue
+            retained = deque(
+                request
+                for request in pending
+                if request.file_path not in invalidated
+            )
+            removed = len(pending) - len(retained)
+            if removed:
+                self._index_queue.queue = retained
+                self._index_queue.unfinished_tasks -= removed
+                if self._index_queue.unfinished_tasks == 0:
+                    self._index_queue.all_tasks_done.notify_all()
 
     def sync_tag(self, name: str, color: str | None) -> None:
         if self.session_factory is None:
@@ -296,15 +369,18 @@ class ModernRuntime:
     def delete_file(self, file_path: str) -> None:
         if self.session_factory is None:
             return
-        with self.session_factory.begin() as session:
-            file = session.scalar(
-                select(File).where(
-                    File.canonical_path == _canonical_path(file_path)
+        canonical_path = _canonical_path(file_path)
+        with self._lock:
+            self._invalidate_index_paths_locked((canonical_path,))
+            with self.session_factory.begin() as session:
+                file = session.scalar(
+                    select(File).where(
+                        File.canonical_path == canonical_path
+                    )
                 )
-            )
-            if file is not None:
-                delete_file_embeddings(session, (int(file.id),))
-                session.delete(file)
+                if file is not None:
+                    delete_file_embeddings(session, (int(file.id),))
+                    session.delete(file)
 
     def sync_legacy_changes(
         self,
@@ -319,71 +395,76 @@ class ModernRuntime:
             return
         files = [(path, list(tags)) for path, tags in file_paths]
         deleted_files = list(file_deletes)
+        deleted_paths = {_canonical_path(path) for path in deleted_files}
         deleted_tags = list(tag_deletes)
         updated_tags = list(tag_upserts)
-        with self.session_factory.begin() as session:
-            files_to_delete: dict[int, File] = {}
-            for path in deleted_files:
-                file = session.scalar(
-                    select(File).where(
-                        File.canonical_path == _canonical_path(path)
+        with self._lock:
+            self._invalidate_index_paths_locked(deleted_paths)
+            with self.session_factory.begin() as session:
+                files_to_delete: dict[int, File] = {}
+                for canonical_path in deleted_paths:
+                    file = session.scalar(
+                        select(File).where(
+                            File.canonical_path == canonical_path
+                        )
                     )
-                )
-                if file is not None:
-                    files_to_delete[int(file.id)] = file
-            delete_file_embeddings(session, files_to_delete)
-            for file in files_to_delete.values():
-                session.delete(file)
-            for name in deleted_tags:
-                tag = session.scalar(select(Tag).where(Tag.name == name))
-                if tag is not None:
-                    session.delete(tag)
-            for name, color in updated_tags:
-                tag = session.scalar(select(Tag).where(Tag.name == name))
-                if tag is None:
-                    tag = Tag(name=name, color=color or "#808080")
-                    session.add(tag)
-                else:
-                    tag.color = color or "#808080"
-            session.flush()
-
-            for path, tags in files:
-                canonical_path = _canonical_path(path)
-                file = session.scalar(
-                    select(File).where(File.canonical_path == canonical_path)
-                )
-                if file is None:
-                    file = File(
-                        canonical_path=canonical_path,
-                        indexing_state="not_indexed",
-                    )
-                    session.add(file)
-                    session.flush()
-
-                selected: dict[str, Tag] = {}
-                for name, color in tags:
+                    if file is not None:
+                        files_to_delete[int(file.id)] = file
+                delete_file_embeddings(session, files_to_delete)
+                for file in files_to_delete.values():
+                    session.delete(file)
+                for name in deleted_tags:
+                    tag = session.scalar(select(Tag).where(Tag.name == name))
+                    if tag is not None:
+                        session.delete(tag)
+                for name, color in updated_tags:
                     tag = session.scalar(select(Tag).where(Tag.name == name))
                     if tag is None:
                         tag = Tag(name=name, color=color or "#808080")
                         session.add(tag)
-                        session.flush()
                     else:
                         tag.color = color or "#808080"
-                    selected[name] = tag
+                session.flush()
 
-                associations = {
-                    association.tag_id: association
-                    for association in session.scalars(
-                        select(FileTag).where(FileTag.file_id == file.id)
+                for path, tags in files:
+                    canonical_path = _canonical_path(path)
+                    file = session.scalar(
+                        select(File).where(File.canonical_path == canonical_path)
                     )
-                }
-                selected_ids = {int(tag.id) for tag in selected.values()}
-                for tag_id, association in associations.items():
-                    if tag_id not in selected_ids:
-                        session.delete(association)
-                for tag in selected.values():
-                    if int(tag.id) not in associations:
-                        session.add(FileTag(file_id=int(file.id), tag_id=int(tag.id)))
+                    if file is None:
+                        file = File(
+                            canonical_path=canonical_path,
+                            indexing_state="not_indexed",
+                        )
+                        session.add(file)
+                        session.flush()
+
+                    selected: dict[str, Tag] = {}
+                    for name, color in tags:
+                        tag = session.scalar(select(Tag).where(Tag.name == name))
+                        if tag is None:
+                            tag = Tag(name=name, color=color or "#808080")
+                            session.add(tag)
+                            session.flush()
+                        else:
+                            tag.color = color or "#808080"
+                        selected[name] = tag
+
+                    associations = {
+                        association.tag_id: association
+                        for association in session.scalars(
+                            select(FileTag).where(FileTag.file_id == file.id)
+                        )
+                    }
+                    selected_ids = {int(tag.id) for tag in selected.values()}
+                    for tag_id, association in associations.items():
+                        if tag_id not in selected_ids:
+                            session.delete(association)
+                    for tag in selected.values():
+                        if int(tag.id) not in associations:
+                            session.add(
+                                FileTag(file_id=int(file.id), tag_id=int(tag.id))
+                            )
 
 
 def _required_models(recommendation: ModelRecommendation) -> RequiredModels:

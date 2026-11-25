@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..domain.errors import DatabaseExtensionError
+from ..persistence.vector_cleanup import purge_orphaned_embeddings
 
 BUSY_TIMEOUT_MS = 5_000
 
@@ -83,11 +84,14 @@ def _verify_search_extensions(engine: Engine) -> None:
 def create_session_factory(database_path: Path) -> sessionmaker[Session]:
     engine = create_database_engine(database_path)
     _verify_search_extensions(engine)
-    return sessionmaker(
+    session_factory = sessionmaker(
         bind=engine,
         expire_on_commit=False,
         autoflush=False,
     )
+    with session_factory.begin() as session:
+        purge_orphaned_embeddings(session)
+    return session_factory
 
 
 def upgrade_database(database_path: Path) -> None:

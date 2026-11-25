@@ -6,6 +6,7 @@ import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
+from threading import Event
 
 from sqlalchemy import select
 import pytest
@@ -406,25 +407,138 @@ def test_runtime_indexes_queued_files_through_one_worker(
         "password",
         start_readiness=False,
     )
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.txt"
+    first.write_text("one", encoding="utf-8")
+    second.write_text("two", encoding="utf-8")
+    runtime.sync_file(str(first), ())
+    runtime.sync_file(str(second), ())
     calls: list[str] = []
     worker_ids: set[int] = set()
-    runtime._indexing_service = object()
-    monkeypatch.setattr(
-        runtime,
-        "index_file",
-        lambda path: (
-            calls.append(str(path)),
-            worker_ids.add(threading.get_ident()),
-            SimpleNamespace(status="completed"),
-        )[-1],
-    )
 
-    runtime.index_file_async("one.txt")
-    runtime.index_file_async("two.txt")
+    class RecordingService:
+        def __init__(self) -> None:
+            self._next_job_id = 1
+
+        def queue(self, path: str) -> int:
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            return job_id
+
+        def reindex(self, path: str, *, job_id: int | None = None):
+            del job_id
+            calls.append(path)
+            worker_ids.add(threading.get_ident())
+            return SimpleNamespace(status="completed")
+
+    runtime._indexing_service = RecordingService()
+
+    runtime.index_file_async(first)
+    runtime.index_file_async(second)
     runtime._index_queue.join()
 
-    assert calls == ["one.txt", "two.txt"]
+    assert calls == [str(first.resolve()), str(second.resolve())]
     assert len(worker_ids) == 1
+
+
+@pytest.mark.parametrize("deletion_method", ("delete_file", "sync_legacy_changes"))
+def test_runtime_removes_pending_queue_entry_when_file_is_deleted(
+    tmp_path, monkeypatch, deletion_method: str
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = initialize_modern_runtime(
+        paths,
+        ReloadableConfig(paths),
+        "password",
+        start_readiness=False,
+    )
+    first = tmp_path / "first.txt"
+    deleted = tmp_path / "deleted.txt"
+    first.write_text("first", encoding="utf-8")
+    deleted.write_text("deleted", encoding="utf-8")
+    runtime.sync_file(str(first), ())
+    runtime.sync_file(str(deleted), ())
+    first_started = Event()
+    release_first = Event()
+    calls: list[str] = []
+
+    class BlockingService:
+        def __init__(self) -> None:
+            self._next_job_id = 1
+
+        def queue(self, path: str) -> int:
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            return job_id
+
+        def reindex(self, path: str, *, job_id: int | None = None):
+            del job_id
+            calls.append(str(path))
+            if Path(path).resolve() == first.resolve():
+                first_started.set()
+                assert release_first.wait(5)
+            return SimpleNamespace(status="completed")
+
+    runtime._indexing_service = BlockingService()
+
+    runtime.index_file_async(first)
+    assert first_started.wait(5)
+    runtime.index_file_async(deleted)
+    if deletion_method == "delete_file":
+        runtime.delete_file(str(deleted))
+    else:
+        runtime.sync_legacy_changes(file_deletes=(str(deleted),))
+    release_first.set()
+    runtime._index_queue.join()
+
+    assert calls == [str(first.resolve())]
+    assert runtime.session_factory is not None
+    with runtime.session_factory() as session:
+        assert session.scalar(
+            select(File).where(File.canonical_path == str(deleted.resolve()))
+        ) is None
+
+
+def test_runtime_deletion_during_worker_does_not_resurrect_file(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = initialize_modern_runtime(
+        paths,
+        ReloadableConfig(paths),
+        "password",
+        start_readiness=False,
+    )
+    source = tmp_path / "racing.txt"
+    source.write_text("source", encoding="utf-8")
+    runtime.sync_file(str(source), ())
+    worker_started = Event()
+    release_worker = Event()
+
+    class QueueRaceService:
+        def queue(self, path: str) -> int:
+            return 1
+
+        def reindex(self, path: str, *, job_id: int | None = None):
+            worker_started.set()
+            assert release_worker.wait(5)
+            if job_id is None:
+                runtime.sync_file(path, ())
+            return SimpleNamespace(status="completed")
+
+    runtime._indexing_service = QueueRaceService()
+
+    runtime.index_file_async(source)
+    assert worker_started.wait(5)
+    runtime.delete_file(str(source))
+    release_worker.set()
+    runtime._index_queue.join()
+
+    assert runtime.session_factory is not None
+    with runtime.session_factory() as session:
+        assert session.scalar(
+            select(File).where(File.canonical_path == str(source.resolve()))
+        ) is None
 
 
 def test_legacy_commit_failure_does_not_touch_modern_database(monkeypatch) -> None:
