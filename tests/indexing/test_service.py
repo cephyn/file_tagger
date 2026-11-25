@@ -155,6 +155,73 @@ def extraction(path: Path, *, marker: str, file_hash: str) -> ExtractedDocument:
     )
 
 
+def test_repository_restores_latest_cancelled_resumable_job(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "resume.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    repository = IndexingRepository(create_session_factory(database))
+
+    failed_id = repository.queue(source)
+    failed_owner = repository.begin(failed_id)
+    assert failed_owner.lease_token is not None
+    repository.fail(
+        failed_id,
+        {"code": "test_failed", "summary": "failed"},
+        lease_token=failed_owner.lease_token,
+    )
+
+    cancelled_id = repository.queue(source)
+    repository.begin(cancelled_id)
+    repository.request_cancellation(cancelled_id)
+
+    restored = repository.latest_resumable_job()
+
+    assert restored is not None
+    assert restored.id == cancelled_id
+    assert restored.status == "running"
+    assert restored.failure == {
+        "code": "cancel_requested",
+        "summary": "Cancellation was requested; resume to continue this job.",
+    }
+
+
+def test_new_service_resumes_persisted_cancelled_running_job(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "cancelled-resume.sqlite3"
+    source = tmp_path / "guide.md"
+    source.write_text("source", encoding="utf-8")
+    upgrade_database(database)
+    repository = IndexingRepository(create_session_factory(database))
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=1_000,
+        dimensions=256,
+    )
+    cancelled_id = repository.queue(source)
+    repository.begin(cancelled_id)
+    repository.request_cancellation(cancelled_id)
+    replacement = IndexingService(
+        repository,
+        extractor=MutableExtractor(
+            extraction(source, marker="resumed", file_hash="unused")
+        ),
+        embedding_gateway=FixedGateway(),
+        embedding_profile=profile,
+        recover_on_startup=False,
+    )
+
+    result = replacement.resume(cancelled_id)
+
+    assert result.status == "completed"
+    assert result.revision == 1
+
+
 def test_identical_files_receive_distinct_stable_chunk_ids(tmp_path: Path) -> None:
     database = tmp_path / "identical-files.sqlite3"
     first = tmp_path / "first.md"

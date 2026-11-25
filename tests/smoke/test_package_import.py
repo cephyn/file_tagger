@@ -30,7 +30,7 @@ def test_search_chat_control_stays_disabled_after_results(
     source.write_text("indexed evidence", encoding="utf-8")
 
     class Search:
-        def search(self, *args, **kwargs):
+        def search_content(self, *args, **kwargs):
             return [
                 {
                     "path": str(source),
@@ -42,7 +42,7 @@ def test_search_chat_control_stays_disabled_after_results(
 
     manager = FileTagManager.__new__(FileTagManager)
     QMainWindow.__init__(manager)
-    manager.vector_search = Search()
+    manager.modern_runtime = Search()
     tab = manager.create_rag_search_tab()
     qtbot.addWidget(tab)
     manager.query_input.setText("evidence")

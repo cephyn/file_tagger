@@ -49,7 +49,7 @@ from .ui.ollama_settings import OllamaSettingsDialog
 from .migration.legacy_chroma import cleanup_legacy_chroma, inspect_legacy_chroma
 from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
-from .modern_context import ModernIndexingUnavailable
+from .modern_context import ModernIndexingUnavailable, ModernSearchUnavailable
 
 
 class HTMLDelegate(QStyledItemDelegate):
@@ -367,6 +367,15 @@ class FileTagManager(QMainWindow):
         )
         self.logger.debug("Stack trace at close event:")
         self.logger.debug("".join(traceback.format_stack()))
+
+        indexing_status = getattr(self, "indexing_status", None)
+        shutdown = getattr(indexing_status, "shutdown", None)
+        if callable(shutdown) and not shutdown():
+            self.logger.warning(
+                "Window close deferred because modern indexing is still stopping."
+            )
+            event.ignore()
+            return
 
         # Call parent class method to proceed with normal closing
         super().closeEvent(event)
@@ -1313,19 +1322,22 @@ class FileTagManager(QMainWindow):
 
         # Perform search
         try:
-            vector_search = self.vector_search
-            if vector_search is None:
-                from .vector_search import VectorSearch
-
-                legacy_search = cast(Any, VectorSearch)
-                vector_search = legacy_search(self.db_session, self.config)
-                self.vector_search = vector_search
-            results = vector_search.search(
+            runtime = getattr(self, "modern_runtime", None)
+            search_content = getattr(runtime, "search_content", None)
+            if runtime is None or not callable(search_content):
+                raise ModernSearchUnavailable(
+                    "the modern runtime is not initialized."
+                )
+            modern_results = search_content(
                 query,
-                tag_filter=tag_filters,
+                tags=tag_filters,
                 use_and=self.rag_and_radio.isChecked(),
                 limit=20,
             )
+            results = [
+                self._modern_search_result(result)
+                for result in modern_results
+            ]
 
             # Display results
             self.rag_search_results.clear()
@@ -1461,11 +1473,37 @@ class FileTagManager(QMainWindow):
                         # Add to results list
                         self.rag_search_results.addItem(snippet_item)
 
+        except ModernSearchUnavailable as e:
+            self.rag_search_results.clear()
+            QMessageBox.warning(
+                self,
+                "Modern content search unavailable",
+                f"Modern content search is unavailable: {e}",
+            )
+            self.chat_results_btn.setEnabled(False)
+            self.current_search_results = []
+            self.result_document_items = {}
         except Exception as e:
+            self.rag_search_results.clear()
             QMessageBox.warning(self, "Error", f"Search failed: {str(e)}")
             self.chat_results_btn.setEnabled(False)
             self.current_search_results = []
             self.result_document_items = {}
+
+    @staticmethod
+    def _modern_search_result(result: Any) -> dict[str, Any]:
+        if isinstance(result, dict):
+            return dict(result)
+        path = str(getattr(result, "path", getattr(result, "file_path", "")))
+        if not path:
+            raise ValueError("A modern search result did not contain a file path.")
+        return {
+            "path": path,
+            "score": float(getattr(result, "score", 0.0)),
+            "summary": str(getattr(result, "summary", path)),
+            "snippets": list(getattr(result, "snippets", ())),
+            "tags": list(getattr(result, "tags", ())),
+        }
 
     def reindex_files(self):
         """Queue all known files through the resumable modern indexing service."""

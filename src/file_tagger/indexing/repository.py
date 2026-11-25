@@ -267,6 +267,24 @@ class IndexingRepository:
                 )
             )
 
+    def latest_resumable_job(self) -> JobState | None:
+        with self._session_factory() as session:
+            jobs = session.scalars(
+                select(IndexJob)
+                .where(
+                    IndexJob.file_id.is_not(None),
+                    IndexJob.status.in_(("queued", "failed", "pending", "running")),
+                )
+                .order_by(IndexJob.updated_at.desc(), IndexJob.id.desc())
+            )
+            for job in jobs:
+                if job.status != "running" or (
+                    job.failure
+                    and job.failure.get("code") == "cancel_requested"
+                ):
+                    return self._state(session, job)
+        return None
+
     def heartbeat(self, job_id: int, *, lease_token: str) -> JobState:
         with self._session_factory.begin() as session:
             job = self._owned_job(session, job_id, lease_token)
@@ -363,6 +381,27 @@ class IndexingRepository:
                 "code": "cancel_requested",
                 "summary": "Cancellation was requested; resume to continue this job.",
             }
+            session.flush()
+            return self._state(session, job)
+
+    def requeue_cancelled(self, job_id: int) -> JobState:
+        with self._session_factory.begin() as session:
+            job = self._job(session, job_id)
+            if (
+                job.status != "running"
+                or not job.failure
+                or job.failure.get("code") != "cancel_requested"
+            ):
+                raise IndexTransactionError(
+                    "The indexing job does not have a cancellable lease."
+                )
+            job.status = "queued"
+            job.lease_token = None
+            job.lease_expires_at = None
+            job.failure = None
+            job.completed_at = None
+            if job.file is not None:
+                job.file.indexing_state = "queued"
             session.flush()
             return self._state(session, job)
 

@@ -31,6 +31,10 @@ from .ollama.model_recommender import ModelRecommendation, recommend_models
 from .ollama.readiness import OllamaReadinessService, ReadinessReport, RequiredModels
 from .persistence.models import File, FileTag, Tag
 from .persistence.vector_cleanup import delete_file_embeddings
+from .rag.planner import SearchPlan
+from .rag.service import execute_search_plan
+from .search.hybrid import HybridSearch
+from .search.results import SearchResult, merge_results
 
 
 logger = logging.getLogger("ModernRuntime")
@@ -47,6 +51,10 @@ class _IndexRequest:
 
 class ModernIndexingUnavailable(RuntimeError):
     """Raised when a modern indexing profile has not become available."""
+
+
+class ModernSearchUnavailable(RuntimeError):
+    """Raised when modern content search has not become available."""
 
 
 class StartupConfig(Protocol):
@@ -90,6 +98,12 @@ class ModernRuntime:
         self.readiness: ReadinessReport | None = None
         self.required_models: RequiredModels | None = None
         self._indexing_service: IndexingService | None = None
+        self._indexing_repository = (
+            IndexingRepository(session_factory)
+            if session_factory is not None
+            else None
+        )
+        self._embedding_gateway: Any | None = None
         self._readiness_thread: threading.Thread | None = None
         self._index_queue: queue.Queue[_IndexRequest] = queue.Queue()
         self._index_generations: dict[str, int] = {}
@@ -235,6 +249,7 @@ class ModernRuntime:
             self._model_overrides = updated
             self.required_models = selected
             self._indexing_service = None
+            self._embedding_gateway = None
         return self.start_readiness()
 
     def _initialize_readiness(
@@ -278,11 +293,13 @@ class ModernRuntime:
             ):
                 embedding_profile = None
             indexing_service = None
+            embedding_gateway = None
             if embedding_profile is not None and self.session_factory is not None:
+                embedding_gateway = _FreshOllamaEmbeddingGateway()
                 indexing_service = IndexingService(
                     IndexingRepository(self.session_factory),
                     DoclingAdapter(),
-                    embedding_gateway=_FreshOllamaEmbeddingGateway(),
+                    embedding_gateway=embedding_gateway,
                     embedding_profile=embedding_profile,
                 )
             with self._lock:
@@ -290,6 +307,7 @@ class ModernRuntime:
                     self.required_models = required
                     self.readiness = report
                     self._indexing_service = indexing_service
+                    self._embedding_gateway = embedding_gateway
                     self._unavailable_reason = None
                 else:
                     report = None
@@ -381,12 +399,103 @@ class ModernRuntime:
             return await OllamaReadinessService(gateway, session=session).check(required)
 
     def index_file(self, file_path: str | Path) -> IndexingResult:
+        service = self._require_indexing_service()
+        return service.reindex(file_path)
+
+    def queue(self, file_path: str | Path) -> int:
+        return self._require_indexing_service().queue(file_path)
+
+    def resume(
+        self,
+        job_id: int,
+        *,
+        cancellation_check: Callable[[], bool] | None = None,
+    ) -> IndexingResult:
+        return self._require_indexing_service().resume(
+            job_id,
+            cancellation_check=cancellation_check,
+        )
+
+    def cancel(self, job_id: int) -> IndexingResult:
+        return self._require_indexing_service().cancel(job_id)
+
+    def state(self, job_id: int) -> IndexingResult:
+        service = self._indexing_service
+        if service is not None:
+            return service.state(job_id)
+        repository = self._indexing_repository
+        if repository is None:
+            raise ModernIndexingUnavailable("The modern database is unavailable.")
+        return IndexingResult.from_state(repository.state(job_id))
+
+    def latest_resumable_job(self) -> IndexingResult | None:
+        repository = self._indexing_repository
+        if repository is None:
+            return None
+        state = repository.latest_resumable_job()
+        return IndexingResult.from_state(state) if state is not None else None
+
+    def _require_indexing_service(self) -> IndexingService:
         with self._lock:
             service = self._indexing_service
-            reason = self.unavailable_reason
+        reason = self.unavailable_reason
         if service is None:
             raise ModernIndexingUnavailable(reason)
-        return service.reindex(file_path)
+        return service
+
+    def search_content(
+        self,
+        query: str,
+        *,
+        tags: Iterable[str] = (),
+        use_and: bool = True,
+        limit: int = 20,
+    ) -> tuple[SearchResult, ...]:
+        if not isinstance(query, str) or not query.strip():
+            return ()
+        with self._lock:
+            gateway = self._embedding_gateway
+            factory = self.session_factory
+        profile = self.embedding_profile
+        if profile is None or gateway is None or factory is None:
+            raise ModernSearchUnavailable(self.unavailable_reason)
+
+        selected_tags = tuple(dict.fromkeys(tag.strip() for tag in tags if tag.strip()))
+        tag_groups = (
+            (selected_tags,)
+            if use_and or not selected_tags
+            else tuple((tag,) for tag in selected_tags)
+        )
+        session = factory()
+        try:
+            search = HybridSearch(session, embedding_profile=profile)
+            matches: list[SearchResult] = []
+            per_query_limit = max(limit, 20)
+            for tag_group in tag_groups:
+                plan = SearchPlan(
+                    question=query,
+                    intent_names=("content_search",),
+                    exact_terms=(query,),
+                    paraphrase_queries=(query,),
+                    filters=tuple(f"tag:{tag}" for tag in tag_group),
+                    evidence_categories=("document_content",),
+                )
+                matches.extend(
+                    execute_search_plan(
+                        plan,
+                        search,
+                        embedding_gateway=gateway,
+                        embedding_profile=profile,
+                        model_digest=profile.digest,
+                        index_version=profile.default_index_version,
+                        per_query_limit=per_query_limit,
+                        limit=limit,
+                        max_sections_per_file=1,
+                    )
+                )
+            return merge_results(matches, limit=limit)
+        finally:
+            session.close()
 
     def index_file_async(self, file_path: str | Path) -> None:
         canonical_path = _canonical_path(file_path)

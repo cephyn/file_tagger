@@ -18,6 +18,7 @@ from file_tagger.indexing.repository import IndexingRepository
 from file_tagger.indexing.service import IndexingService
 from file_tagger.modern_context import (
     ModernIndexingUnavailable,
+    ModernSearchUnavailable,
     ModernRuntime,
     initialize_modern_runtime,
 )
@@ -1021,6 +1022,184 @@ def test_runtime_does_not_expose_blocked_embedding_profile(
     )
 
     assert runtime.embedding_profile is None
+
+
+def test_modern_runtime_search_uses_active_profile_and_embedding_gateway(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    session = SimpleNamespace(close=lambda: None)
+
+    class Factory:
+        def __call__(self):
+            return session
+
+    runtime = ModernRuntime(paths, Factory())  # type: ignore[arg-type]
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-active",
+        digest="embedding-active-digest",
+        context_length=8192,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    selected = RequiredModels(
+        embedding=profile.model,
+        decision="decision-active",
+        generation="generation-active",
+    )
+    runtime.required_models = selected
+    runtime.readiness = ReadinessReport(
+        ready=True,
+        profiles=(profile,),
+        selected_models=selected,
+    )
+    gateway = object()
+    runtime._embedding_gateway = gateway
+    calls: list[tuple[Any, ...]] = []
+    expected = (SimpleNamespace(path="C:\\library\\guide.md"),)
+
+    class FakeHybridSearch:
+        def __init__(self, selected_session, *, embedding_profile):
+            calls.append(("hybrid", selected_session, embedding_profile))
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.HybridSearch",
+        FakeHybridSearch,
+    )
+
+    def execute(
+        plan,
+        search,
+        *,
+        embedding_gateway,
+        embedding_profile,
+        model_digest,
+        index_version,
+        per_query_limit,
+        limit,
+        max_sections_per_file,
+    ):
+        calls.append(
+            (
+                "execute",
+                plan,
+                search,
+                embedding_gateway,
+                embedding_profile,
+                model_digest,
+                index_version,
+                per_query_limit,
+                limit,
+                max_sections_per_file,
+            )
+        )
+        return expected
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.execute_search_plan",
+        execute,
+    )
+    monkeypatch.setattr(
+        "file_tagger.modern_context.merge_results",
+        lambda values, *, limit: tuple(values),
+    )
+
+    results = runtime.search_content(
+        "query",
+        tags=("research",),
+        use_and=True,
+        limit=7,
+    )
+
+    assert results == expected
+    assert calls[0] == ("hybrid", session, profile)
+    assert calls[1][3:5] == (gateway, profile)
+    assert calls[1][5:7] == (
+        profile.digest,
+        profile.default_index_version,
+    )
+
+
+def test_modern_runtime_search_reports_unavailable_without_active_profile(
+    tmp_path, monkeypatch
+) -> None:
+    runtime = ModernRuntime(_paths(tmp_path, monkeypatch), object())  # type: ignore[arg-type]
+
+    with pytest.raises(ModernSearchUnavailable):
+        runtime.search_content("query")
+
+
+def test_manager_content_search_never_constructs_legacy_vector_search(
+    qtbot, monkeypatch, tmp_path
+) -> None:
+    manager_class = _manager_class(monkeypatch)
+    manager = manager_class.__new__(manager_class)
+    file_tag_manager = sys.modules["file_tagger.file_tag_manager"]
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    source = tmp_path / "search-fixture.txt"
+    source.write_text("modern", encoding="utf-8")
+    calls: list[tuple[str, tuple[str, ...], bool, int]] = []
+
+    class Runtime:
+        def search_content(self, query, *, tags=(), use_and=True, limit=20):
+            calls.append((query, tuple(tags), use_and, limit))
+            return (
+                {
+                    "path": str(source),
+                    "score": 0.9,
+                    "summary": "modern result",
+                    "snippets": ["modern"],
+                    "tags": [],
+                },
+            )
+
+    manager.modern_runtime = Runtime()
+    manager.vector_search = SimpleNamespace(
+        search=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy VectorSearch must not be used")
+        )
+    )
+    tab = manager.create_rag_search_tab()
+    qtbot.addWidget(tab)
+    manager.query_input.setText("modern")
+
+    try:
+        manager.search_by_content()
+    finally:
+        source.unlink(missing_ok=True)
+
+    assert calls == [("modern", (), True, 20)]
+    assert manager.current_search_results[0]["summary"] == "modern result"
+    assert manager.rag_search_results.count() > 0
+
+
+def test_manager_content_search_reports_modern_unavailable(
+    qtbot, monkeypatch
+) -> None:
+    from file_tagger.file_tag_manager import FileTagManager
+
+    manager = FileTagManager.__new__(FileTagManager)
+    from PySide6.QtWidgets import QMainWindow
+
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    warnings: list[str] = []
+    tab = manager.create_rag_search_tab()
+    qtbot.addWidget(tab)
+    manager.modern_runtime = None
+    manager.query_input.setText("modern")
+    monkeypatch.setattr(
+        "file_tagger.file_tag_manager.QMessageBox.warning",
+        lambda parent, title, message: warnings.append(message),
+    )
+
+    manager.search_by_content()
+
+    assert warnings
+    assert "unavailable" in warnings[0].lower()
+    assert manager.current_search_results == []
 
 
 def test_runtime_readiness_completion_ignores_stale_overlapping_result(

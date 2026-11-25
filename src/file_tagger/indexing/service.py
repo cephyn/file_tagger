@@ -118,9 +118,18 @@ class IndexingService:
             state = self._repository.begin(job_id)
         except IndexTransactionError:
             current = self._repository.state(job_id)
-            if current.status in {"completed", "running"}:
+            if current.status == "completed":
                 return IndexingResult.from_state(current)
-            raise
+            if current.status == "running":
+                if (
+                    current.failure is None
+                    or current.failure.get("code") != "cancel_requested"
+                ):
+                    return IndexingResult.from_state(current)
+                self._repository.requeue_cancelled(job_id)
+                state = self._repository.begin(job_id)
+            else:
+                raise
         lease_token = state.lease_token
         if lease_token is None:
             raise IndexTransactionError("The indexing job claim has no lease token.")
@@ -307,6 +316,10 @@ class IndexingService:
 
     def state(self, job_id: int) -> IndexingResult:
         return IndexingResult.from_state(self._repository.state(job_id))
+
+    def latest_resumable_job(self) -> IndexingResult | None:
+        state = self._repository.latest_resumable_job()
+        return IndexingResult.from_state(state) if state is not None else None
 
     def recover_abandoned(self) -> tuple[IndexingResult, ...]:
         return tuple(self.resume(job_id) for job_id in self._repository.expired_job_ids())

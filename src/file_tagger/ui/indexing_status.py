@@ -72,8 +72,10 @@ class IndexingStatus(QWidget):
         self._pending: deque[str] = deque()
         self._active_path = ""
         self._active_service: Any = service
+        self._worker_generation = 0
         self._result_handled = False
         self._completed = False
+        self._closing = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -106,6 +108,7 @@ class IndexingStatus(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._refresh_progress)
+        self._restore_resumable_job()
 
     @property
     def previous_revision_available(self) -> bool:
@@ -116,6 +119,10 @@ class IndexingStatus(QWidget):
         return indexing_service if indexing_service is not None else self.service
 
     def start(self, file_path: str | Path) -> int | None:
+        if self._closing:
+            raise ModernIndexingUnavailable(
+                "the indexing status widget is shutting down."
+            )
         path = str(Path(file_path)) if not isinstance(file_path, str) else file_path
         if self._worker is not None and self._worker.isRunning():
             self._pending.append(path)
@@ -155,6 +162,13 @@ class IndexingStatus(QWidget):
     def _run_job(self, job_id: int | None) -> None:
         if self._worker is not None and self._worker.isRunning():
             raise RuntimeError("An indexing job is already running.")
+        if self._closing:
+            raise ModernIndexingUnavailable(
+                "the indexing status widget is shutting down."
+            )
+        previous_worker = self._worker
+        if previous_worker is not None:
+            previous_worker.deleteLater()
         self._job_id = job_id
         self._result_handled = False
         self._completed = False
@@ -165,18 +179,44 @@ class IndexingStatus(QWidget):
         )
         self.cancel_button.setEnabled(True)
         self.resume_button.setEnabled(False)
-        self._worker = _IndexingWorker(
+        self._worker_generation += 1
+        generation = self._worker_generation
+        active_service = self._active_service
+
+        def cancellation_check() -> bool:
+            return bool(
+                self._closing
+                or getattr(active_service, "cancel_requested", False)
+            )
+
+        worker = _IndexingWorker(
             self._active_service,
             job_id,
             self._active_path,
-            cancellation_check=lambda: bool(
-                getattr(self._active_service, "cancel_requested", False)
-            ),
+            cancellation_check=cancellation_check,
         )
-        self._worker.result_ready.connect(self._complete)
-        self._worker.failure.connect(self._fail)
-        self._worker.finished.connect(self._worker_finished)
-        self._worker.start()
+        self._worker = worker
+        worker.result_ready.connect(
+            lambda result, worker=worker, generation=generation: self._complete(
+                worker,
+                generation,
+                result,
+            )
+        )
+        worker.failure.connect(
+            lambda exc, worker=worker, generation=generation: self._fail(
+                worker,
+                generation,
+                exc,
+            )
+        )
+        worker.finished.connect(
+            lambda worker=worker, generation=generation: self._worker_finished(
+                worker,
+                generation,
+            )
+        )
+        worker.start()
         self._refresh_progress()
         self._timer.start()
 
@@ -225,8 +265,13 @@ class IndexingStatus(QWidget):
         elif status in {"failed", "queued", "pending"}:
             return
 
-    def _complete(self, result: Any) -> None:
-        if self._result_handled:
+    def _complete(
+        self,
+        worker: _IndexingWorker,
+        generation: int,
+        result: Any,
+    ) -> None:
+        if not self._is_current_worker(worker, generation) or self._result_handled:
             return
         self._result_handled = True
         self._timer.stop()
@@ -254,7 +299,12 @@ class IndexingStatus(QWidget):
             else "The indexing job can be resumed from its latest checkpoint."
         )
         status = str(getattr(result, "status", "failed"))
-        phase = "Cancelled (resumable)" if status == "queued" else "Failed (resumable)"
+        failure_code = failure.get("code") if isinstance(failure, dict) else None
+        phase = (
+            "Cancelled (resumable)"
+            if status == "queued" or failure_code == "cancel_requested"
+            else "Failed (resumable)"
+        )
         self._set_progress(phase, self.progress_bar.value(), summary)
         self.resume_button.setEnabled(
             self._job_id is not None
@@ -264,8 +314,13 @@ class IndexingStatus(QWidget):
             )
         )
 
-    def _fail(self, exc: object) -> None:
-        if self._result_handled:
+    def _fail(
+        self,
+        worker: _IndexingWorker,
+        generation: int,
+        exc: object,
+    ) -> None:
+        if not self._is_current_worker(worker, generation) or self._result_handled:
             return
         self._result_handled = True
         self._timer.stop()
@@ -278,14 +333,18 @@ class IndexingStatus(QWidget):
         )
         self.resume_button.setEnabled(False)
 
-    def _worker_finished(self) -> None:
-        worker = self._worker
+    def _worker_finished(
+        self,
+        worker: _IndexingWorker,
+        generation: int,
+    ) -> None:
+        worker.deleteLater()
+        if not self._is_current_worker(worker, generation):
+            return
         self._worker = None
-        if worker is not None:
-            worker.deleteLater()
-        if self._completed:
+        if self._completed and not self._closing:
             self._start_next()
-        else:
+        elif not self._closing:
             self.resume_button.setEnabled(self._job_id is not None)
 
     def cancel(self) -> None:
@@ -304,6 +363,8 @@ class IndexingStatus(QWidget):
         )
 
     def resume(self) -> int | None:
+        if self._closing:
+            return None
         if self._job_id is None:
             self._set_progress(
                 "Nothing to resume",
@@ -313,8 +374,71 @@ class IndexingStatus(QWidget):
             return None
         setattr(self.service, "cancel_requested", False)
         setattr(self._active_service, "cancel_requested", False)
+        self._active_service = self._resolved_service()
         self._run_job(self._job_id)
         return self._job_id
+
+    def wait(self, timeout_ms: int = 30_000) -> bool:
+        if timeout_ms < 0:
+            raise ValueError("The indexing wait timeout cannot be negative.")
+        worker = self._worker
+        if worker is None:
+            return True
+        if not worker.wait(timeout_ms):
+            return False
+        if self._worker is worker:
+            self._worker = None
+            self._timer.stop()
+            self.cancel_button.setEnabled(False)
+            self.resume_button.setEnabled(False)
+        worker.deleteLater()
+        return True
+
+    def shutdown(self, timeout_ms: int = 30_000) -> bool:
+        self._closing = True
+        self._pending.clear()
+        self._timer.stop()
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            self.cancel()
+        stopped = self.wait(timeout_ms)
+        if stopped:
+            self.cancel_button.setEnabled(False)
+            self.resume_button.setEnabled(False)
+        return stopped
+
+    def closeEvent(self, event: Any) -> None:
+        if self.shutdown() and self._worker is None:
+            super().closeEvent(event)
+            return
+        event.ignore()
+
+    def _restore_resumable_job(self) -> None:
+        latest = getattr(self.service, "latest_resumable_job", None)
+        if not callable(latest):
+            return
+        try:
+            result = latest()
+        except Exception:
+            return
+        if result is None:
+            return
+        job_id = getattr(result, "job_id", getattr(result, "id", None))
+        if job_id is None:
+            return
+        self._job_id = int(job_id)
+        self._active_path = str(getattr(result, "file_path", ""))
+        self._active_service = self._resolved_service()
+        self._result_handled = True
+        self._completed = False
+        self._terminal_state(result)
+
+    def _is_current_worker(
+        self,
+        worker: _IndexingWorker,
+        generation: int,
+    ) -> bool:
+        return self._worker is worker and self._worker_generation == generation
 
     def _set_progress(self, phase: str, value: int, detail: str) -> None:
         self.file_label.setText(f"Modern index: {self._active_path or 'idle'}")

@@ -3,6 +3,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMessageBox
 
 from file_tagger.ui.indexing_status import IndexingStatus
@@ -143,6 +144,170 @@ def test_indexing_status_does_not_call_runtime_async_queue(qtbot) -> None:
         status.start("C:\\library\\guide.md")
 
     assert calls == []
+
+
+def test_stale_qthread_callbacks_do_not_clear_replacement_worker(qtbot) -> None:
+    first_entered = Event()
+    release_first = Event()
+    second_entered = Event()
+    release_second = Event()
+    completed: list[int] = []
+
+    class Service:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def __init__(self) -> None:
+            self.next_job_id = 1
+
+        def queue(self, path: str) -> int:
+            del path
+            job_id = self.next_job_id
+            self.next_job_id += 1
+            return job_id
+
+        def state(self, job_id: int):
+            return SimpleNamespace(
+                status="running",
+                total_count=1,
+                processed_count=0,
+            )
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            del cancellation_check
+            if job_id == 1:
+                first_entered.set()
+                assert release_first.wait(2)
+                return SimpleNamespace(job_id=job_id, status="failed")
+            second_entered.set()
+            assert release_second.wait(2)
+            completed.append(job_id)
+            return SimpleNamespace(job_id=job_id, status="completed")
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+
+    assert status.start("C:\\library\\first.md") == 1
+    assert first_entered.wait(1)
+    first_worker = status._worker
+    assert first_worker is not None
+    release_first.set()
+    assert first_worker.wait(1_000)
+
+    assert status.start("C:\\library\\second.md") == 2
+    replacement = status._worker
+    assert replacement is not None
+    assert replacement is not first_worker
+    assert second_entered.wait(1)
+
+    status._worker_finished(first_worker, 1)
+    assert status._worker is replacement
+    assert "failed" not in status.phase_label.text().lower()
+
+    release_second.set()
+    qtbot.waitUntil(lambda: completed == [2])
+    qtbot.waitUntil(
+        lambda: "completed" in status.phase_label.text().lower()
+    )
+
+
+def test_shutdown_waits_for_real_qthread_and_manager_rejects_timeout(
+    qtbot, monkeypatch
+) -> None:
+    entered = Event()
+    release = Event()
+
+    class Service:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def queue(self, path: str) -> int:
+            del path
+            return 9
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            entered.set()
+            while not release.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    pass
+            return SimpleNamespace(job_id=job_id, status="completed")
+
+        def state(self, job_id: int):
+            return SimpleNamespace(
+                status="running",
+                total_count=1,
+                processed_count=0,
+            )
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+    status.start("C:\\library\\slow.md")
+    assert entered.wait(1)
+
+    assert status.shutdown(25) is False
+
+    release.set()
+    assert status.shutdown(1_000) is True
+    assert status.wait(0) is True
+    assert status._worker is None
+
+    from file_tagger import file_tag_manager
+
+    manager = file_tag_manager.FileTagManager.__new__(
+        file_tag_manager.FileTagManager
+    )
+    file_tag_manager.QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.logger = logging.getLogger("indexing-shutdown-test")
+    manager.indexing_status = SimpleNamespace(shutdown=lambda: False)
+    event = QCloseEvent()
+
+    manager.closeEvent(event)
+
+    assert event.isAccepted() is False
+
+
+def test_new_status_restores_and_resumes_persisted_latest_job(qtbot) -> None:
+    resumed: list[int] = []
+    persisted = SimpleNamespace(
+        id=17,
+        job_id=17,
+        status="running",
+        file_path="C:\\library\\persisted.md",
+        total_count=4,
+        processed_count=2,
+        failed_count=1,
+        retry_count=1,
+        revision=1,
+        failure={
+            "code": "cancel_requested",
+            "summary": "resume this checkpoint",
+        },
+    )
+
+    class Service:
+        cancel_requested = False
+        previous_revision_available = True
+
+        def latest_resumable_job(self):
+            return persisted
+
+        def resume(self, job_id: int, *, cancellation_check=None):
+            resumed.append(job_id)
+            return SimpleNamespace(
+                job_id=job_id,
+                status="completed",
+                revision=2,
+            )
+
+    status = IndexingStatus(Service())
+    qtbot.addWidget(status)
+
+    assert status._job_id == 17
+    assert status.resume_button.isEnabled()
+    assert "cancelled" in status.phase_label.text().lower()
+    assert status.resume() == 17
+    qtbot.waitUntil(lambda: resumed == [17])
 
 
 def test_failed_job_is_resumable_without_losing_previous_revision(qtbot) -> None:
