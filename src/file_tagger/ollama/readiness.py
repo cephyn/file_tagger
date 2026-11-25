@@ -21,6 +21,7 @@ ROLE_FEATURES = {
     "decision": ("tagging",),
     "generation": ("rag", "search"),
 }
+SUPPORTED_EMBEDDING_DIMENSIONS = frozenset({256, 512, 768})
 
 
 class RequiredModels(BaseModel):
@@ -43,6 +44,7 @@ class ReadinessReport(BaseModel):
 
     ready: bool
     blocked_roles: tuple[str, ...] = ()
+    blocked_model_roles: tuple[str, ...] = ()
     instructions: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
@@ -52,6 +54,30 @@ class ReadinessReport(BaseModel):
     hardware: HardwareReport | None = None
     recommendation: ModelRecommendation | None = None
     selected_models: RequiredModels | None = None
+
+    def selected_profile(self, role: str) -> ModelProfile | None:
+        if self.selected_models is None:
+            return None
+        if role in self.blocked_model_roles:
+            return None
+        selected_model = self.selected_models.as_mapping().get(role)
+        if selected_model is None:
+            return None
+        selected = next(
+            (
+                profile
+                for profile in self.profiles
+                if profile.role == role and profile.model == selected_model
+            ),
+            None,
+        )
+        if (
+            role == "embedding"
+            and selected is not None
+            and selected.dimensions not in SUPPORTED_EMBEDDING_DIMENSIONS
+        ):
+            return None
+        return selected
 
 
 def _cloud_model(model: str) -> bool:
@@ -141,6 +167,20 @@ class OllamaReadinessService:
                 errors.append(str(exc))
                 continue
 
+            if (
+                role == "embedding"
+                and profile.dimensions not in SUPPORTED_EMBEDDING_DIMENSIONS
+            ):
+                blocked_model_roles.add(role)
+                errors.append(
+                    f"Model {model} has unsupported embedding dimensions "
+                    f"{profile.dimensions}; expected one of 256, 512, or 768."
+                )
+                instructions.append(
+                    "Select a different embedding model with 256, 512, "
+                    "or 768 dimensions."
+                )
+                continue
             profiles.append(profile)
             benchmark = await run_model_benchmark(
                 self.gateway,
@@ -177,6 +217,7 @@ class OllamaReadinessService:
         return ReadinessReport(
             ready=not blocked_model_roles and not errors,
             blocked_roles=_blocked_features(blocked_model_roles),
+            blocked_model_roles=tuple(sorted(blocked_model_roles)),
             instructions=tuple(dict.fromkeys(instructions)),
             warnings=tuple(warnings),
             errors=tuple(dict.fromkeys(errors)),
@@ -201,11 +242,18 @@ class OllamaReadinessService:
                 continue
             for role in ROLE_FEATURES:
                 try:
-                    profiles.append(await self.gateway.model_profile(role, model))
+                    profile = await self.gateway.model_profile(role, model)
                 except (ModelMissingError, ModelIncompatibleError):
                     continue
                 except OllamaUnavailableError:
                     break
+                if (
+                    role == "embedding"
+                    and profile.dimensions
+                    not in SUPPORTED_EMBEDDING_DIMENSIONS
+                ):
+                    continue
+                profiles.append(profile)
         return profiles
 
     def _persist_profiles(

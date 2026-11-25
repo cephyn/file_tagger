@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import event, inspect, text
 
 from file_tagger.domain.contracts import ModelProfile, TagDecision
+from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.infrastructure.app_paths import AppPaths
 from file_tagger.persistence.models import (
@@ -805,6 +806,12 @@ def test_production_tag_suggester_uses_semantic_hybrid_search_and_new_quota(
         SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
         gateway=gateway,
         cache=InMemoryTagRecommendationCache(),
+        modern_runtime=SimpleNamespace(
+            session_factory=factory,
+            embedding_profile=profile,
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+        ),
     ).recommend_tags_for_file(str(source))
 
     assert len(result.decisions) == 24
@@ -816,6 +823,186 @@ def test_production_tag_suggester_uses_semantic_hybrid_search_and_new_quota(
     }
     assert len(gateway.embedding_calls) == 1
     assert "friendly woodland animal habitat" in str(gateway.embedding_calls[0]["text"])
+
+
+def test_production_tag_suggester_uses_runtime_selected_embedding_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    profile_a = ModelProfile(
+        role="embedding",
+        model="embedding-a",
+        digest="sha256:embedding-a",
+        context_length=32_768,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    profile_b = ModelProfile(
+        role="embedding",
+        model="embedding-b",
+        digest="sha256:embedding-b",
+        context_length=32_768,
+        dimensions=512,
+        capabilities=("embedding",),
+    )
+    decision_profile = ModelProfile(
+        role="decision",
+        model="decision-a",
+        digest="sha256:decision-a",
+        context_length=32_768,
+        capabilities=("systemone",),
+    )
+    generation_profile = ModelProfile(
+        role="generation",
+        model="candidate-a",
+        digest="sha256:candidate-a",
+        context_length=32_768,
+        capabilities=("completion",),
+    )
+    factory = create_session_factory(paths.database)
+    with factory.begin() as session:
+        for profile in (profile_a, profile_b):
+            session.add(
+                ModelProfileRecord(
+                    role=profile.role,
+                    model=profile.model,
+                    digest=profile.digest,
+                    dimensions=profile.dimensions,
+                    context_length=profile.context_length,
+                    index_version=profile.default_index_version,
+                    capabilities=list(profile.capabilities),
+                    benchmark_data={},
+                )
+            )
+
+    source = tmp_path / "selected-profile.txt"
+    source.write_text("selected profile", encoding="utf-8")
+
+    class EmbeddingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__(["generated"])
+            self.embedding_calls: list[str] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            del text, truncate, keep_alive
+            self.embedding_calls.append(model)
+            assert dimensions == profile_a.dimensions
+            return (tuple(0.0 for _ in range(profile_a.dimensions or 0)),)
+
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        readiness=ReadinessReport(
+            ready=True,
+            profiles=(
+                profile_a,
+                profile_b,
+                decision_profile,
+                generation_profile,
+            ),
+            selected_models=RequiredModels(
+                embedding=profile_a.model,
+                decision="decision-a",
+                generation="candidate-a",
+            ),
+        ),
+    )
+    gateway = EmbeddingGateway()
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=gateway,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert gateway.embedding_calls == ["embedding-a"]
+    assert [call["model"] for call in gateway.chat_calls] == ["candidate-a"]
+    assert [call["model"] for call in gateway.decision_calls] == ["decision-a"]
+
+
+def test_production_tag_suggester_rejects_incomplete_runtime_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    factory = create_session_factory(paths.database)
+    source = tmp_path / "incomplete-selection.txt"
+    source.write_text("incomplete selection", encoding="utf-8")
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        readiness=ReadinessReport(
+            ready=False,
+            selected_models=RequiredModels(
+                embedding="embedding-a",
+                decision="decision-a",
+                generation="candidate-a",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Modern runtime model selection is incomplete",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            gateway=FakeGateway(["generated"]),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_runtime_helpers_do_not_fall_back_to_stale_readiness_report() -> None:
+    from file_tagger.tag_suggestion import (
+        _runtime_embedding_profile,
+        _runtime_selected_model,
+    )
+
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-a",
+        digest="sha256:embedding-a",
+        context_length=32_768,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    runtime = SimpleNamespace(
+        embedding_profile=None,
+        candidate_model=None,
+        decision_model=None,
+        readiness=ReadinessReport(
+            ready=True,
+            profiles=(profile,),
+            selected_models=RequiredModels(
+                embedding=profile.model,
+                decision="decision-a",
+                generation="candidate-a",
+            ),
+        ),
+    )
+
+    assert _runtime_embedding_profile(runtime) is None
+    assert _runtime_selected_model(runtime, "generation") is None
+    assert _runtime_selected_model(runtime, "decision") is None
 
 
 def test_production_tag_suggester_uses_query_aware_fts_without_embedding_profile(

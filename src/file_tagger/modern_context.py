@@ -25,6 +25,7 @@ from .infrastructure.database import create_session_factory, upgrade_database
 from .migration.config_migration import ConfigMigrationReport, migrate_legacy_config
 from .migration.sqlite_migration import LegacyMigrationReport, migrate_legacy_sqlite
 from .ollama.hardware import profile_hardware
+from .domain.contracts import ModelProfile
 from .domain.errors import ModelRecommendationError
 from .ollama.model_recommender import ModelRecommendation, recommend_models
 from .ollama.readiness import OllamaReadinessService, ReadinessReport, RequiredModels
@@ -111,27 +112,41 @@ class ModernRuntime:
 
     @property
     def candidate_model(self) -> str | None:
-        if self.required_models is None or self.readiness is None:
-            return None
-        if self.required_models.generation not in {
-            profile.model
-            for profile in self.readiness.profiles
-            if profile.role == "generation"
-        }:
-            return None
-        return str(self.required_models.generation)
+        profile = self.selected_profile("generation")
+        return profile.model if profile is not None else None
 
     @property
     def decision_model(self) -> str | None:
-        if self.required_models is None or self.readiness is None:
+        profile = self.selected_profile("decision")
+        return profile.model if profile is not None else None
+
+    @property
+    def embedding_profile(self) -> ModelProfile | None:
+        return self.selected_profile("embedding")
+
+    @property
+    def selected_models(self) -> RequiredModels | None:
+        with self._lock:
+            if self.required_models is not None:
+                return self.required_models
+            if self.readiness is not None:
+                return self.readiness.selected_models
+        return None
+
+    def selected_profile(self, role: str) -> ModelProfile | None:
+        with self._lock:
+            report = self.readiness
+            required = self.required_models
+        if report is None:
             return None
-        if self.required_models.decision not in {
-            profile.model
-            for profile in self.readiness.profiles
-            if profile.role == "decision"
-        }:
+        selected = (
+            required if required is not None else report.selected_models
+        )
+        if selected is None:
             return None
-        return str(self.required_models.decision)
+        if selected != report.selected_models:
+            return None
+        return report.selected_profile(role)
 
     @property
     def model_overrides(self) -> dict[str, str]:
@@ -255,18 +270,13 @@ class ModernRuntime:
                     "selected_models": required,
                 }
             )
-            embedding_profile = None
-            if "indexing" not in report.blocked_roles:
-                embedding_profile = next(
-                    (
-                        profile
-                        for profile in report.profiles
-                        if profile.role == "embedding"
-                        and profile.model == required.embedding
-                        and profile.dimensions in {256, 512, 768}
-                    ),
-                    None,
-                )
+            embedding_profile = report.selected_profile("embedding")
+            if (
+                "indexing" in report.blocked_roles
+                or embedding_profile is None
+                or embedding_profile.dimensions not in {256, 512, 768}
+            ):
+                embedding_profile = None
             indexing_service = None
             if embedding_profile is not None and self.session_factory is not None:
                 indexing_service = IndexingService(

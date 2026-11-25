@@ -838,6 +838,74 @@ def test_runtime_persists_model_selections_and_refreshes(
     assert restarted.model_overrides == selected
 
 
+def test_runtime_resolves_active_profile_by_selection_not_catalog_order(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, object())  # type: ignore[arg-type]
+    selected = RequiredModels(
+        embedding="embedding-a",
+        decision="decision-a",
+        generation="generation-a",
+    )
+    embedding_a = ModelProfile(
+        role="embedding",
+        model="embedding-a",
+        digest="embedding-a-digest",
+        context_length=8192,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    embedding_b = ModelProfile(
+        role="embedding",
+        model="embedding-b",
+        digest="embedding-b-digest",
+        context_length=8192,
+        dimensions=512,
+        capabilities=("embedding",),
+    )
+    runtime.required_models = selected
+    runtime.readiness = ReadinessReport(
+        ready=True,
+        profiles=(embedding_a, embedding_b),
+        selected_models=selected,
+    )
+
+    assert runtime.embedding_profile == embedding_a
+    assert runtime.embedding_profile != embedding_b
+
+
+def test_runtime_does_not_expose_blocked_embedding_profile(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, object())  # type: ignore[arg-type]
+    selected = RequiredModels(
+        embedding="embedding-unsupported",
+        decision="decision-a",
+        generation="generation-a",
+    )
+    runtime.required_models = selected
+    runtime.readiness = ReadinessReport(
+        ready=False,
+        blocked_roles=("indexing", "search"),
+        blocked_model_roles=("embedding",),
+        profiles=(
+            ModelProfile(
+                role="embedding",
+                model="embedding-unsupported",
+                digest="embedding-unsupported-digest",
+                context_length=8192,
+                dimensions=512,
+                capabilities=("embedding",),
+            ),
+        ),
+        selected_models=selected,
+    )
+
+    assert runtime.embedding_profile is None
+
+
 def test_runtime_readiness_completion_ignores_stale_overlapping_result(
     tmp_path, monkeypatch
 ) -> None:

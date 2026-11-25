@@ -4,7 +4,6 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QTextEdit)
 from PySide6.QtCore import Qt, QSize, Signal, QEvent
 from PySide6.QtGui import QColor
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 from hashlib import sha256
 import mimetypes
@@ -16,8 +15,7 @@ from .domain.contracts import ModelProfile
 from .infrastructure.app_paths import AppPaths
 from .infrastructure.database import create_session_factory, upgrade_database
 from .models import File, Tag, TagSuggestionCache as LegacySuggestionCache
-from .persistence.models import ModelProfileRecord
-from .search.hybrid import HybridSearch, VECTOR_DIMENSIONS
+from .search.hybrid import HybridSearch
 from .tagging.cache import (
     CachedTagRecommendations,
     TagRecommendationCache,
@@ -27,6 +25,7 @@ from .vector_search.content_extractor import ContentExtractor
 
 
 MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
+_MISSING_RUNTIME_VALUE = object()
 _TRUNCATION_MARKER = "\n[truncated]"
 _STRUCTURED_TEXT_SUBTYPES = frozenset(
     {"calendar", "csv", "html", "rtf", "sgml", "xml"}
@@ -150,27 +149,41 @@ class TagSuggester:
             if selected_cache is None:
                 cache_session = init_db()  # type: ignore[no-untyped-call]
                 selected_cache = _LegacyTagRecommendationCache(cache_session)
-            embedding_profile = _latest_embedding_profile(search_session)
-            service_options = {}
-            if self.modern_runtime is not None:
-                if self.modern_runtime.candidate_model:
-                    service_options["candidate_model"] = (
-                        self.modern_runtime.candidate_model
-                    )
-                if self.modern_runtime.decision_model:
-                    service_options["decision_model"] = (
-                        self.modern_runtime.decision_model
-                    )
-            service = CandidateService(
-                HybridSearch(
-                    search_session,
-                    embedding_profile=embedding_profile,
-                ),
-                gateway=self._gateway,
-                decision_gateway=self._decision_gateway,
-                cache=selected_cache,
-                **service_options,
+            embedding_profile = _runtime_embedding_profile(self.modern_runtime)
+            candidate_model = _runtime_selected_model(
+                self.modern_runtime,
+                "generation",
             )
+            decision_model = _runtime_selected_model(
+                self.modern_runtime,
+                "decision",
+            )
+            if self.modern_runtime is None:
+                service = CandidateService(
+                    HybridSearch(
+                        search_session,
+                        embedding_profile=embedding_profile,
+                    ),
+                    gateway=self._gateway,
+                    decision_gateway=self._decision_gateway,
+                    cache=selected_cache,
+                )
+            elif candidate_model is None or decision_model is None:
+                raise ValueError(
+                    "Modern runtime model selection is incomplete."
+                )
+            else:
+                service = CandidateService(
+                    HybridSearch(
+                        search_session,
+                        embedding_profile=embedding_profile,
+                    ),
+                    gateway=self._gateway,
+                    decision_gateway=self._decision_gateway,
+                    cache=selected_cache,
+                    candidate_model=candidate_model,
+                    decision_model=decision_model,
+                )
             result = service.recommend(
                 document_state,
                 file_hash=file_hash,
@@ -220,29 +233,55 @@ class TagSuggester:
             return {}
 
 
-def _latest_embedding_profile(session: Session) -> ModelProfile | None:
-    record = session.scalar(
-        select(ModelProfileRecord)
-        .where(
-            ModelProfileRecord.role == "embedding",
-            ModelProfileRecord.dimensions.in_(VECTOR_DIMENSIONS),
-        )
-        .order_by(
-            ModelProfileRecord.updated_at.desc(),
-            ModelProfileRecord.id.desc(),
-        )
-        .limit(1)
-    )
-    if record is None or record.dimensions is None:
+def _runtime_embedding_profile(runtime: Any | None) -> ModelProfile | None:
+    if runtime is None:
         return None
-    return ModelProfile(
-        role="embedding",
-        model=record.model,
-        digest=record.digest,
-        context_length=record.context_length,
-        dimensions=record.dimensions,
-        capabilities=tuple(record.capabilities),
+    profile = getattr(
+        runtime,
+        "embedding_profile",
+        _MISSING_RUNTIME_VALUE,
     )
+    if profile is _MISSING_RUNTIME_VALUE:
+        report = getattr(runtime, "readiness", None)
+        if report is not None:
+            profile = report.selected_profile("embedding")
+        else:
+            profile = None
+    if profile is None:
+        return None
+    if not isinstance(profile, ModelProfile):
+        raise ValueError("The active embedding profile is invalid.")
+    if profile.dimensions not in {256, 512, 768}:
+        raise ValueError(
+            "The active embedding profile does not support modern search."
+        )
+    return profile
+
+
+def _runtime_selected_model(runtime: Any | None, role: str) -> str | None:
+    if runtime is None:
+        return None
+    property_name = {
+        "generation": "candidate_model",
+        "decision": "decision_model",
+    }.get(role)
+    if property_name is not None:
+        model = getattr(
+            runtime,
+            property_name,
+            _MISSING_RUNTIME_VALUE,
+        )
+        if model is not _MISSING_RUNTIME_VALUE:
+            if model is None:
+                return None
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(f"The active {role} model is invalid.")
+            return model
+    report = getattr(runtime, "readiness", None)
+    if report is None:
+        return None
+    profile = report.selected_profile(role)
+    return profile.model if profile is not None else None
 
 
 class _LegacyTagRecommendationCache:

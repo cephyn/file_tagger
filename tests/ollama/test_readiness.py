@@ -6,7 +6,11 @@ from sqlalchemy import func, select
 from file_tagger.domain.contracts import ModelProfile, OllamaReadiness
 from file_tagger.domain.errors import ModelIncompatibleError, ModelMissingError
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
-from file_tagger.ollama.readiness import OllamaReadinessService, RequiredModels
+from file_tagger.ollama.readiness import (
+    OllamaReadinessService,
+    ReadinessReport,
+    RequiredModels,
+)
 from file_tagger.persistence.models import ModelProfileRecord
 
 
@@ -159,6 +163,26 @@ def test_slow_successful_benchmarks_receive_warning_not_failure() -> None:
     assert any("slow" in warning.lower() for warning in report.warnings)
 
 
+def test_unsupported_selected_embedding_dimensions_block_search() -> None:
+    class UnsupportedEmbeddingGateway(FakeGateway):
+        async def model_profile(self, role, model):
+            profile = await super().model_profile(role, model)
+            if role == "embedding":
+                return profile.model_copy(update={"dimensions": 1024})
+            return profile
+
+    report = asyncio.run(
+        OllamaReadinessService(UnsupportedEmbeddingGateway()).check(
+            required_models()
+        )
+    )
+
+    assert report.ready is False
+    assert report.blocked_roles == ("indexing", "search")
+    assert report.selected_profile("embedding") is None
+    assert all(profile.dimensions != 1024 for profile in report.profiles)
+
+
 def test_successful_readiness_has_all_profiles() -> None:
     report = asyncio.run(
         OllamaReadinessService(FakeGateway()).check(required_models())
@@ -172,13 +196,60 @@ def test_successful_readiness_has_all_profiles() -> None:
     }
 
 
+def test_blocked_feature_does_not_hide_other_role_profiles() -> None:
+    selected = required_models()
+    embedding = ModelProfile(
+        role="embedding",
+        model=selected.embedding,
+        digest="embedding",
+        context_length=8192,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    generation = ModelProfile(
+        role="generation",
+        model=selected.generation,
+        digest="generation",
+        context_length=8192,
+        capabilities=("completion",),
+    )
+
+    embedding_blocked = ReadinessReport(
+        ready=False,
+        blocked_roles=("indexing", "search"),
+        blocked_model_roles=("embedding",),
+        profiles=(embedding, generation),
+        selected_models=selected,
+    )
+    generation_blocked = ReadinessReport(
+        ready=False,
+        blocked_roles=("rag", "search"),
+        blocked_model_roles=("generation",),
+        profiles=(embedding, generation),
+        selected_models=selected,
+    )
+
+    assert embedding_blocked.selected_profile("embedding") is None
+    assert embedding_blocked.selected_profile("generation") == generation
+    assert generation_blocked.selected_profile("embedding") == embedding
+    assert generation_blocked.selected_profile("generation") is None
+
+
 def test_readiness_includes_full_compatible_installed_catalog_by_role() -> None:
+    class DimensionedGateway(FakeGateway):
+        async def model_profile(self, role, model):
+            profile = await super().model_profile(role, model)
+            if role == "embedding" and model == "embeddinggemma-2:huge":
+                return profile.model_copy(update={"dimensions": 1024})
+            return profile
+
     report = asyncio.run(
         OllamaReadinessService(
-            FakeGateway(
+            DimensionedGateway(
                 installed_models=(
                     "embeddinggemma-2:270m",
                     "embeddinggemma-2:440m",
+                    "embeddinggemma-2:huge",
                     "nimble:9b",
                     "tev1:4b",
                     "gemma4:e4b",
@@ -194,6 +265,15 @@ def test_readiness_includes_full_compatible_installed_catalog_by_role() -> None:
         ("embedding", "embeddinggemma-2:440m"),
         ("decision", "tev1:4b"),
         ("generation", "gemma4:e2b"),
+    }
+    selected_embedding = report.selected_profile("embedding")
+    assert selected_embedding is not None
+    assert selected_embedding.model == "embeddinggemma-2:270m"
+    assert (
+        "embedding",
+        "embeddinggemma-2:huge",
+    ) not in {
+        (profile.role, profile.model) for profile in report.profiles
     }
 
 
