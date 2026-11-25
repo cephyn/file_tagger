@@ -234,47 +234,27 @@ def _normalized_words(value: str) -> tuple[str, ...]:
 
 
 def _claim_is_supported(claim: str, quote: str) -> bool:
-    claim_words = _normalized_words(claim)
-    quote_words = _normalized_words(quote)
-    if not claim_words or not quote_words:
-        return False
-    normalized_claim = " ".join(claim_words)
-    normalized_quote = " ".join(quote_words)
-    if normalized_quote in normalized_claim or normalized_claim in normalized_quote:
-        return True
-
-    claim_numbers = {word for word in claim_words if any(char.isdigit() for char in word)}
-    quote_numbers = {word for word in quote_words if any(char.isdigit() for char in word)}
-    if not claim_numbers <= quote_numbers:
-        return False
-    calendar_terms = {
-        "january",
-        "february",
-        "march",
-        "april",
+    raw_claim_words = _normalized_words(claim)
+    raw_quote_words = _normalized_words(quote)
+    relation_markers = {
+        "no",
+        "not",
+        "never",
+        "without",
+        "cannot",
+        "can't",
         "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
+        "might",
+        "must",
+        "shall",
+        "should",
+        "will",
+        "would",
     }
-    claim_dates = set(claim_words) & calendar_terms
-    if not claim_dates <= set(quote_words):
+    claim_markers = tuple(word for word in raw_claim_words if word in relation_markers)
+    quote_markers = tuple(word for word in raw_quote_words if word in relation_markers)
+    if claim_markers != quote_markers:
         return False
-    negations = {"no", "not", "never", "without"}
-    if bool(set(claim_words) & negations) != bool(set(quote_words) & negations):
-        return False
-
     stop_words = {
         "a",
         "an",
@@ -299,25 +279,24 @@ def _claim_is_supported(claim: str, quote: str) -> bool:
         "were",
         "with",
     }
-    claim_terms = set(claim_words) - stop_words
-    quote_terms = set(quote_words) - stop_words
-    if not claim_terms or not quote_terms:
+    claim_words = tuple(
+        word for word in raw_claim_words if word not in stop_words
+    )
+    quote_words = tuple(
+        word for word in raw_quote_words if word not in stop_words
+    )
+    if not claim_words or not quote_words:
         return False
-    return _canonical_terms(claim_terms) <= _canonical_terms(quote_terms)
-
-
-def _canonical_terms(words: set[str]) -> set[str]:
-    normalized: set[str] = set()
-    for word in words:
-        candidate = word
-        if len(candidate) > 5 and candidate.endswith("ing"):
-            candidate = candidate[:-3]
-        elif len(candidate) > 4 and candidate.endswith("ed"):
-            candidate = candidate[:-2]
-        elif len(candidate) > 3 and candidate.endswith("s"):
-            candidate = candidate[:-1]
-        normalized.add(candidate)
-    return normalized
+    if len(quote_words) - len(claim_words) > 1:
+        return False
+    quote_index = 0
+    for word in claim_words:
+        while quote_index < len(quote_words) and quote_words[quote_index] != word:
+            quote_index += 1
+        if quote_index == len(quote_words):
+            return False
+        quote_index += 1
+    return True
 
 
 def _answer_is_supported(

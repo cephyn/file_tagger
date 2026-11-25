@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from hashlib import sha256
 import inspect
 import json
+import re
 import threading
 from typing import Any, Callable, Protocol, TypeAlias, TypeVar, cast
+import unicodedata
 
 from pydantic import ValidationError
 
@@ -24,6 +26,7 @@ from ..domain.errors import (
     StructuredOutputError,
     UncitedAnswerError,
 )
+from ..search.hybrid import SearchFilters
 from ..search.results import SearchCitation, SearchResult, make_result
 from .citations import (
     CitedAnswer,
@@ -47,7 +50,13 @@ MAX_QUESTION_LENGTH = 1_024
 T = TypeVar("T")
 JsonMapping: TypeAlias = Mapping[str, Any]
 ChatHistory: TypeAlias = tuple[tuple[str, str], ...]
-IndexIdentity: TypeAlias = tuple[str | None, str | None, int | None, str | None]
+IndexIdentity: TypeAlias = tuple[
+    str | None,
+    str | None,
+    int | None,
+    str | None,
+    str | None,
+]
 EvidenceInput: TypeAlias = (
     SearchResult
     | SearchCitation
@@ -63,6 +72,7 @@ class SearchGateway(Protocol):
         query_embedding: Sequence[float] | None = None,
         *,
         limit: int = 10,
+        filters: SearchFilters | None = None,
         model_digest: str | None = None,
         index_version: str | None = None,
         embedding_profile: ModelProfile | None = None,
@@ -458,7 +468,12 @@ async def execute_search_plan_async(
     if limit == 0:
         return ()
 
-    queries = tuple(dict.fromkeys((*plan.exact_terms, *plan.paraphrase_queries)))
+    selected_filters, retrieval_constraints = _plan_search_options(plan)
+    queries = tuple(
+        dict.fromkeys(
+            (*plan.exact_terms, *retrieval_constraints, *plan.paraphrase_queries)
+        )
+    )
     selected_profile = _embedding_profile(search, embedding_profile)
     identity = _index_identity(
         search,
@@ -477,17 +492,43 @@ async def execute_search_plan_async(
     candidates: list[SearchResult] = []
     for index, query in enumerate(queries):
         if embeddings is None:
-            candidates.extend(search.search(query, limit=per_query_limit))
+            if selected_filters is None:
+                candidates.extend(search.search(query, limit=per_query_limit))
+            else:
+                candidates.extend(
+                    search.search(
+                        query,
+                        filters=selected_filters,
+                        limit=per_query_limit,
+                    )
+                )
             continue
-        candidates.extend(
-            search.search(
-                query,
-                embeddings[index],
-                limit=per_query_limit,
-                model_digest=identity[1],
-                index_version=identity[3],
+        if selected_filters is None:
+            candidates.extend(
+                search.search(
+                    query,
+                    embeddings[index],
+                    limit=per_query_limit,
+                    model_digest=identity[1],
+                    index_version=identity[3],
+                )
             )
-        )
+        else:
+            candidates.extend(
+                search.search(
+                    query,
+                    embeddings[index],
+                    filters=selected_filters,
+                    limit=per_query_limit,
+                    model_digest=identity[1],
+                    index_version=identity[3],
+                )
+            )
+    candidates = [
+        result
+        for result in _expand_evidence(candidates)
+        if not _result_is_excluded(result, plan.exclusions)
+    ]
     return _bounded_evidence(
         candidates,
         limit=limit,
@@ -527,6 +568,7 @@ def _index_identity(
 ) -> IndexIdentity:
     digest = model_digest
     version = index_version
+    fingerprint = _index_fingerprint(search)
     if search is not None:
         digest = digest or cast(str | None, getattr(search, "model_digest", None))
         version = version or cast(
@@ -534,7 +576,7 @@ def _index_identity(
             getattr(search, "index_version", None),
         )
     if profile is None:
-        return (None, digest, None, version)
+        return (None, digest, None, version, fingerprint)
     if digest is not None and digest != profile.digest:
         raise ModelIncompatibleError(
             "The active indexed model digest does not match its embedding profile."
@@ -550,7 +592,135 @@ def _index_identity(
         profile.digest,
         profile.dimensions,
         selected_version,
+        fingerprint,
     )
+
+
+def _index_fingerprint(search: SearchGateway | None) -> str | None:
+    if search is None:
+        return None
+    fingerprint = getattr(search, "index_fingerprint", None)
+    if callable(fingerprint):
+        fingerprint = fingerprint()
+    if fingerprint is None:
+        return None
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise ModelIncompatibleError("The active index fingerprint is invalid.")
+    return fingerprint
+
+
+def _plan_search_options(
+    plan: SearchPlan,
+) -> tuple[SearchFilters | None, tuple[str, ...]]:
+    tags: list[str] = []
+    paths: list[str] = []
+    file_types: list[str] = []
+    retrieval_constraints: list[str] = []
+    for constraint in (*plan.filters, *plan.normalized_constraints):
+        key, value = _typed_constraint(constraint)
+        if key in {"tag", "tags"}:
+            tags.extend(_constraint_values(value))
+        elif key in {"path", "folder", "directory"}:
+            paths.append(value)
+        elif key in {
+            "filetype",
+            "filetypes",
+            "extension",
+            "extensions",
+            "ext",
+            "mime",
+            "mimetype",
+            "type",
+        }:
+            file_types.extend(_constraint_values(value))
+        else:
+            retrieval_constraints.append(constraint)
+    if len(set(path.casefold() for path in paths)) > 1:
+        retrieval_constraints.extend(f"path: {path}" for path in paths)
+        paths = []
+    selected = (
+        SearchFilters(
+            tags=tuple(dict.fromkeys(tags)),
+            path=paths[0] if paths else None,
+            file_types=tuple(dict.fromkeys(file_types)),
+        )
+        if tags or paths or file_types
+        else None
+    )
+    return selected, tuple(retrieval_constraints)
+
+
+def _typed_constraint(constraint: str) -> tuple[str, str]:
+    key, separator, value = constraint.partition(":")
+    if not separator or not value.strip():
+        return "", constraint.strip()
+    normalized_key = re.sub(r"[\s_-]+", "", unicodedata.normalize("NFKC", key))
+    return normalized_key.casefold(), value.strip()
+
+
+def _constraint_values(value: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip()
+        for item in re.split(r"[,|]", value)
+        if item.strip()
+    )
+
+
+def _result_is_excluded(
+    result: SearchResult,
+    exclusions: Sequence[str],
+) -> bool:
+    text = " ".join(
+        (
+            result.file_path,
+            *result.tags,
+            *(section.heading or "" for section in result.matched_sections),
+            *(section.snippet for section in result.matched_sections),
+        )
+    )
+    for exclusion in exclusions:
+        key, value = _typed_constraint(exclusion)
+        if not value:
+            continue
+        if key in {"tag", "tags"}:
+            excluded_tags = {
+                _normalize_match(item) for item in _constraint_values(value)
+            }
+            if any(_normalize_match(tag) in excluded_tags for tag in result.tags):
+                return True
+        elif key in {"path", "folder", "directory"}:
+            if _normalize_match(value) in _normalize_match(result.file_path):
+                return True
+        elif key in {
+            "filetype",
+            "filetypes",
+            "extension",
+            "extensions",
+            "ext",
+            "mime",
+            "mimetype",
+            "type",
+        }:
+            normalized_path = _normalize_path(result.file_path)
+            for file_type in _constraint_values(value):
+                extension = file_type.strip().casefold().removeprefix(".")
+                if "/" not in extension and normalized_path.endswith(f".{extension}"):
+                    return True
+        elif _normalize_match(value) in _normalize_match(text):
+            return True
+    return False
+
+
+def _normalize_match(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(
+        token
+        for token in re.findall(r"[^\W_]+", normalized)
+    )
+
+
+def _normalize_path(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold().replace("\\", "/")
 
 
 async def _embed_queries(

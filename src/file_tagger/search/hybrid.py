@@ -1,9 +1,10 @@
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 import sqlite3
 import struct
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
@@ -81,6 +82,62 @@ class HybridSearch:
     @property
     def index_version(self) -> str | None:
         return self._index_version
+
+    @property
+    def index_fingerprint(self) -> str:
+        digest = sha256()
+        with _sqlite_read_snapshot(self._session):
+            data_version = self._session.execute(
+                text("PRAGMA data_version")
+            ).scalar_one()
+            _update_fingerprint(digest, "data_version", ((data_version,),))
+            corpus_rows = self._session.execute(
+                text(
+                    """
+                    SELECT
+                        f.id AS file_id,
+                        f.canonical_path,
+                        f.content_hash AS file_content_hash,
+                        f.size_bytes,
+                        f.mtime_ns,
+                        f.mime_type,
+                        f.indexing_state,
+                        d.id AS document_id,
+                        d.revision,
+                        d.file_hash AS document_hash,
+                        d.extraction_version,
+                        c.id AS chunk_id,
+                        c.stable_id,
+                        c.content_hash AS chunk_content_hash,
+                        c.model_digest,
+                        c.index_version
+                    FROM files AS f
+                    LEFT JOIN documents AS d
+                      ON d.id = (
+                          SELECT latest.id
+                          FROM documents AS latest
+                          WHERE latest.file_id = f.id
+                          ORDER BY latest.revision DESC, latest.id DESC
+                          LIMIT 1
+                      )
+                    LEFT JOIN chunks AS c ON c.document_id = d.id
+                    ORDER BY f.id, c.ordinal, c.id
+                    """
+                )
+            )
+            _update_fingerprint(digest, "corpus", corpus_rows)
+            tag_rows = self._session.execute(
+                text(
+                    """
+                    SELECT ft.file_id, t.name
+                    FROM file_tags AS ft
+                    JOIN tags AS t ON t.id = ft.tag_id
+                    ORDER BY ft.file_id, unicode_normalize(t.name), t.id
+                    """
+                )
+            )
+            _update_fingerprint(digest, "tags", tag_rows)
+        return digest.hexdigest()
 
     def search(
         self,
@@ -475,3 +532,18 @@ def _filter_sql(
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _update_fingerprint(
+    digest: Any,
+    category: str,
+    rows: Any,
+) -> None:
+    category_bytes = category.encode("utf-8")
+    digest.update(len(category_bytes).to_bytes(8, "big"))
+    digest.update(category_bytes)
+    for row in rows:
+        for value in row:
+            encoded = b"" if value is None else str(value).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)

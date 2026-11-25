@@ -19,6 +19,7 @@ from file_tagger.rag.service import (
     execute_search_plan,
     execute_search_plan_async,
 )
+from file_tagger.search.hybrid import SearchFilters
 from file_tagger.search.results import SearchResult, make_result
 
 
@@ -309,6 +310,149 @@ def test_structured_claim_cannot_change_a_fact_in_the_quoted_span() -> None:
         answer_question("When is the release?", evidence, gateway=fake_model)
 
 
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "Alice hired Bob for the role.",
+        "The role was given to Alice by Bob.",
+    ],
+)
+def test_structured_claim_cannot_reverse_relationships_from_evidence(
+    claim: str,
+) -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\appointment.md",
+                "stable_id": "appointment",
+                "page_number": 1,
+                "text": "Bob hired Alice for the role.",
+            },
+            source="hybrid",
+            rank=1,
+            score=0.9,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": "Bob hired Alice for the role.",
+                        "chunk_ids": ["appointment"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("Who was hired?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_cannot_replace_evidence_with_an_arbitrary_paraphrase() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\decision.md",
+                "stable_id": "decision",
+                "page_number": 1,
+                "text": "The committee approved the plan.",
+            },
+            source="hybrid",
+            rank=1,
+            score=0.9,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "The plan was approved by the committee.",
+                "claims": [
+                    {
+                        "text": "The plan was approved by the committee.",
+                        "evidence_quote": "The committee approved the plan.",
+                        "chunk_ids": ["decision"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("What happened?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_cannot_drop_evidence_negation() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\appointment.md",
+                "stable_id": "negated-appointment",
+                "page_number": 1,
+                "text": "Bob was not responsible for the event.",
+            },
+            source="hybrid",
+            rank=1,
+            score=0.9,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "Bob was responsible for the event.",
+                "claims": [
+                    {
+                        "text": "Bob was responsible for the event.",
+                        "evidence_quote": "Bob was not responsible for the event.",
+                        "chunk_ids": ["negated-appointment"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("Was Bob responsible?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_cannot_reduce_evidence_to_unrelated_name_pairs() -> None:
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\campaign\appointment.md",
+                "stable_id": "reduced-appointment",
+                "page_number": 1,
+                "text": "Bob hired Alice for the senior engineering role.",
+            },
+            source="hybrid",
+            rank=1,
+            score=0.9,
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "Bob and Alice.",
+                "claims": [
+                    {
+                        "text": "Bob and Alice.",
+                        "evidence_quote": (
+                            "Bob hired Alice for the senior engineering role."
+                        ),
+                        "chunk_ids": ["reduced-appointment"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="not supported"):
+        answer_question("Who is involved?", evidence, gateway=fake_model)
+
+
 def test_empty_evidence_returns_not_found_without_model_call() -> None:
     fake_model = FakeModel("{}")
 
@@ -466,6 +610,72 @@ def test_search_plan_executes_exact_terms_and_paraphrases_as_hybrid() -> None:
     assert all(
         call["index_version"] == profile.default_index_version
         for call in search.calls
+    )
+
+
+def test_search_plan_applies_typed_filters_and_postfilters_exclusions() -> None:
+    wanted = make_result(
+        {
+            "file_path": r"C:\reports\atlas.pdf",
+            "stable_id": "wanted",
+            "page_number": 1,
+            "text": "The public atlas report.",
+        },
+        source="hybrid",
+        rank=1,
+        score=0.9,
+    )
+    excluded = make_result(
+        {
+            "file_path": r"C:\reports\classified.pdf",
+            "stable_id": "excluded",
+            "page_number": 2,
+            "text": "The classified atlas report.",
+        },
+        source="hybrid",
+        rank=2,
+        score=0.8,
+    )
+
+    class FilterRecordingSearch(FakeSearch):
+        def __init__(self) -> None:
+            super().__init__({"atlas": (wanted, excluded)})
+            self.filters: list[object] = []
+
+        def search(
+            self,
+            query: str,
+            query_embedding: Sequence[float] | None = None,
+            *,
+            limit: int = 10,
+            filters: object | None = None,
+            model_digest: str | None = None,
+            index_version: str | None = None,
+        ) -> tuple[SearchResult, ...]:
+            del query_embedding, model_digest, index_version
+            self.filters.append(filters)
+            return super().search(query, limit=limit)
+
+    search = FilterRecordingSearch()
+    plan = SearchPlan(
+        question="Find the atlas report",
+        intent_names=("reports",),
+        exact_terms=("atlas",),
+        paraphrase_queries=("atlas",),
+        filters=("path: reports", "tag: work", "file type: pdf"),
+        normalized_constraints=("tag: finance",),
+        exclusions=("classified",),
+        evidence_categories=("reports",),
+    )
+
+    evidence = execute_search_plan(plan, search)
+
+    assert [result.chunk_id for result in evidence] == ["wanted"]
+    assert len(search.filters) == 1
+    assert search.filters[0] == SearchFilters(
+        tags=("work", "finance"),
+        path="reports",
+        file_types=("pdf",),
     )
 
 
@@ -848,6 +1058,71 @@ def test_session_index_profile_change_invalidates_reused_evidence() -> None:
     assert search.queries == ["initial", "follow-up"]
     assert search.calls[-1]["model_digest"] == "sha256:index-v2"
     assert search.calls[-1]["index_version"] == profile_v2.default_index_version
+    assert "first" not in json.dumps(model.chat_calls[-1]["messages"][:-1])
+
+
+def test_session_index_epoch_change_invalidates_reused_evidence() -> None:
+    first = _result("first", r"C:\campaign\first.md", 1, 0.9)
+    second = _result("second", r"C:\campaign\second.md", 1, 0.9)
+
+    class EpochSearch(FakeSearch):
+        def __init__(self) -> None:
+            super().__init__({"initial": (first,), "follow-up": (second,)})
+            self.index_fingerprint = "sha256:corpus-v1"
+
+    search = EpochSearch()
+
+    class FakePlanner:
+        async def __call__(
+            self,
+            question: str,
+            markdown_context: str,
+            *,
+            gateway: FakeModel,
+        ) -> SearchPlan:
+            del markdown_context, gateway
+            return _plan(question)
+
+    class EpochModel(FakeModel):
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            self.chat_calls.append(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "schema": schema,
+                    "keep_alive": keep_alive,
+                }
+            )
+            prompt = messages[-1]["content"]
+            chunk_id = "first" if '"first"' in prompt else "second"
+            return json.dumps(
+                {
+                    "answer": f"Evidence from {chunk_id}.",
+                    "claims": [
+                        {
+                            "text": f"Evidence from {chunk_id}.",
+                            "evidence_quote": f"Evidence from {chunk_id}.",
+                            "chunk_ids": [chunk_id],
+                        }
+                    ],
+                }
+            )
+
+    model = EpochModel("")
+    service = RagService(search=search, gateway=model, planner=FakePlanner())
+
+    service.answer_question("initial", session_id="conversation-1")
+    search.index_fingerprint = "sha256:corpus-v2"
+    service.answer_question("follow-up", session_id="conversation-1")
+
+    assert search.queries == ["initial", "follow-up"]
     assert "first" not in json.dumps(model.chat_calls[-1]["messages"][:-1])
 
 

@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.persistence.models import Chunk, Document, File, FileTag, Page, Tag
+from file_tagger.rag.planner import SearchPlan
+from file_tagger.rag.service import execute_search_plan
 from file_tagger.search.hybrid import (
     HybridSearch,
     SearchFilters,
@@ -417,6 +419,80 @@ def test_search_applies_tag_path_and_type_filters_in_sql(
     assert [candidate.chunk_id for candidate in result] == ["wanted"]
 
 
+def test_search_plan_constraints_filter_corpus_and_exclude_terms(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    seed = (
+        (
+            reports / "wanted.pdf",
+            "plan-wanted",
+            "Atlas annual report",
+            ("work",),
+            "application/pdf",
+        ),
+        (
+            reports / "classified.pdf",
+            "plan-excluded",
+            "Atlas classified annual report",
+            ("work",),
+            "application/pdf",
+        ),
+        (
+            reports / "wrong-tag.pdf",
+            "plan-wrong-tag",
+            "Atlas annual report",
+            ("personal",),
+            "application/pdf",
+        ),
+        (
+            tmp_path / "wrong-path.pdf",
+            "plan-wrong-path",
+            "Atlas annual report",
+            ("work",),
+            "application/pdf",
+        ),
+        (
+            reports / "wrong-type.md",
+            "plan-wrong-type",
+            "Atlas annual report",
+            ("work",),
+            "text/markdown",
+        ),
+    )
+    for path, stable_id, text_value, tags, mime_type in seed:
+        _seed_chunk(
+            search_session,
+            path=path,
+            stable_id=stable_id,
+            text_value=text_value,
+            vector=_vector(1.0, 0.0),
+            tags=tags,
+            mime_type=mime_type,
+        )
+    search_session.commit()
+    plan = SearchPlan(
+        question="Find the work report",
+        intent_names=("report",),
+        exact_terms=("Atlas",),
+        paraphrase_queries=("annual report",),
+        filters=(f"path: {reports}", "tag: work", "file type: pdf"),
+        exclusions=("classified",),
+        evidence_categories=("report",),
+    )
+
+    result = execute_search_plan(
+        plan,
+        HybridSearch(search_session),
+        per_query_limit=20,
+        limit=20,
+    )
+
+    assert [candidate.chunk_id for candidate in result] == ["plan-wanted"]
+
+
 @pytest.mark.parametrize("file_type", ["strasse", "APPLICATION/STRASSE"])
 @pytest.mark.parametrize(
     ("query", "embedding"),
@@ -597,6 +673,46 @@ def test_search_pins_one_revision_snapshot_across_all_queries(
             .order_by(Document.revision.desc())
             .limit(1)
         ) == 2
+
+
+def test_index_fingerprint_changes_after_reindex_and_delete(
+    search_session: Session,
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "mutable.md"
+    _seed_chunk(
+        search_session,
+        path=file_path,
+        stable_id="revision-one",
+        text_value="revision one",
+        vector=_vector(1.0, 0.0),
+    )
+    search_session.commit()
+    search = HybridSearch(search_session)
+    initial = search.index_fingerprint
+
+    with Session(bind=search_session.get_bind()) as writer:
+        _seed_chunk(
+            writer,
+            path=file_path,
+            stable_id="revision-two",
+            text_value="revision two",
+            vector=_vector(1.0, 0.0),
+            revision=2,
+        )
+        writer.commit()
+    reindexed = search.index_fingerprint
+
+    with Session(bind=search_session.get_bind()) as writer:
+        file = writer.scalar(
+            select(File).where(File.canonical_path == str(file_path.resolve()))
+        )
+        assert file is not None
+        writer.delete(file)
+        writer.commit()
+    deleted = search.index_fingerprint
+
+    assert len({initial, reindexed, deleted}) == 3
 
 
 def test_fts_query_is_safely_quoted_and_cannot_inject_sql(
