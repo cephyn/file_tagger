@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -44,6 +44,7 @@ SessionFactory: TypeAlias = sessionmaker[Session]
 TagData = tuple[str, str | None]
 ReadinessCallback = Callable[[ReadinessReport | None], None]
 _INDEX_RECOVERY_MAX_WAIT_SECONDS = 1.0
+_CONTEXTUAL_RAG_CACHE_LIMIT = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,14 +116,15 @@ class ModernRuntime:
         self._indexing_service_generation = 0
         self._lock = threading.Lock()
         self._contextual_rag_lock = threading.Lock()
-        self._contextual_rag_services: dict[
+        self._contextual_rag_cache_limit = _CONTEXTUAL_RAG_CACHE_LIMIT
+        self._contextual_rag_services: OrderedDict[
             str,
             tuple[
                 str,
                 RagService,
                 Any,
             ],
-        ] = {}
+        ] = OrderedDict()
         self._unavailable_reason = unavailable_reason
         self._readiness_generation = 0
         self._model_overrides = self._load_model_overrides()
@@ -773,12 +775,17 @@ class ModernRuntime:
         with self._contextual_rag_lock:
             cached = self._contextual_rag_services.get(checked_id)
             if cached is not None and cached[0] == key:
+                self._contextual_rag_services.move_to_end(checked_id)
                 return checked_id, cached[1]
             if cached is not None:
                 try:
                     cached[2].close()
                 except Exception:
                     pass
+                close_rag = getattr(cached[1], "close_session", None)
+                if callable(close_rag):
+                    close_rag(checked_id)
+                del self._contextual_rag_services[checked_id]
 
             if self.session_factory is None:
                 raise ModernSearchUnavailable(self.unavailable_reason)
@@ -800,7 +807,30 @@ class ModernRuntime:
                 embedding_profile=profile,
             )
             self._contextual_rag_services[checked_id] = (key, rag, session)
+            self._contextual_rag_services.move_to_end(checked_id)
+            while len(self._contextual_rag_services) > self._contextual_rag_cache_limit:
+                evicted_id, evicted = self._contextual_rag_services.popitem(last=False)
+                try:
+                    evicted[2].close()
+                except Exception:
+                    pass
+                close_rag = getattr(evicted[1], "close_session", None)
+                if callable(close_rag):
+                    close_rag(evicted_id)
             return checked_id, rag
+
+    def close_contextual_session(self, session_id: str) -> None:
+        checked_id = session_id or "default"
+        with self._contextual_rag_lock:
+            cached = self._contextual_rag_services.pop(checked_id, None)
+            if cached is not None:
+                try:
+                    cached[2].close()
+                except Exception:
+                    pass
+                close_rag = getattr(cached[1], "close_session", None)
+                if callable(close_rag):
+                    close_rag(checked_id)
 
     def get_session_answer(self, session_id: str) -> CitedAnswer | None:
         checked_id = session_id or "default"
@@ -816,6 +846,7 @@ class ModernRuntime:
         markdown_context: str = "",
         *,
         conversation_id: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> AsyncIterator[str]:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("A nonempty search question is required.")
@@ -859,6 +890,7 @@ class ModernRuntime:
             question,
             markdown_context,
             conversation_id=checked_id,
+            cancellation_check=cancellation_check,
         ):
             yield fragment
 
@@ -868,6 +900,7 @@ class ModernRuntime:
         markdown_context: str = "",
         *,
         conversation_id: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> Any:
         """Answer a question using the shared hybrid search and RAG services."""
         if not isinstance(question, str) or not question.strip():
@@ -916,6 +949,7 @@ class ModernRuntime:
                 question,
                 markdown_context,
                 conversation_id=checked_id,
+                cancellation_check=cancellation_check,
             ):
                 pass
             return rag.get_session_answer(checked_id)

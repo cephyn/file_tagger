@@ -1125,6 +1125,61 @@ def test_modern_runtime_search_uses_active_profile_and_embedding_gateway(
     )
 
 
+def test_modern_runtime_evicts_contextual_service_and_closes_session(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    closed = []
+
+    class FakeSession:
+        def close(self) -> None:
+            closed.append(self)
+
+    class FakeFactory:
+        def __call__(self):
+            return FakeSession()
+
+    class FakeSearch:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeRag:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    monkeypatch.setattr("file_tagger.modern_context.HybridSearch", FakeSearch)
+    monkeypatch.setattr("file_tagger.modern_context.RagService", FakeRag)
+
+    runtime = ModernRuntime(_paths(tmp_path, monkeypatch), FakeFactory())
+    runtime._contextual_rag_cache_limit = 2
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-active",
+        digest="sha256:embedding",
+        context_length=4096,
+        capabilities=("embedding",),
+    )
+    generation = ModelProfile(
+        role="generation",
+        model="generation-active",
+        digest="sha256:generation",
+        context_length=4096,
+        capabilities=("completion",),
+    )
+
+    runtime._get_contextual_rag_service("conversation-1", profile=profile, generation_profile=generation)
+    runtime._get_contextual_rag_service("conversation-2", profile=profile, generation_profile=generation)
+    runtime._get_contextual_rag_service("conversation-3", profile=profile, generation_profile=generation)
+
+    assert "conversation-1" not in runtime._contextual_rag_services
+    assert len(closed) == 1
+
+    runtime.close_contextual_session("conversation-2")
+
+    assert "conversation-2" not in runtime._contextual_rag_services
+    assert len(closed) == 2
+
+
 def test_modern_runtime_reuses_contextual_rag_service_for_conversation(
     tmp_path,
     monkeypatch,

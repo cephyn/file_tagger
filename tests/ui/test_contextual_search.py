@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 from file_tagger.ui.contextual_search import (
     ContextualSearchDialog,
@@ -127,3 +128,64 @@ def test_contextual_worker_emits_slow_gateway_fragments_incrementally(qtbot) -> 
     qtbot.waitUntil(lambda: len(chunks) == 4)
 
     assert chunks == ["The ", "clue ", "arrives ", "slowly."]
+
+
+def test_dialog_stale_worker_callbacks_cannot_mutate_replacement_ui(qtbot) -> None:
+    dialog = ContextualSearchDialog(rag_service=SimpleNamespace())
+    qtbot.addWidget(dialog)
+
+    old_worker = ContextualSearchWorker(
+        SimpleNamespace(),
+        ContextualSearchSubmission(question="old"),
+        session_id="old",
+    )
+    replacement_worker = ContextualSearchWorker(
+        SimpleNamespace(),
+        ContextualSearchSubmission(question="new"),
+        session_id="new",
+    )
+    dialog._worker = replacement_worker
+    dialog._worker_generation = getattr(dialog, "_worker_generation", 1) + 1
+    generation = dialog._worker_generation
+
+    dialog._answer_ready(SimpleNamespace(text="new"), replacement_worker, generation)
+    dialog.answer_output.setPlainText("replacement")
+
+    dialog._answer_ready(SimpleNamespace(text="old"), old_worker, generation)
+    dialog._render_citations((SimpleNamespace(path="old.md"),), old_worker, generation)
+
+    assert dialog.answer_output.toPlainText() == "replacement"
+    assert dialog.citations_list.count() == 0
+
+
+def test_dialog_close_requests_worker_cancellation_and_clears_session(qtbot) -> None:
+    release = threading.Event()
+
+    class Service:
+        def close_contextual_session(self, session_id):
+            assert session_id
+            closed.append(session_id)
+
+        async def answer_contextual_question_stream_async(
+            self,
+            question,
+            markdown_context,
+            **kwargs,
+        ):
+            del question, markdown_context, kwargs
+            release.wait(2)
+            yield "late"
+
+    closed = []
+    dialog = ContextualSearchDialog(rag_service=Service())
+    qtbot.addWidget(dialog)
+    dialog.question.setText("cancel me")
+    dialog.submit()
+    worker = dialog._worker
+    assert worker is not None
+
+    dialog.close()
+    qtbot.waitUntil(lambda: worker.isFinished() or not worker.isRunning())
+    release.set()
+
+    assert worker._cancel_requested.is_set()

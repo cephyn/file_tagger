@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+import uuid
 from typing import Any, Sequence, cast
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -93,11 +94,19 @@ class ContextualSearchWorker(QThread):
                 async def consume_stream() -> object | None:
                     nonlocal answer
                     if hasattr(self._service, "answer_contextual_question_stream_async"):
-                        stream = stream_method(
-                            self.submission.question,
-                            markdown_context,
-                            conversation_id=self._session_id,
-                        )
+                        try:
+                            stream = stream_method(
+                                self.submission.question,
+                                markdown_context,
+                                conversation_id=self._session_id,
+                                cancellation_check=self._cancel_requested.is_set,
+                            )
+                        except TypeError:
+                            stream = stream_method(
+                                self.submission.question,
+                                markdown_context,
+                                conversation_id=self._session_id,
+                            )
                     else:
                         stream = stream_method(
                             self.submission.question,
@@ -128,11 +137,19 @@ class ContextualSearchWorker(QThread):
                     None,
                 )
                 if callable(answer_method):
-                    answer = answer_method(
-                        self.submission.question,
-                        markdown_context,
-                        conversation_id=self._session_id,
-                    )
+                    try:
+                        answer = answer_method(
+                            self.submission.question,
+                            markdown_context,
+                            conversation_id=self._session_id,
+                            cancellation_check=self._cancel_requested.is_set,
+                        )
+                    except TypeError:
+                        answer = answer_method(
+                            self.submission.question,
+                            markdown_context,
+                            conversation_id=self._session_id,
+                        )
                 else:
                     rag_method = getattr(self._service, "answer_question", None)
                     if not callable(rag_method):
@@ -179,6 +196,8 @@ class ContextualSearchDialog(QDialog):
         self.rag_service = rag_service
         self._context_file: Path | None = None
         self._worker: ContextualSearchWorker | None = None
+        self._worker_generation = 0
+        self._session_id = f"ui:{uuid.uuid4().hex}"
         if readiness is not None:
             selected_readiness = readiness
         elif readiness_report is not None:
@@ -332,22 +351,40 @@ class ContextualSearchDialog(QDialog):
             return None
         if self._worker is not None and self._worker.isRunning():
             self._worker.request_cancel()
+            self._stop_worker(self._worker)
         self.answer_output.clear()
         self.citations_list.clear()
         self.evidence_list.clear()
         worker = ContextualSearchWorker(
             service,
             submission,
-            session_id=f"ui:{id(self)}",
+            session_id=self._session_id,
         )
         self._worker = worker
+        self._worker_generation += 1
+        generation = self._worker_generation
         _ACTIVE_CONTEXTUAL_SEARCH_WORKERS.add(worker)
-        worker.answer_chunk.connect(self.answer_output.insertPlainText)
-        worker.answer_ready.connect(self._answer_ready)
-        worker.citations_ready.connect(self._render_citations)
-        worker.evidence_ready.connect(self._render_evidence)
-        worker.failure.connect(self._search_failed)
-        worker.finished.connect(lambda worker=worker: self._worker_finished(worker))
+        worker.answer_chunk.connect(
+            lambda chunk, w=worker, g=generation: self._answer_chunk(chunk, w, g)
+        )
+        worker.answer_ready.connect(
+            lambda answer, w=worker, g=generation: self._answer_ready(answer, w, g)
+        )
+        worker.citations_ready.connect(
+            lambda citations, w=worker, g=generation: self._render_citations(citations, w, g)
+        )
+        worker.evidence_ready.connect(
+            lambda evidence, w=worker, g=generation: self._render_evidence(evidence, w, g)
+        )
+        worker.failure.connect(
+            lambda exc, w=worker, g=generation: self._search_failed(exc, w, g)
+        )
+        worker.cancelled.connect(
+            lambda w=worker, g=generation: self._search_cancelled(w, g)
+        )
+        worker.finished.connect(
+            lambda w=worker, g=generation: self._worker_finished(w, g)
+        )
         self.submission_button.setEnabled(False)
         worker.start()
         return submission
@@ -360,20 +397,80 @@ class ContextualSearchDialog(QDialog):
         self.follow_up_input.clear()
         self.submit()
 
-    def _answer_ready(self, _answer: object) -> None:
+    def _answer_chunk(
+        self,
+        chunk: str,
+        worker: ContextualSearchWorker,
+        generation: int,
+    ) -> None:
+        if not self._is_current_worker(worker, generation):
+            return
+        self.answer_output.insertPlainText(chunk)
+
+    def _is_current_worker(
+        self,
+        worker: ContextualSearchWorker,
+        generation: int,
+    ) -> bool:
+        return (
+            worker is self._worker
+            and generation == self._worker_generation
+        )
+
+    def _answer_ready(
+        self,
+        _answer: object,
+        worker: ContextualSearchWorker | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if worker is not None and generation is not None:
+            if not self._is_current_worker(worker, generation):
+                return
         self.submission_button.setEnabled(True)
 
-    def _search_failed(self, exc: object) -> None:
+    def _search_failed(
+        self,
+        exc: object,
+        worker: ContextualSearchWorker | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if worker is not None and generation is not None:
+            if not self._is_current_worker(worker, generation):
+                return
         QMessageBox.warning(self, "Contextual search failed", str(exc))
         self.submission_button.setEnabled(True)
 
-    def _worker_finished(self, worker: ContextualSearchWorker) -> None:
-        _ACTIVE_CONTEXTUAL_SEARCH_WORKERS.discard(worker)
-        if worker is self._worker:
-            self._worker = None
-        worker.deleteLater()
+    def _search_cancelled(
+        self,
+        worker: ContextualSearchWorker,
+        generation: int,
+    ) -> None:
+        if not self._is_current_worker(worker, generation):
+            return
+        self.submission_button.setEnabled(True)
 
-    def _render_citations(self, citations: Sequence[Any]) -> None:
+    def _worker_finished(
+        self,
+        worker: ContextualSearchWorker,
+        generation: int | None = None,
+    ) -> None:
+        _ACTIVE_CONTEXTUAL_SEARCH_WORKERS.discard(worker)
+        if generation is not None and self._is_current_worker(worker, generation):
+            self._worker = None
+            self.submission_button.setEnabled(True)
+        elif worker is self._worker and generation is None:
+            self._worker = None
+            self.submission_button.setEnabled(True)
+
+    def _render_citations(
+        self,
+        citations: Sequence[Any],
+        worker: ContextualSearchWorker | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if worker is not None and generation is not None:
+            if not self._is_current_worker(worker, generation):
+                return
         self.citations_list.clear()
         for citation in citations:
             path = getattr(citation, "path", getattr(citation, "file_path", ""))
@@ -385,7 +482,15 @@ class ContextualSearchDialog(QDialog):
             if path:
                 widget_item.setData(Qt.ItemDataRole.UserRole, str(path))
 
-    def _render_evidence(self, evidence: Sequence[Any]) -> None:
+    def _render_evidence(
+        self,
+        evidence: Sequence[Any],
+        worker: ContextualSearchWorker | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if worker is not None and generation is not None:
+            if not self._is_current_worker(worker, generation):
+                return
         self.evidence_list.clear()
         paths: list[str] = []
         for item in evidence:
@@ -411,6 +516,41 @@ class ContextualSearchDialog(QDialog):
         path = item.data(Qt.ItemDataRole.UserRole)
         if path:
             open_file(str(path))
+
+    def _stop_worker(self, worker: ContextualSearchWorker) -> None:
+        worker.request_cancel()
+        if worker.isRunning():
+            worker.wait(2000)
+        if worker.isRunning():
+            worker.terminate()
+            worker.wait(500)
+
+    def _close_contextual_session(self) -> None:
+        close_method = getattr(self.modern_runtime, "close_contextual_session", None)
+        if not callable(close_method):
+            close_method = getattr(self.rag_service, "close_session", None)
+        if not callable(close_method):
+            close_method = getattr(self.rag_service, "close_contextual_session", None)
+        if callable(close_method):
+            close_method(self._session_id)
+
+    def reject(self) -> None:
+        worker = self._worker
+        if worker is not None:
+            self._stop_worker(worker)
+        self._worker_generation += 1
+        self._worker = None
+        self._close_contextual_session()
+        super().reject()
+
+    def closeEvent(self, event: Any) -> None:
+        worker = self._worker
+        if worker is not None:
+            self._stop_worker(worker)
+        self._worker_generation += 1
+        self._worker = None
+        self._close_contextual_session()
+        super().closeEvent(event)
 
 
 __all__ = (

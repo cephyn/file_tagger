@@ -63,6 +63,16 @@ class ProfiledFakeModel(FakeModel):
         )
 
 
+def test_close_session_removes_rag_conversation_state() -> None:
+    service = RagService(search=None, gateway=FakeModel("{}"))
+    service._session_states["conversation-1"] = object()  # type: ignore[assignment]
+
+    service.close_session("conversation-1")
+
+    assert "conversation-1" not in service._session_states
+    assert "conversation-1" not in service._session_locks
+
+
 def _evidence() -> tuple[SearchResult, ...]:
     return (
         make_result(

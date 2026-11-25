@@ -184,6 +184,17 @@ class RagService:
             answer = state.answer
         return answer
 
+    def close_session(self, session_id: str) -> None:
+        checked_session = _validate_session_identity(session_id, None)
+        with self._session_registry_lock:
+            self._session_states.pop(checked_session, None)
+            self._session_locks.pop(checked_session, None)
+
+    def close_all_sessions(self) -> None:
+        with self._session_registry_lock:
+            self._session_states.clear()
+            self._session_locks.clear()
+
     def answer_question(
         self,
         question: str,
@@ -196,6 +207,7 @@ class RagService:
         session_id: str | None = None,
         conversation_id: str | None = None,
         retrieval_question: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> CitedAnswer:
         return _run_sync(
             self.answer_question_async(
@@ -208,6 +220,7 @@ class RagService:
                 session_id=session_id,
                 conversation_id=conversation_id,
                 retrieval_question=retrieval_question,
+                cancellation_check=cancellation_check,
             )
         )
 
@@ -223,6 +236,7 @@ class RagService:
         session_id: str | None = None,
         conversation_id: str | None = None,
         retrieval_question: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> CitedAnswer:
         checked_question = _validate_question(question)
         if not isinstance(markdown_context, str):
@@ -335,6 +349,7 @@ class RagService:
                         per_query_limit=self.per_query_limit,
                         limit=self.evidence_limit,
                         max_sections_per_file=self.max_sections_per_file,
+                        cancellation_check=cancellation_check,
                     )
                 previous_history = ()
                 version = previous_state.version if previous_state is not None else 0
@@ -349,6 +364,7 @@ class RagService:
                 rerank_top_k=rerank_top_k,
                 max_context_retries=max_context_retries,
                 history=previous_history,
+                cancellation_check=cancellation_check,
             )
             updated = _SessionState(
                 key=key,
@@ -373,6 +389,7 @@ class RagService:
         session_id: str | None = None,
         conversation_id: str | None = None,
         retrieval_question: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> AsyncIterator[str]:
         checked_question = _validate_question(question)
         if not isinstance(markdown_context, str):
@@ -485,6 +502,7 @@ class RagService:
                         per_query_limit=self.per_query_limit,
                         limit=self.evidence_limit,
                         max_sections_per_file=self.max_sections_per_file,
+                        cancellation_check=cancellation_check,
                     )
                 previous_history = ()
                 version = previous_state.version if previous_state is not None else 0
@@ -500,6 +518,7 @@ class RagService:
                 rerank_top_k=rerank_top_k,
                 max_context_retries=max_context_retries,
                 history=previous_history,
+                cancellation_check=cancellation_check,
             ):
                 if fragment:
                     yield fragment
@@ -546,6 +565,7 @@ class RagService:
         session_id: str | None = None,
         conversation_id: str | None = None,
         retrieval_question: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> CitedAnswer:
         if not isinstance(plan, SearchPlan):
             raise TypeError("plan must be a SearchPlan.")
@@ -564,6 +584,7 @@ class RagService:
             per_query_limit=self.per_query_limit,
             limit=self.evidence_limit,
             max_sections_per_file=self.max_sections_per_file,
+            cancellation_check=cancellation_check,
         )
         return await self.answer_question_async(
             plan.question,
@@ -573,6 +594,7 @@ class RagService:
             session_id=session_id,
             conversation_id=conversation_id,
             retrieval_question=retrieval_question or plan.question,
+            cancellation_check=cancellation_check,
         )
 
     def answer_plan(
@@ -584,6 +606,7 @@ class RagService:
         session_id: str | None = None,
         conversation_id: str | None = None,
         retrieval_question: str | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> CitedAnswer:
         return _run_sync(
             self.answer_plan_async(
@@ -593,6 +616,7 @@ class RagService:
                 session_id=session_id,
                 conversation_id=conversation_id,
                 retrieval_question=retrieval_question,
+                cancellation_check=cancellation_check,
             )
         )
 
@@ -1108,6 +1132,7 @@ async def _generate_answer_stream_async(
     rerank_top_k: int,
     max_context_retries: int,
     history: ChatHistory = (),
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> AsyncIterator[tuple[str, CitedAnswer | None]]:
     if rerank_top_k <= 0:
         raise ValueError("The rerank top-k must be positive.")
@@ -1115,6 +1140,8 @@ async def _generate_answer_stream_async(
         raise ValueError("The context retry limit cannot be negative.")
 
     selected = tuple(evidence)
+    if cancellation_check is not None and cancellation_check():
+        raise asyncio.CancelledError
     if not selected:
         yield "", CitedAnswer(
             question=question,
@@ -1171,6 +1198,8 @@ async def _generate_answer_stream_async(
                 messages=messages,
                 schema=answer_schema(),
             ):
+                if cancellation_check is not None and cancellation_check():
+                    raise asyncio.CancelledError
                 if not isinstance(fragment, str) or not fragment:
                     continue
                 accumulated += fragment
@@ -1239,6 +1268,7 @@ async def _generate_answer_async(
     rerank_top_k: int,
     max_context_retries: int,
     history: ChatHistory = (),
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> CitedAnswer:
     if rerank_top_k <= 0:
         raise ValueError("The rerank top-k must be positive.")
@@ -1246,6 +1276,8 @@ async def _generate_answer_async(
         raise ValueError("The context retry limit cannot be negative.")
 
     selected = tuple(evidence)
+    if cancellation_check is not None and cancellation_check():
+        raise asyncio.CancelledError
     if not selected:
         return CitedAnswer(question=question, text=NOT_FOUND_ANSWER)
 
@@ -1284,6 +1316,8 @@ async def _generate_answer_async(
                 messages=messages,
                 schema=answer_schema(),
             )
+            if cancellation_check is not None and cancellation_check():
+                raise asyncio.CancelledError
             return parse_cited_answer(question, response, bounded)
         except GenerationContextRejectedError:
             if len(bounded) <= 1 or retries >= max_context_retries:
