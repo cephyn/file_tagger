@@ -39,9 +39,6 @@ def main():
     # Initialize logging first
     log_file = setup_logging()
     
-    # Fix for ChromaDB ONNX issue in PyInstaller
-    os.environ["CHROMADB_DISABLE_ONNX"] = "1"
-    
     try:
         from .login import LoginScreen
 

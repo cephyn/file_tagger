@@ -21,7 +21,7 @@ from .tagging.cache import (
     TagRecommendationCache,
 )
 from .tagging.candidate_service import CandidateService
-from .vector_search.content_extractor import ContentExtractor
+from .extraction.docling_adapter import extract_document
 
 
 MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
@@ -34,7 +34,7 @@ TAG_SUGGESTION_EXTRACTION_VERSION = "tag-suggestion-state-v1"
 
 
 class TagSuggestionConfig(Protocol):
-    def get_pdf_extractor(self) -> str: ...
+    pass
 
 
 def _document_state(file_path: str) -> str:
@@ -49,7 +49,7 @@ def _document_state(file_path: str) -> str:
         except OSError:
             pass
     else:
-        content = ContentExtractor.extract_file_content(file_path) or ""
+        content = extract_document(file_path).full_markdown
     state = (
         f"Filename: {os.path.basename(file_path)}\n"
         f"Type: {mime_type or 'application/octet-stream'}\n"

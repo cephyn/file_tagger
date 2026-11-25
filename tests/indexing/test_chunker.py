@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from file_tagger.indexing.chunker import chunk_document
-from file_tagger.vector_search.document_chunker import DocumentChunker
 
 
 @dataclass(frozen=True)
@@ -82,13 +81,9 @@ def test_overlap_is_bounded_and_empty_pages_do_not_create_chunks() -> None:
 
 def test_legacy_chunker_returns_compatible_text_without_changing_coverage() -> None:
     text = "Long paragraph. " * 100
-
-    chunks = DocumentChunker.chunk_document(
-        text,
-        min_chunk_size=20,
-        max_chunk_size=120,
-        overlap=10,
+    chunks = chunk_document(
+        [Page(number=1, markdown=text)],
+        soft_limit_tokens=20,
+        overlap_tokens=10,
     )
-
     assert chunks
-    assert all(isinstance(chunk, str) for chunk in chunks)

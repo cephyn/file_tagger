@@ -151,18 +151,7 @@ class Config:
         """Load and decrypt configuration file."""
         if not os.path.exists(self.paths.config_file):
             return {
-                'api_keys': {
-                    'openai': '',
-                    'gemini': '',
-                    'anthropic': ''
-                },
-                'selected_provider': 'openai',
                 'home_directory': str(Path.home()),  # Default to user's home directory
-                'local_models': {
-                    'model_path': '',
-                    'model_type': 'llama'  # Default model type
-                },
-                'pdf_extractor': 'accurate',  # 'fast' or 'accurate' for PDF extraction
                 'system_message': DEFAULT_SYSTEM_MESSAGE
             }
         
@@ -172,46 +161,18 @@ class Config:
             decrypted_data = self.fernet.decrypt(encrypted_data)
             config = json.loads(decrypted_data)
 
-            config.setdefault(
-                'api_keys',
-                {'openai': '', 'gemini': '', 'anthropic': ''}
-            )
-            config.setdefault('selected_provider', 'openai')
-            
             # Add home_directory if it doesn't exist in older config files
             if 'home_directory' not in config:
                 config['home_directory'] = str(Path.home())
-                
-            # Add local_models if it doesn't exist in older config files
-            if 'local_models' not in config:
-                config['local_models'] = {
-                    'model_path': '',
-                    'model_type': 'llama'
-                }
             
             # Add system_message if it doesn't exist in older config files
             if 'system_message' not in config:
                 config['system_message'] = DEFAULT_SYSTEM_MESSAGE
-            
-            # Add pdf_extractor if it doesn't exist in older config files
-            if 'pdf_extractor' not in config:
-                config['pdf_extractor'] = 'accurate'
                 
             return config
         except Exception:
             return {
-                'api_keys': {
-                    'openai': '',
-                    'gemini': '',
-                    'anthropic': ''
-                },
-                'selected_provider': 'openai',
                 'home_directory': str(Path.home()),
-                'local_models': {
-                    'model_path': '',
-                    'model_type': 'llama'
-                },
-                'pdf_extractor': 'accurate',  # 'fast' or 'accurate' for PDF extraction
                 'system_message': DEFAULT_SYSTEM_MESSAGE
             }
     
@@ -227,24 +188,6 @@ class Config:
             raise ValueError("Invalid password after configuration migration")
         self.fernet = get_encryption_key(self.password)
         self.config_data = self._load_config()
-    
-    def set_api_key(self, provider: str, key: str):
-        """Set API key for a provider."""
-        self.config_data['api_keys'][provider] = key
-        self.save()
-    
-    def get_api_key(self, provider: str) -> str:
-        """Get API key for a provider."""
-        return self.config_data['api_keys'].get(provider, '')
-    
-    def set_selected_provider(self, provider: str):
-        """Set the selected AI provider."""
-        self.config_data['selected_provider'] = provider
-        self.save()
-    
-    def get_selected_provider(self) -> str:
-        """Get the selected AI provider."""
-        return self.config_data.get('selected_provider', 'openai')
     
     def change_password(self, old_password: str, new_password: str) -> bool:
         """Change the encryption password."""
@@ -348,27 +291,6 @@ class Config:
         """Get the configured home directory."""
         return self.config_data.get('home_directory', str(Path.home()))
 
-    def set_local_model_path(self, path: str):
-        """Set the local AI model path."""
-        if os.path.exists(path):
-            self.config_data['local_models']['model_path'] = path
-            self.save()
-            return True
-        return False
-    
-    def get_local_model_path(self) -> str:
-        """Get the local AI model path."""
-        return self.config_data.get('local_models', {}).get('model_path', '')
-    
-    def set_local_model_type(self, model_type: str):
-        """Set the local AI model type."""
-        self.config_data['local_models']['model_type'] = model_type
-        self.save()
-    
-    def get_local_model_type(self) -> str:
-        """Get the local AI model type."""
-        return self.config_data.get('local_models', {}).get('model_type', 'llama')
-    
     def set_system_message(self, message: str):
         """Set the custom system message for AI interactions."""
         self.config_data['system_message'] = message
@@ -382,15 +304,3 @@ class Config:
         """Reset the system message to the default value."""
         self.config_data['system_message'] = DEFAULT_SYSTEM_MESSAGE
         self.save()
-
-    def set_pdf_extractor(self, preference: str):
-        """Set the PDF content extractor preference ('fast' or 'accurate')."""
-        if preference not in ['fast', 'accurate']:
-            raise ValueError("PDF extractor preference must be 'fast' or 'accurate'")
-            
-        self.config_data['pdf_extractor'] = preference
-        self.save()
-        
-    def get_pdf_extractor(self) -> str:
-        """Get the PDF content extractor preference."""
-        return self.config_data.get('pdf_extractor', 'accurate')

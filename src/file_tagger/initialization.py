@@ -11,9 +11,6 @@ from .infrastructure.app_paths import AppPaths
 from .migration.legacy_chroma import inspect_legacy_chroma
 from .modern_context import initialize_modern_runtime
 
-# Set ONNX environment variable here too for the worker thread
-os.environ["CHROMADB_DISABLE_ONNX"] = "1"
-
 # Log initialization steps
 log_dir = AppPaths.discover().logs_dir
 log_dir.mkdir(parents=True, exist_ok=True)
@@ -26,24 +23,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("Initialization")
-
-# Safely try imports that might be problematic after packaging
-logger.debug("Attempting to import potentially problematic modules...")
-try:
-    logger.debug("Importing sentence_transformers...")
-    import sentence_transformers  # noqa: F401
-    logger.debug("Successfully imported sentence_transformers")
-except Exception as e:
-    logger.error(f"Error importing sentence_transformers: {str(e)}")
-    logger.error(traceback.format_exc())
-
-try:
-    logger.debug("Importing onnxruntime...")
-    import onnxruntime  # noqa: F401
-    logger.debug("Successfully imported onnxruntime")
-except Exception as e:
-    logger.error(f"Error importing onnxruntime: {str(e)}")
-    logger.error(traceback.format_exc())
 
 class InitializationWorker(QThread):
     progress_signal = Signal(str, int)
@@ -121,7 +100,7 @@ class InitializationWorker(QThread):
             # Send the results back to the main thread
             logger.debug("Initialization completed successfully, emitting signal")
             self.finished_signal.emit(
-                (db_session, config, None, modern_runtime)
+                (db_session, config, modern_runtime)
             )
             
         except Exception as e:

@@ -1974,7 +1974,7 @@ def test_initialization_worker_exposes_modern_runtime_to_login(
     worker.run()
 
     assert len(results) == 1
-    assert results[0] == (legacy_session, config, None, runtime)
+    assert results[0] == (legacy_session, config, runtime)
 
 
 def test_login_accepts_modern_runtime_without_legacy_search(
@@ -1986,12 +1986,12 @@ def test_login_accepts_modern_runtime_without_legacy_search(
 
     from file_tagger.login import LoginScreen
 
-    constructed: list[tuple[object, object, object, object]] = []
+    constructed: list[tuple[object, object, object]] = []
 
     class Window(QWidget):
         def __init__(self, *args: object) -> None:
             super().__init__()
-            constructed.append((args[0], args[1], args[2], args[3]))
+            constructed.append((args[0], args[1], args[2]))
 
     manager_module = ModuleType("file_tagger.file_tag_manager")
     manager_module.FileTagManager = Window
@@ -2005,9 +2005,9 @@ def test_login_accepts_modern_runtime_without_legacy_search(
     config = object()
 
     screen.on_initialization_finished(
-        (legacy_session, config, None, modern_runtime)
+        (legacy_session, config, modern_runtime)
     )
 
     assert constructed == [
-        (legacy_session, config, None, modern_runtime)
+        (legacy_session, config, modern_runtime)
     ]

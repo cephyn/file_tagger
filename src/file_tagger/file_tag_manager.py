@@ -37,7 +37,6 @@ from PySide6.QtGui import (
     QColor,
     QTextDocument,
     QAction,
-    QActionGroup,
 )
 from PySide6.QtCore import QSize
 from .models import File, Tag
@@ -195,7 +194,7 @@ class AboutDialog(QDialog):
 class FileTagManager(QMainWindow):
     """Main window for the File Tagger application."""
 
-    def __init__(self, db_session, config, vector_search=None, modern_runtime=None):
+    def __init__(self, db_session, config, modern_runtime=None):
         # Set up logging for the main window
         self.logger = logging.getLogger("FileTagManager")
         # Add a file handler for main window-specific issues
@@ -222,10 +221,6 @@ class FileTagManager(QMainWindow):
                 self.logger.debug(f"Received config: {config is not None}")
                 self.config = config
 
-                self.logger.debug(
-                    f"Received vector_search: {vector_search is not None}"
-                )
-                self.vector_search = vector_search
                 self.modern_runtime = modern_runtime
                 self.modern_index_status_text = ""
 
@@ -524,35 +519,6 @@ class FileTagManager(QMainWindow):
 
         password_action = settings_menu.addAction("Password Management")
         password_action.triggered.connect(self.show_password_management)
-
-        # Add PDF extractor settings submenu
-        pdf_extractor_menu = settings_menu.addMenu("PDF Extractor")
-
-        # Create action group to ensure only one option is selected at a time
-        self.pdf_extractor_group = QActionGroup(self)
-        self.pdf_extractor_group.setExclusive(True)
-
-        # Create actions for PDF extractor options
-        self.fast_action = QAction("Fast (markitdown)", self)
-        self.fast_action.setCheckable(True)
-        self.fast_action.setActionGroup(self.pdf_extractor_group)
-        self.fast_action.triggered.connect(lambda: self.set_pdf_extractor("fast"))
-
-        self.accurate_action = QAction("Slower, more accurate (docling)", self)
-        self.accurate_action.setCheckable(True)
-        self.accurate_action.setActionGroup(self.pdf_extractor_group)
-        self.accurate_action.triggered.connect(
-            lambda: self.set_pdf_extractor("accurate")
-        )
-
-        # Add actions to the menu
-        pdf_extractor_menu.addAction(self.fast_action)
-        pdf_extractor_menu.addAction(self.accurate_action)
-
-        # Set initial state based on configuration
-        pdf_extractor = self.config.get_pdf_extractor()
-        self.fast_action.setChecked(pdf_extractor == "fast")
-        self.accurate_action.setChecked(pdf_extractor == "accurate")
 
         # Add scan directory action
         scan_action = menubar.addAction("Scan Directory")
@@ -2379,40 +2345,3 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(self, "Error", f"Failed to reindex file: {str(e)}")
             return False
 
-    def set_pdf_extractor(self, preference):
-        """Set the PDF extractor preference."""
-        try:
-            current = self.config.get_pdf_extractor()
-            if current == preference:
-                return  # No change needed
-
-            # Update configuration
-            self.config.set_pdf_extractor(preference)
-
-            # Update action states - use the stored action references
-            # instead of trying to access the menu directly
-            self.fast_action.setChecked(preference == "fast")
-            self.accurate_action.setChecked(preference == "accurate")
-
-            # Show confirmation message
-            if preference == "fast":
-                QMessageBox.information(
-                    self,
-                    "PDF Extractor Changed",
-                    "PDF extractor set to Fast mode (using markitdown).\n\n"
-                    "This setting will be used for all future PDF and Word document extraction.",
-                )
-            else:
-                QMessageBox.information(
-                    self,
-                    "PDF Extractor Changed",
-                    "PDF extractor set to Accurate mode (using docling).\n\n"
-                    "This setting will be used for all future PDF and Word document extraction.",
-                )
-
-        except Exception as e:
-            self.logger.error(f"Error setting PDF extractor preference: {str(e)}")
-            self.logger.error(traceback.format_exc())
-            QMessageBox.warning(
-                self, "Error", f"Failed to change PDF extractor preference: {str(e)}"
-            )

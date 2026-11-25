@@ -2,7 +2,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from file_tagger.extraction.docling_adapter import DoclingAdapter, extract_document
-from file_tagger.vector_search.content_extractor import ContentExtractor
 
 
 class FakeDocument:
@@ -149,7 +148,7 @@ def test_encrypted_and_unsupported_documents_have_typed_failures(
     assert unsupported_document.failure == "unsupported"
 
 
-def test_legacy_extractor_delegates_to_docling_adapter(
+def test_docling_adapter_extracts_modern_text(
     tmp_path: Path, monkeypatch
 ) -> None:
     source = _write_source(tmp_path, ".txt")
@@ -158,13 +157,7 @@ def test_legacy_extractor_delegates_to_docling_adapter(
         source,
         converter_factory=lambda use_ocr: converter,
     )
-    monkeypatch.setattr(
-        DoclingAdapter,
-        "extract",
-        lambda self, file_path: extracted,
-    )
-
-    content = ContentExtractor.extract_file_content(str(source))
+    content = extracted.full_markdown
 
     assert content is not None
     assert "# Local text" in content

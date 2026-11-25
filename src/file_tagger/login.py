@@ -237,14 +237,10 @@ class LoginScreen(QWidget):
         """Handle completion of the initialization process."""
         logger.debug("on_initialization_finished called with result")
         try:
-            if len(result) == 3:
-                db_session, config, vector_search = result
-                modern_runtime = None
-            else:
-                db_session, config, vector_search, modern_runtime = result
-            logger.debug(f"Unpacked result: db_session={db_session is not None}, config={config is not None}, vector_search={vector_search is not None}, modern_runtime={modern_runtime is not None}")
+            db_session, config, modern_runtime = result
+            logger.debug(f"Unpacked result: db_session={db_session is not None}, config={config is not None}, modern_runtime={modern_runtime is not None}")
             
-            if db_session and config and (modern_runtime or vector_search):
+            if db_session and config and modern_runtime:
                 logger.debug("Initialization succeeded, preparing to show main window")
                 try:
                     # Hide the login window
@@ -261,7 +257,6 @@ class LoginScreen(QWidget):
                     window = FileTagManager(
                         db_session,
                         config,
-                        vector_search,
                         modern_runtime,
                     )
                     logger.debug("FileTagManager instance created")

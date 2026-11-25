@@ -140,6 +140,16 @@ def _error_messages(result: Any) -> tuple[str, ...]:
     )
 
 
+def _parser_version() -> str:
+    try:
+        return version("docling-slim")
+    except Exception:
+        try:
+            return version("docling")
+        except Exception:
+            return "unknown"
+
+
 def _conversion_failure(
     path: Path,
     file_hash: str,
@@ -164,7 +174,7 @@ def _conversion_failure(
     return ExtractedDocument(
         file_path=str(path),
         file_hash=file_hash,
-        parser_version=version("docling"),
+        parser_version=_parser_version(),
         status="failed",
         diagnostics=diagnostics,
         failure=failure,
@@ -382,7 +392,7 @@ def _from_result(
     return ExtractedDocument(
         file_path=str(path),
         file_hash=file_hash,
-        parser_version=version("docling"),
+        parser_version=_parser_version(),
         status="warnings" if diagnostics else "complete",
         pages=pages,
         full_markdown=full_markdown,

@@ -561,8 +561,8 @@ def test_document_state_raw_reads_plain_text_only(
         raise AssertionError("plain text must not be sent to Docling")
 
     monkeypatch.setattr(
-        tag_suggestion.ContentExtractor,
-        "extract_file_content",
+        tag_suggestion,
+        "extract_document",
         unexpected_extraction,
     )
 
@@ -583,16 +583,12 @@ def test_document_state_extracts_structured_and_non_text_files(
     source.write_bytes(b"RAW_BINARY_SHOULD_NOT_APPEAR")
     calls: list[str] = []
 
-    def extract(file_path: str, **kwargs: Any) -> str:
+    def extract(file_path: str, **kwargs: Any):
         del kwargs
         calls.append(file_path)
-        return "Filename: report\n\n# Extracted document"
+        return SimpleNamespace(full_markdown="# Extracted document")
 
-    monkeypatch.setattr(
-        tag_suggestion.ContentExtractor,
-        "extract_file_content",
-        extract,
-    )
+    monkeypatch.setattr(tag_suggestion, "extract_document", extract)
 
     state = tag_suggestion._document_state(str(source))
 
@@ -611,9 +607,9 @@ def test_document_state_is_truncated_safely(
     source.write_bytes(b"%PDF")
     extracted = "Filename: large.pdf\n\n" + ("😀" * (32 * 1024))
     monkeypatch.setattr(
-        tag_suggestion.ContentExtractor,
-        "extract_file_content",
-        lambda *args, **kwargs: extracted,
+        tag_suggestion,
+        "extract_document",
+        lambda *args, **kwargs: SimpleNamespace(full_markdown=extracted),
     )
 
     state = tag_suggestion._document_state(str(source))

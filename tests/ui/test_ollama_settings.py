@@ -512,10 +512,8 @@ def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
     assert applied == [selections]
 
 
-def test_manager_import_preserves_real_content_extractor() -> None:
+def test_manager_import_preserves_modern_tag_suggestion() -> None:
     module = _manager_module()
     from file_tagger import tag_suggestion
-    from file_tagger.vector_search.content_extractor import ContentExtractor
 
     assert module.TagSuggestionDialog is tag_suggestion.TagSuggestionDialog
-    assert tag_suggestion.ContentExtractor is ContentExtractor
