@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import queue
 import threading
-import time
 from typing import Any, Protocol, TypeAlias
 
 from sqlalchemy import select
@@ -133,7 +132,7 @@ class ModernRuntime:
         self._contextual_rag_active: dict[str, int] = {}
         self._retired_contextual_rag: dict[
             str,
-            list[tuple[str, RagService, Any]],
+            list[tuple[int, RagService, Any]],
         ] = {}
         self._unavailable_reason = unavailable_reason
         self._readiness_generation = 0
@@ -771,6 +770,7 @@ class ModernRuntime:
         *,
         profile: ModelProfile,
         generation_profile: ModelProfile,
+        expected_epoch: int | None = None,
     ) -> tuple[str, RagService]:
         checked_id = conversation_id or "default"
         key = "\0".join(
@@ -782,14 +782,23 @@ class ModernRuntime:
                 generation_profile.digest,
             )
         )
-        retired: list[tuple[str, RagService, Any]] = []
+        retired: list[tuple[str, int, RagService, Any]] = []
         with self._contextual_rag_condition:
+            if (
+                expected_epoch is not None
+                and expected_epoch
+                != self._contextual_rag_epochs.get(checked_id, 0)
+            ):
+                raise ModernSearchUnavailable(
+                    "the contextual RAG session was retired."
+                )
             cached = self._contextual_rag_services.get(checked_id)
             if cached is not None and cached[0] == key:
                 self._contextual_rag_services.move_to_end(checked_id)
                 return checked_id, cached[1]
             if cached is not None:
-                retired.append((checked_id, cached[1], cached[2]))
+                old_epoch = self._contextual_rag_epochs.get(checked_id, 0)
+                retired.append((checked_id, old_epoch, cached[1], cached[2]))
                 del self._contextual_rag_services[checked_id]
                 self._contextual_rag_epochs[checked_id] = (
                     self._contextual_rag_epochs.get(checked_id, 0) + 1
@@ -827,20 +836,26 @@ class ModernRuntime:
                 if evicted_id is not None:
                     assert evicted is not None
                     del self._contextual_rag_services[evicted_id]
-                    retired.append((evicted_id, evicted[1], evicted[2]))
+                    retired.append(
+                        (
+                            evicted_id,
+                            self._contextual_rag_epochs.get(evicted_id, 0),
+                            evicted[1],
+                            evicted[2],
+                        )
+                    )
                     continue
                 self._contextual_rag_condition.wait(timeout=0.05)
             if retired:
-                for retired_id, retired_rag, retired_session in retired:
+                for retired_id, retired_epoch, retired_rag, retired_session in retired:
                     self._retired_contextual_rag.setdefault(
                         retired_id,
                         [],
-                    ).append((retired_id, retired_rag, retired_session))
-                    if self._contextual_rag_active.get(retired_id, 0) == 0:
-                        self._close_retired_contextual_rag(
-                            retired_id,
-                            self._contextual_rag_epochs.get(retired_id, 0),
-                        )
+                    ).append((retired_epoch, retired_rag, retired_session))
+        if retired:
+            for retired_id, _retired_epoch, _retired_rag, _retired_session in retired:
+                if self._contextual_rag_active.get(retired_id, 0) == 0:
+                    self._close_retired_contextual_rag(retired_id)
         return checked_id, rag
 
     def _begin_contextual_rag_use(
@@ -855,13 +870,16 @@ class ModernRuntime:
             self._contextual_rag_active[checked_id] = (
                 self._contextual_rag_active.get(checked_id, 0) + 1
             )
+            epoch = self._contextual_rag_epochs.get(checked_id, 0)
         try:
             checked_id, rag = self._get_contextual_rag_service(
                 conversation_id,
                 profile=profile,
                 generation_profile=generation_profile,
+                expected_epoch=epoch,
             )
         except Exception:
+            is_idle = False
             with self._contextual_rag_condition:
                 active = self._contextual_rag_active.get(checked_id, 0)
                 if active <= 1:
@@ -869,12 +887,32 @@ class ModernRuntime:
                 else:
                     self._contextual_rag_active[checked_id] = active - 1
                 self._contextual_rag_condition.notify_all()
+                is_idle = self._contextual_rag_active.get(checked_id, 0) == 0
+            if is_idle:
+                self._close_retired_contextual_rag(checked_id)
             raise
         with self._contextual_rag_condition:
-            epoch = self._contextual_rag_epochs.get(checked_id, 0)
+            current_epoch = self._contextual_rag_epochs.get(checked_id, 0)
+            if current_epoch != epoch:
+                active = self._contextual_rag_active.get(checked_id, 0)
+                if active <= 1:
+                    self._contextual_rag_active.pop(checked_id, None)
+                else:
+                    self._contextual_rag_active[checked_id] = active - 1
+                self._contextual_rag_condition.notify_all()
+                is_idle = self._contextual_rag_active.get(checked_id, 0) == 0
+            else:
+                is_idle = False
+        if current_epoch != epoch:
+            if is_idle:
+                self._close_retired_contextual_rag(checked_id)
+            raise ModernSearchUnavailable(
+                "the contextual RAG session was retired."
+            )
         return checked_id, rag, epoch
 
     def _end_contextual_rag_use(self, session_id: str, epoch: int) -> None:
+        del epoch
         with self._contextual_rag_condition:
             active = self._contextual_rag_active.get(session_id, 0)
             if active <= 1:
@@ -882,28 +920,23 @@ class ModernRuntime:
             else:
                 self._contextual_rag_active[session_id] = active - 1
             self._contextual_rag_condition.notify_all()
-            if self._contextual_rag_active.get(session_id, 0) == 0:
-                self._close_retired_contextual_rag(
-                    session_id,
-                    self._contextual_rag_epochs.get(session_id, 0),
-                )
+            is_idle = self._contextual_rag_active.get(session_id, 0) == 0
+        if is_idle:
+            self._close_retired_contextual_rag(session_id)
 
     def _close_retired_contextual_rag(
         self,
         session_id: str,
-        epoch: int,
     ) -> None:
-        if (
-            epoch != self._contextual_rag_epochs.get(session_id, 0)
-            or self._contextual_rag_active.get(session_id, 0) != 0
-        ):
-            return
-        retired = self._retired_contextual_rag.pop(session_id, ())
-        for retired_id, rag, session in retired:
+        with self._contextual_rag_condition:
+            if self._contextual_rag_active.get(session_id, 0) != 0:
+                return
+            retired = self._retired_contextual_rag.pop(session_id, [])
+        for _retired_epoch, rag, session in retired:
             close_rag = getattr(rag, "close_session", None)
             if callable(close_rag):
                 try:
-                    close_rag(retired_id)
+                    close_rag(session_id)
                 except Exception:
                     pass
             try:
@@ -916,43 +949,22 @@ class ModernRuntime:
         session_id: str,
         timeout: float = 2.0,
     ) -> None:
+        del timeout
         checked_id = session_id or "default"
-        retired: list[tuple[str, RagService, Any]] = []
+        retired: tuple[int, RagService, Any] | None = None
         with self._contextual_rag_condition:
             cached = self._contextual_rag_services.pop(checked_id, None)
             if cached is not None:
-                retired.append((checked_id, cached[1], cached[2]))
-            self._contextual_rag_epochs[checked_id] = (
-                self._contextual_rag_epochs.get(checked_id, 0) + 1
-            )
-            epoch = self._contextual_rag_epochs[checked_id]
-        for retired_id, rag, _session in retired:
-            close_rag = getattr(rag, "close_session", None)
-            if callable(close_rag):
-                try:
-                    close_rag(retired_id)
-                except Exception:
-                    pass
-        with self._contextual_rag_condition:
-            deadline = time.monotonic() + max(0.0, timeout)
-            while (
-                self._contextual_rag_active.get(checked_id, 0) > 0
-                and time.monotonic() < deadline
-            ):
-                self._contextual_rag_condition.wait(timeout=0.05)
-        if retired:
-            for retired_id, rag, session in retired:
-                close_rag = getattr(rag, "close_session", None)
-                if callable(close_rag):
-                    try:
-                        close_rag(retired_id)
-                    except Exception:
-                        pass
-                try:
-                    session.close()
-                except Exception:
-                    pass
-        self._close_retired_contextual_rag(checked_id, epoch)
+                old_epoch = self._contextual_rag_epochs.get(checked_id, 0)
+                retired = (old_epoch, cached[1], cached[2])
+                self._contextual_rag_epochs[checked_id] = old_epoch + 1
+                self._retired_contextual_rag.setdefault(
+                    checked_id,
+                    [],
+                ).append(retired)
+                self._contextual_rag_condition.notify_all()
+        if retired is not None:
+            self._close_retired_contextual_rag(checked_id)
 
     def get_session_answer(self, session_id: str) -> CitedAnswer | None:
         checked_id = session_id or "default"
