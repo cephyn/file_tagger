@@ -45,6 +45,7 @@ from .ollama.readiness import ReadinessReport
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
 from .ui.content_search import ContentSearchWorker
+from .ui.contextual_search import ContextualSearchDialog
 from .ui.indexing_status import IndexingStatus
 from .ui.ollama_settings import OllamaSettingsDialog
 from .migration.legacy_chroma import cleanup_legacy_chroma, inspect_legacy_chroma
@@ -509,9 +510,12 @@ class FileTagManager(QMainWindow):
         menubar = self.menuBar()
         settings_menu = menubar.addMenu("Settings")
         indexing_menu = menubar.addMenu("Indexing")
+        search_menu = menubar.addMenu("Search")
         help_menu = menubar.addMenu("Help")
 
         # Add settings menu actions
+        contextual_search_action = search_menu.addAction("Contextual Markdown Chat")
+        contextual_search_action.triggered.connect(self.open_contextual_search)
         ollama_settings_action = settings_menu.addAction("Ollama Readiness")
         ollama_settings_action.triggered.connect(self.show_ollama_settings)
 
@@ -571,6 +575,16 @@ class FileTagManager(QMainWindow):
         """Show the About dialog."""
         dialog = AboutDialog(self)
         dialog.exec()
+
+    def open_contextual_search(self) -> None:
+        """Open the local Markdown-contextual RAG chat."""
+        dialog = ContextualSearchDialog(
+            self,
+            modern_runtime=getattr(self, "modern_runtime", None),
+        )
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._contextual_search_dialog = dialog
+        dialog.open()
 
     def create_tagging_tab(self):
         """Create and return the tagging interface tab."""

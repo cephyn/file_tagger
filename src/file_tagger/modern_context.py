@@ -33,7 +33,7 @@ from .ollama.readiness import OllamaReadinessService, ReadinessReport, RequiredM
 from .persistence.models import File, FileTag, Tag
 from .persistence.vector_cleanup import delete_file_embeddings
 from .rag.planner import SearchPlan
-from .rag.service import execute_search_plan
+from .rag.service import RagService, execute_search_plan
 from .search.hybrid import HybridSearch
 from .search.results import SearchResult, merge_results
 
@@ -740,6 +740,75 @@ class ModernRuntime:
                 if cancellation_check is not None and cancellation_check():
                     raise asyncio.CancelledError
             return merge_results(matches, limit=limit)
+        finally:
+            session.close()
+
+    def answer_contextual_question(
+        self,
+        question: str,
+        markdown_context: str = "",
+        *,
+        conversation_id: str | None = None,
+    ) -> Any:
+        """Answer a question using the shared hybrid search and RAG services."""
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("A nonempty search question is required.")
+        with self._lock:
+            factory = self.session_factory
+        profile = self.embedding_profile
+        readiness = self.readiness
+        generation_profile = (
+            readiness.selected_profile("generation")
+            if readiness is not None
+            else None
+        )
+        if (
+            readiness is None
+            or not readiness.ready
+            or profile is None
+            or factory is None
+            or generation_profile is None
+        ):
+            raise ModernSearchUnavailable(self.unavailable_reason)
+
+        repository = self._indexing_repository
+        if repository is not None:
+            try:
+                repository.queue_vector_reindex(profile)
+                vector_ready = repository.vector_readiness(profile)
+            except Exception as exc:
+                raise ModernSearchUnavailable(
+                    "the committed vector index readiness could not be verified."
+                ) from exc
+            if not vector_ready.ready:
+                raise ModernSearchUnavailable(
+                    "the active embedding profile requires a full reindex "
+                    f"({vector_ready.pending_files} file(s) pending)."
+                )
+
+        gateway = OllamaGateway()
+        session = factory()
+        try:
+            search = HybridSearch(
+                session,
+                model_digest=profile.digest,
+                index_version=profile.default_index_version,
+                embedding_profile=profile,
+            )
+            rag = RagService(
+                search=search,
+                gateway=gateway,
+                embedding_gateway=_FreshOllamaEmbeddingGateway(),
+                model=generation_profile.model,
+                model_digest=generation_profile.digest,
+                index_version=profile.default_index_version,
+                embedding_profile=profile,
+            )
+            return rag.answer_question(
+                question,
+                markdown_context,
+                conversation_id=conversation_id,
+            )
         finally:
             session.close()
 
