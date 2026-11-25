@@ -16,118 +16,6 @@ SOURCE_MARKER_PATTERN = re.compile(
     r"\[source:\s*([^\]]+?)\s*\]",
     flags=re.IGNORECASE,
 )
-_SENTENCE_TERMINATORS = frozenset(".!?。！？．")
-_SENTENCE_CLOSERS = frozenset("\"'”’»›）〕］】」』)]}")
-_COMMON_ABBREVIATIONS = frozenset(
-    {
-        "a.m",
-        "al",
-        "approx",
-        "apr",
-        "art",
-        "aug",
-        "ave",
-        "capt",
-        "cf",
-        "ch",
-        "col",
-        "corp",
-        "dec",
-        "dept",
-        "dr",
-        "e.g",
-        "ed",
-        "eds",
-        "eq",
-        "esp",
-        "est",
-        "etc",
-        "feb",
-        "fig",
-        "gen",
-        "gov",
-        "i.e",
-        "ibid",
-        "inc",
-        "jan",
-        "jr",
-        "jul",
-        "jun",
-        "ltd",
-        "mar",
-        "may",
-        "mr",
-        "mrs",
-        "ms",
-        "no",
-        "nov",
-        "oct",
-        "op. cit",
-        "p.m",
-        "para",
-        "pp",
-        "prof",
-        "rep",
-        "sec",
-        "sen",
-        "sept",
-        "sgt",
-        "sr",
-        "st",
-        "vol",
-        "vs",
-    }
-)
-_QUALIFYING_SUFFIX_WORDS = frozenset(
-    {
-        "alleged",
-        "allegedly",
-        "although",
-        "apparently",
-        "but",
-        "cannot",
-        "conditional",
-        "conditionally",
-        "could",
-        "despite",
-        "except",
-        "however",
-        "if",
-        "limited",
-        "likely",
-        "may",
-        "maybe",
-        "might",
-        "neither",
-        "nevertheless",
-        "no",
-        "nonetheless",
-        "nor",
-        "not",
-        "only",
-        "otherwise",
-        "possibly",
-        "probably",
-        "provisional",
-        "provisionally",
-        "purportedly",
-        "rather",
-        "reported",
-        "reportedly",
-        "should",
-        "sometimes",
-        "subject",
-        "supposedly",
-        "tentative",
-        "though",
-        "uncertain",
-        "unless",
-        "unlikely",
-        "until",
-        "without",
-        "yet",
-    }
-)
 
 
 class AnswerClaim(DomainRecord):
@@ -168,8 +56,20 @@ RagAnswer: TypeAlias = CitedAnswer
 
 
 class StructuredClaim(DomainRecord):
-    text: str = Field(min_length=1)
-    evidence_quote: str = Field(min_length=1)
+    text: str = Field(
+        min_length=1,
+        description=(
+            "The factual claim. Its normalized text must equal the complete "
+            "evidence_quote and cited chunk."
+        ),
+    )
+    evidence_quote: str = Field(
+        min_length=1,
+        description=(
+            "The complete full text of exactly one cited chunk; do not quote "
+            "individual sentences or other fragments."
+        ),
+    )
     chunk_ids: tuple[str, ...] = Field(min_length=1)
 
 
@@ -263,15 +163,14 @@ def parse_cited_answer(
                 "The model answer contains a claim without retrieved evidence."
             )
         if not any(
-            _quote_matches_complete_evidence_span(
+            _quote_matches_full_evidence_chunk(
                 raw_claim.evidence_quote,
                 citation.text,
             )
             for citation in resolved
         ):
             raise UncitedAnswerError(
-                "The model answer evidence quote is not a complete, unambiguous, "
-                "exact quoted span or the full cited chunk."
+                "The model answer evidence quote is not the complete full cited chunk."
             )
         if not _claim_is_supported(raw_claim.text, raw_claim.evidence_quote):
             raise UncitedAnswerError(
@@ -378,133 +277,10 @@ def _claim_is_supported(claim: str, quote: str) -> bool:
     return bool(claim_words) and claim_words == quote_words
 
 
-def _quote_matches_complete_evidence_span(quote: str, evidence_text: str) -> bool:
-    exact_quote = quote.strip()
-    exact_evidence = evidence_text.strip()
-    if not exact_quote or not exact_evidence:
-        return False
-    if exact_quote == exact_evidence:
-        return True
-
-    matches: list[tuple[int, str]] = []
-    for span in _evidence_sentence_spans(exact_evidence):
-        start = exact_evidence.find(span)
-        while start >= 0:
-            if exact_quote == span:
-                matches.append((start, span))
-            start = exact_evidence.find(span, start + 1)
-    if len(matches) != 1:
-        return False
-
-    start, span = matches[0]
-    suffix = exact_evidence[start + len(span) :]
-    return not any(
-        word in _QUALIFYING_SUFFIX_WORDS
-        for word in _normalized_words(suffix, strip_markers=False)
-    )
-
-
-def _evidence_sentence_spans(excerpt: str) -> tuple[str, ...]:
-    text = excerpt.strip()
-    if not text:
-        return ()
-
-    spans: list[str] = []
-    start = 0
-    index = 0
-    while index < len(text):
-        terminator = text[index]
-        if terminator not in _SENTENCE_TERMINATORS:
-            index += 1
-            continue
-
-        terminator_end = index + 1
-        while (
-            terminator_end < len(text)
-            and text[terminator_end] in _SENTENCE_TERMINATORS
-        ):
-            terminator_end += 1
-        span_end = terminator_end
-        while span_end < len(text) and text[span_end] in _SENTENCE_CLOSERS:
-            span_end += 1
-
-        if span_end == len(text):
-            break
-
-        next_start = span_end
-        while next_start < len(text) and text[next_start].isspace():
-            next_start += 1
-        if next_start == span_end:
-            if terminator == "." and _period_is_internal(text, index):
-                index = terminator_end
-                continue
-            return (text,)
-        if terminator == "." and _period_is_abbreviation(text, index):
-            index = terminator_end
-            continue
-        if (
-            terminator in {".", "。", "．"}
-            and len(text[index:terminator_end]) >= 3
-            and len(set(text[index:terminator_end])) == 1
-        ):
-            return (text,)
-        if not _looks_like_sentence_start(text, next_start):
-            return (text,)
-
-        spans.append(text[start:span_end].strip())
-        start = next_start
-        index = next_start
-
-    final_span = text[start:].strip()
-    if final_span:
-        if start and not _has_sentence_ending(final_span):
-            return (text,)
-        spans.append(final_span)
-    return tuple(span for span in spans if span)
-
-
-def _period_is_internal(text: str, index: int) -> bool:
-    return (
-        index > 0
-        and index + 1 < len(text)
-        and (text[index - 1].isalnum() or text[index - 1] == "_")
-        and (text[index + 1].isalnum() or text[index + 1] == "_")
-    )
-
-
-def _period_is_abbreviation(text: str, index: int) -> bool:
-    prefix = text[:index]
-    if re.search(r"\bet\s+al$", prefix, flags=re.IGNORECASE):
-        return True
-    match = re.search(r"([^\W\d_]+(?:\.[^\W\d_]+)*)$", prefix, flags=re.UNICODE)
-    if match is None:
-        return False
-    abbreviation = match.group(1).casefold()
-    return abbreviation in _COMMON_ABBREVIATIONS or (
-        "." in abbreviation or len(abbreviation) == 1
-    )
-
-
-def _has_sentence_ending(value: str) -> bool:
-    candidate = value.rstrip()
-    while candidate and candidate[-1] in _SENTENCE_CLOSERS:
-        candidate = candidate[:-1]
-    if not candidate or candidate[-1] not in _SENTENCE_TERMINATORS:
-        return False
-    if candidate[-1] == "." and _period_is_abbreviation(
-        candidate,
-        len(candidate) - 1,
-    ):
-        return False
-    return True
-
-
-def _looks_like_sentence_start(text: str, index: int) -> bool:
-    while index < len(text) and text[index] in "\"'“‘«‹（〔［【「『([{":
-        index += 1
-    return index < len(text) and (
-        text[index].isupper() or text[index].isdigit()
-    )
+def _quote_matches_full_evidence_chunk(quote: str, evidence_text: str) -> bool:
+    quote_words = _normalized_words(quote, strip_markers=False)
+    evidence_words = _normalized_words(evidence_text, strip_markers=False)
+    return bool(quote_words) and quote_words == evidence_words
 
 
 def _answer_is_supported(

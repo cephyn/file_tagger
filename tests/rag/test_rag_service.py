@@ -480,7 +480,7 @@ def test_structured_claim_rejects_incomplete_evidence_sentence(
         answer_question("When did the witness leave?", evidence, gateway=fake_model)
 
 
-def test_structured_claim_accepts_complete_middle_evidence_sentence() -> None:
+def test_structured_claim_rejects_complete_middle_evidence_sentence() -> None:
     quote = "The witness may have left before dawn."
     evidence = (
         make_result(
@@ -512,14 +512,15 @@ def test_structured_claim_accepts_complete_middle_evidence_sentence() -> None:
         )
     )
 
-    answer = answer_question("When did the witness leave?", evidence, gateway=fake_model)
-
-    assert answer.claims[0].evidence_quote == quote
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("When did the witness leave?", evidence, gateway=fake_model)
 
 
 def test_structured_claim_accepts_full_chunk_text_beyond_display_snippet() -> None:
-    quote = "The eastern gate remains closed."
-    full_text = f"{'Patrol notes remain unchanged. ' * 20}{quote}"
+    full_text = (
+        f"{'Patrol notes remain unchanged. ' * 20}"
+        "The eastern gate remains closed."
+    )
     evidence = (
         make_result(
             {
@@ -535,11 +536,11 @@ def test_structured_claim_accepts_full_chunk_text_beyond_display_snippet() -> No
     fake_model = FakeModel(
         json.dumps(
             {
-                "answer": quote,
+                "answer": full_text,
                 "claims": [
                     {
-                        "text": quote,
-                        "evidence_quote": quote,
+                        "text": full_text,
+                        "evidence_quote": full_text,
                         "chunk_ids": ["full-chunk-evidence"],
                     }
                 ],
@@ -549,11 +550,16 @@ def test_structured_claim_accepts_full_chunk_text_beyond_display_snippet() -> No
 
     answer = answer_question("What happened at the gate?", evidence, gateway=fake_model)
 
-    assert answer.citations[0].excerpt != quote
+    assert answer.citations[0].excerpt != full_text
     assert answer.citations[0].text == full_text
-    assert answer.claims[0].evidence_quote == quote
+    assert answer.claims[0].evidence_quote == full_text
     prompt = fake_model.chat_calls[0]["messages"][-1]["content"]
-    assert quote in prompt
+    assert full_text in prompt
+    assert "complete full text of exactly one cited chunk" in (
+        fake_model.chat_calls[0]["messages"][0]["content"]
+    )
+    schema = json.dumps(fake_model.chat_calls[0]["schema"])
+    assert "complete full text of exactly one cited chunk" in schema
 
 
 def test_structured_claim_rejects_quote_omitting_later_qualifier() -> None:
@@ -625,6 +631,38 @@ def test_structured_claim_requires_full_chunk_for_abbreviation_split() -> None:
 
     with pytest.raises(UncitedAnswerError, match="complete"):
         answer_question("Who recorded the observation?", evidence, gateway=fake_model)
+
+
+def test_structured_claim_rejects_unlisted_abbreviation_sentence_fragment() -> None:
+    full_text = "Mt. Everest is the highest mountain above sea level."
+    evidence = (
+        make_result(
+            {
+                "file_path": r"C:\geography\mountains.md",
+                "stable_id": "mount-everest",
+                "page_number": 1,
+                "text": full_text,
+            },
+            source="hybrid",
+        ),
+    )
+    fake_model = FakeModel(
+        json.dumps(
+            {
+                "answer": "Mt.",
+                "claims": [
+                    {
+                        "text": "Mt.",
+                        "evidence_quote": "Mt.",
+                        "chunk_ids": ["mount-everest"],
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(UncitedAnswerError, match="complete"):
+        answer_question("What is the highest mountain?", evidence, gateway=fake_model)
 
 
 def test_structured_claim_rejects_partial_neighboring_sentences() -> None:
@@ -816,7 +854,7 @@ def test_structured_claim_with_quote_not_in_cited_chunk_is_rejected() -> None:
         )
     )
 
-    with pytest.raises(UncitedAnswerError, match="quoted span"):
+    with pytest.raises(UncitedAnswerError, match="complete full cited chunk"):
         answer_question("Find suitable encounters", evidence, gateway=fake_model)
 
 
