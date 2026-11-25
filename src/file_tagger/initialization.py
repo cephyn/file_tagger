@@ -1,7 +1,6 @@
 import time
 import logging
 import traceback
-import os
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QPixmap
@@ -107,7 +106,7 @@ class InitializationWorker(QThread):
             logger.error(f"Initialization failed with error: {str(e)}")
             logger.error(traceback.format_exc())
             self.progress_signal.emit(f"Error: {str(e)}", 100)
-            self.finished_signal.emit((None, None, None, None))
+            self.finished_signal.emit((None, None, None))
 
 class SplashScreen(QPixmap):
     def __init__(self):

@@ -1977,6 +1977,24 @@ def test_initialization_worker_exposes_modern_runtime_to_login(
     assert results[0] == (legacy_session, config, runtime)
 
 
+def test_initialization_worker_failure_emits_three_tuple(monkeypatch) -> None:
+    from file_tagger import initialization
+
+    def fail_init_db():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(initialization, "init_db", fail_init_db)
+    results = []
+
+    worker = initialization.InitializationWorker("password")
+    worker.finished_signal.connect(results.append)
+    worker.run()
+
+    assert len(results) == 1
+    assert results[0] == (None, None, None)
+    assert len(results[0]) == 3
+
+
 def test_login_accepts_modern_runtime_without_legacy_search(
     qtbot, monkeypatch
 ) -> None:
