@@ -147,7 +147,32 @@ def test_tag_edit_dialog_assign_random_updates_preview_only(qtbot, monkeypatch) 
     )
     dialog.assign_random_color()
 
-    assert dialog.selected_color == QColor("#00ff00")
+    assert dialog.selected_color.name() == "#00ff00"
+
+
+def test_tag_edit_dialog_random_preserves_manual_color_collision(
+    qtbot,
+    monkeypatch,
+) -> None:
+    from file_tagger.file_tag_manager import TagEditDialog
+
+    dialog = TagEditDialog(
+        tag_name="work",
+        initial_color=QColor("#123456"),
+        existing_colors={"#123456", "#ff0000"},
+    )
+    qtbot.addWidget(dialog)
+    dialog.selected_color = QColor("#ff0000")
+
+    values = iter((0, 255, 255, 120, 255, 255))
+    monkeypatch.setattr(
+        random,
+        "randint",
+        lambda _low, _high: next(values),
+    )
+    dialog.assign_random_color()
+
+    assert dialog.selected_color.name() == "#00ff00"
 
 
 def test_add_tag_uses_shared_dialog_and_persists_choice(

@@ -97,6 +97,11 @@ class TagEditDialog(QDialog):
         super().__init__(parent)
         self.existing_colors = tuple(existing_colors)
         self.initially_existing = initial_color is not None
+        self.original_color = (
+            QColor(initial_color)
+            if initial_color and initial_color.isValid()
+            else None
+        )
         self.selected_color = (
             QColor(initial_color)
             if initial_color and initial_color.isValid()
@@ -136,7 +141,11 @@ class TagEditDialog(QDialog):
         self._refresh_preview()
 
     def generate_random_color(self) -> QColor:
-        own_color = self.selected_color.name() if self.initially_existing else None
+        own_color = (
+            self.original_color.name()
+            if self.initially_existing and self.original_color
+            else None
+        )
         return generate_random_tag_color(
             self.existing_colors,
             excluded_color=own_color,
