@@ -1,5 +1,6 @@
 import os
 import logging
+import random
 import traceback
 from collections.abc import Iterable
 from pathlib import Path
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QListWidgetItem,
     QDialog,
+    QDialogButtonBox,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QApplication,
@@ -59,6 +61,121 @@ _ACTIVE_CONTENT_SEARCH_WORKERS: set[ContentSearchWorker] = set()
 
 def hide_scan_progress(progress: QProgressDialog) -> None:
     progress.hide()
+
+
+def generate_random_tag_color(
+    existing_colors: Iterable[str] = (),
+    excluded_color: str | None = None,
+) -> QColor:
+    existing = {
+        QColor(color).name().lower()
+        for color in existing_colors
+        if QColor(color).isValid()
+    }
+    if excluded_color:
+        existing.discard(QColor(excluded_color).name().lower())
+
+    generated = QColor()
+    for _ in range(16):
+        hue = random.randint(0, 359)
+        saturation = random.randint(128, 255)
+        value = random.randint(180, 255)
+        generated = QColor.fromHsv(hue, saturation, value)
+        if generated.name().lower() not in existing:
+            break
+    return generated
+
+
+class TagEditDialog(QDialog):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        tag_name: str = "",
+        initial_color: QColor | None = None,
+        existing_colors: Iterable[str] = (),
+    ) -> None:
+        super().__init__(parent)
+        self.existing_colors = tuple(existing_colors)
+        self.initially_existing = initial_color is not None
+        self.selected_color = (
+            QColor(initial_color)
+            if initial_color and initial_color.isValid()
+            else generate_random_tag_color(self.existing_colors)
+        )
+
+        self.setWindowTitle("Add Tag" if not tag_name else "Edit Tag")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Tag name"))
+        self.name_input = QLineEdit(tag_name)
+        layout.addWidget(self.name_input)
+
+        self.preview = QLabel()
+        self.preview.setToolTip("Selected tag color")
+        self.preview.setFixedHeight(48)
+        self.preview.setFrameShape(QFrame.StyledPanel)
+        layout.addWidget(self.preview)
+
+        action_layout = QHBoxLayout()
+        choose_button = QPushButton("Choose color")
+        choose_button.clicked.connect(self._choose_color)
+        action_layout.addWidget(choose_button)
+
+        random_button = QPushButton("Assign random color")
+        random_button.clicked.connect(self.assign_random_color)
+        action_layout.addWidget(random_button)
+        layout.addLayout(action_layout)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self._refresh_preview()
+
+    def generate_random_color(self) -> QColor:
+        own_color = self.selected_color.name() if self.initially_existing else None
+        return generate_random_tag_color(
+            self.existing_colors,
+            excluded_color=own_color,
+        )
+
+    def assign_random_color(self) -> None:
+        color = self.generate_random_color()
+        if color.isValid():
+            self.selected_color = QColor(color)
+            self._refresh_preview()
+
+    def _choose_color(self) -> None:
+        color = QColorDialog.getColor(
+            initial=self.selected_color,
+            parent=self,
+            title="Select Tag Color",
+        )
+        if color.isValid():
+            self.selected_color = QColor(color)
+            self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        self.preview.setStyleSheet(
+            f"background-color: {self.selected_color.name()}; "
+            "border: 1px solid #777;"
+        )
+
+    def accept(self) -> None:
+        if not self.name_input.text().strip():
+            QMessageBox.warning(self, "Error", "Tag name cannot be blank!")
+            return
+        super().accept()
+
+    def get_tag_name(self) -> str:
+        return self.name_input.text().strip()
+
+    def get_selected_color(self) -> QColor:
+        return QColor(self.selected_color)
 
 
 class HTMLDelegate(QStyledItemDelegate):
