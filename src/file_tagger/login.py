@@ -265,6 +265,18 @@ class LoginScreen(QWidget):
             if db_session and config and modern_runtime:
                 logger.debug("Initialization succeeded, preparing to show main window")
                 try:
+                    recovery_key = getattr(config, "pending_recovery_key", None)
+                    if recovery_key:
+                        QMessageBox.information(
+                            self,
+                            "Save Your Recovery Key",
+                            f"Your one-time recovery key is:\n\n{recovery_key}\n\n"
+                            "Store it somewhere safe. It will not be shown again "
+                            "and is required if you forget your password.",
+                        )
+                        config.acknowledge_recovery_key()
+                    self.password_input.clear()
+
                     # Hide the login window
                     self.hide()
                     logger.debug("Login window hidden")

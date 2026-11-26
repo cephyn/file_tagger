@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import sys
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QMessageBox
@@ -123,3 +124,68 @@ def test_accepted_recovery_retries_login_with_new_password(
 
     assert screen.password_input.text() == "replacement"
     assert submitted == [True]
+
+
+def test_first_setup_requires_recovery_key_acknowledgement(
+    qtbot, monkeypatch
+) -> None:
+    from file_tagger.login import LoginScreen
+    from types import ModuleType
+    from PySide6.QtWidgets import QWidget
+
+    events = []
+    acknowledgements = []
+    config = SimpleNamespace(
+        pending_recovery_key="one-time-key",
+        acknowledge_recovery_key=lambda: acknowledgements.append(True),
+    )
+
+    class Window(QWidget):
+        def __init__(self, *args) -> None:
+            super().__init__()
+            events.append("window")
+
+    manager_module = ModuleType("file_tagger.file_tag_manager")
+    manager_module.FileTagManager = Window
+    monkeypatch.setitem(sys.modules, "file_tagger.file_tag_manager", manager_module)
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda parent, title, text: events.append(("acknowledged", text)) or QMessageBox.StandardButton.Ok,
+    )
+    screen = LoginScreen()
+    qtbot.addWidget(screen)
+    screen.password_input.setText("initial-password")
+    monkeypatch.setattr(screen, "hide", lambda: None)
+    monkeypatch.setattr(screen, "close", lambda: None)
+
+    screen.on_initialization_finished((object(), config, object()))
+
+    assert acknowledgements == [True]
+    assert events[0][0] == "acknowledged"
+    assert "one-time-key" in events[0][1]
+    assert events[1] == "window"
+    assert screen.password_input.text() == ""
+
+
+def test_manager_opens_password_management_with_correct_arguments(
+    monkeypatch,
+) -> None:
+    from file_tagger import file_tag_manager
+
+    config = object()
+    manager = SimpleNamespace(config=config)
+    constructed = []
+
+    class Dialog:
+        def __init__(self, received_config, parent) -> None:
+            constructed.append((received_config, parent))
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(file_tag_manager, "PasswordManagementDialog", Dialog)
+
+    file_tag_manager.FileTagManager.show_password_management(manager)
+
+    assert constructed == [(config, manager)]

@@ -1847,7 +1847,7 @@ class FileTagManager(QMainWindow):
 
     def show_password_management(self):
         """Show the password management dialog."""
-        dialog = PasswordManagementDialog(self, self.config)
+        dialog = PasswordManagementDialog(self.config, self)
         dialog.exec()
 
     def set_home_directory(self):
