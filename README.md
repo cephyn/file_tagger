@@ -37,6 +37,27 @@ You can also start the module directly:
 uv run python -m file_tagger
 ```
 
+If PowerShell reports that `uv` is not recognized, use the repository launcher,
+which creates or updates `.venv` and bootstraps `uv` when needed:
+
+```powershell
+.\scripts\start.ps1
+```
+
+For a permanent `uv` command on Windows, install it and reopen PowerShell:
+
+```powershell
+py -3.13 -m pip install --user uv
+```
+
+Or use the installed UV package through the virtual environment without adding
+it to `PATH`:
+
+```powershell
+.\.venv\Scripts\uv.exe sync --locked --all-extras
+.\.venv\Scripts\uv.exe run file-tagger
+```
+
 On first launch, create a password for the encrypted local configuration.
 If an older `file_tags.db`/`.chroma` installation is detected, the application
 creates a backup and migrates the available file/tag metadata. It inventories
