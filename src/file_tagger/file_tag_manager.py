@@ -56,6 +56,10 @@ from .modern_context import ModernIndexingUnavailable, ModernSearchUnavailable
 _ACTIVE_CONTENT_SEARCH_WORKERS: set[ContentSearchWorker] = set()
 
 
+def hide_scan_progress(progress: QProgressDialog) -> None:
+    progress.hide()
+
+
 class HTMLDelegate(QStyledItemDelegate):
     """Custom delegate to render HTML in QListWidgetItems with text wrapping"""
 
@@ -2003,13 +2007,17 @@ class FileTagManager(QMainWindow):
         self.scan_thread.scan_progress.connect(
             lambda current, total: progress.setValue(int(current / total * 100))
         )
-        self.scan_thread.scan_finished.connect(progress.close)
+        self.scan_thread.scan_finished.connect(
+            lambda *_args: hide_scan_progress(progress)
+        )
         self.scan_thread.scan_finished.connect(
             lambda files: None
             if self.scan_thread.stop_requested
             else self.show_untagged_files_dialog(files, dir_path)
         )
-        self.scan_thread.scan_error.connect(progress.close)
+        self.scan_thread.scan_error.connect(
+            lambda *_args: hide_scan_progress(progress)
+        )
         self.scan_thread.scan_error.connect(
             lambda error: None
             if self.scan_thread.stop_requested

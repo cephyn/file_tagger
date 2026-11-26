@@ -2,7 +2,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PySide6.QtWidgets import QProgressDialog
 
+from file_tagger.file_tag_manager import hide_scan_progress
 from file_tagger.utils import is_hidden_path, iter_visible_files
 
 
@@ -169,3 +171,18 @@ def test_iter_visible_files_propagates_walk_errors(
 
     with pytest.raises(PermissionError, match="directory denied"):
         list(iter_visible_files(tmp_path))
+
+
+def test_hide_scan_progress_does_not_emit_cancelled(qtbot) -> None:
+    progress = QProgressDialog()
+    qtbot.addWidget(progress)
+    cancelled = False
+
+    def mark_cancelled() -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    progress.canceled.connect(mark_cancelled)
+    hide_scan_progress(progress)
+
+    assert cancelled is False
