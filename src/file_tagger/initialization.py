@@ -33,6 +33,7 @@ class InitializationWorker(QThread):
         
     def run(self):
         logger.debug("InitializationWorker.run() started")
+        config = None
         try:
             # Initialize config
             logger.debug("Starting config initialization")
@@ -101,7 +102,7 @@ class InitializationWorker(QThread):
             logger.error(f"Initialization failed with error: {str(e)}")
             logger.error(traceback.format_exc())
             self.progress_signal.emit(f"Error: {str(e)}", 100)
-            self.finished_signal.emit((None, None, None))
+            self.finished_signal.emit((None, config, None))
 
 class SplashScreen(QPixmap):
     def __init__(self):

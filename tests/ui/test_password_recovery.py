@@ -68,6 +68,20 @@ def test_recovery_dialog_disables_recovery_for_legacy_and_explains_reset(
     assert "reset" in dialog.status_label.text().lower()
 
 
+def test_recovery_dialog_detects_pending_cwd_legacy_configuration(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.encrypted").write_bytes(b"legacy config")
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path / "data"))
+
+    dialog = PasswordRecoveryDialog()
+    qtbot.addWidget(dialog)
+
+    assert not dialog.recover_button.isEnabled()
+    assert "legacy" in dialog.status_label.text().lower()
+
+
 def test_recovery_dialog_quarantines_only_after_typed_confirmation(
     qtbot, monkeypatch
 ) -> None:
@@ -189,3 +203,31 @@ def test_manager_opens_password_management_with_correct_arguments(
     file_tag_manager.FileTagManager.show_password_management(manager)
 
     assert constructed == [(config, manager)]
+
+
+def test_pending_recovery_key_is_acknowledged_even_after_startup_failure(
+    qtbot, monkeypatch
+) -> None:
+    from file_tagger.login import LoginScreen
+
+    events = []
+    config = SimpleNamespace(
+        pending_recovery_key="one-time-key",
+        acknowledge_recovery_key=lambda: events.append("cleared"),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda parent, title, text: events.append(("shown", text))
+        or QMessageBox.StandardButton.Ok,
+    )
+    screen = LoginScreen()
+    qtbot.addWidget(screen)
+    monkeypatch.setattr(screen, "show_error", lambda message: events.append("error"))
+    monkeypatch.setattr(screen, "cleanup_worker", lambda: None)
+
+    screen.on_initialization_finished((None, config, None))
+
+    assert events[0][0] == "shown"
+    assert "one-time-key" in events[0][1]
+    assert events[1:] == ["cleared", "error"]

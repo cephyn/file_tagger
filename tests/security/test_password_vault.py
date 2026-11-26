@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import logging
 
 import pytest
 from cryptography.fernet import Fernet
@@ -11,6 +12,7 @@ from file_tagger.config import Config
 from file_tagger.domain.errors import (
     CredentialFormatError,
     CredentialRecoveryError,
+    PasswordEncryptionError,
 )
 from file_tagger.infrastructure.app_paths import AppPaths
 from file_tagger.security.password_vault import CredentialStatus, PasswordVault
@@ -67,6 +69,20 @@ def test_password_vault_identifies_legacy_credentials(tmp_path, monkeypatch) -> 
     paths.password_hash_file.write_text("{}")
 
     assert PasswordVault.status(paths) is CredentialStatus.LEGACY
+
+
+def test_password_vault_never_initializes_over_existing_config(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    paths.config_file.write_bytes(b"existing encrypted configuration")
+
+    with pytest.raises(CredentialFormatError):
+        PasswordVault.create(paths, "password")
+
+    assert paths.config_file.read_bytes() == b"existing encrypted configuration"
 
 
 def test_password_vault_encrypts_config_and_changes_password(
@@ -187,3 +203,67 @@ def test_legacy_migration_preserves_files_when_password_is_wrong(
         Config("wrong-password")
 
     assert all(path.read_bytes() == content for path, content in originals.items())
+
+
+def test_corrupt_encrypted_config_is_not_replaced_with_defaults(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    PasswordVault.create(paths, "password")
+    paths.config_file.write_bytes(b"corrupt")
+
+    with pytest.raises(PasswordEncryptionError):
+        Config("password")
+
+    assert paths.config_file.read_bytes() == b"corrupt"
+
+
+def test_failed_recovery_does_not_log_secrets(
+    caplog, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    PasswordVault.create(paths, "current-password")
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(CredentialRecoveryError):
+            PasswordVault.recover(
+                paths, "wrong-secret-key", "new-password"
+            )
+
+    assert "wrong-secret-key" not in caplog.text
+    assert "new-password" not in caplog.text
+
+
+def test_recovery_rejects_valid_envelope_for_different_data_key(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path / "active"))
+    active_paths = AppPaths.discover()
+    active_paths.ensure_directories()
+    active, _ = PasswordVault.create(active_paths, "old-password")
+    ciphertext = active.encrypt(b'{"setting":"original"}')
+    active_paths.config_file.write_bytes(ciphertext)
+    original_password = active_paths.password_key_file.read_bytes()
+
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path / "other"))
+    other_paths = AppPaths.discover()
+    other_paths.ensure_directories()
+    _, other_recovery_key = PasswordVault.create(other_paths, "other-password")
+    active_paths.recovery_file.write_bytes(other_paths.recovery_file.read_bytes())
+
+    with pytest.raises(CredentialRecoveryError):
+        PasswordVault.recover(
+            active_paths, other_recovery_key, "new-password"
+        )
+
+    assert active_paths.password_key_file.read_bytes() == original_password
+    assert active_paths.config_file.read_bytes() == ciphertext
+    assert (
+        PasswordVault.open(active_paths, "old-password")
+        .decrypt(active_paths.config_file.read_bytes())
+        == b'{"setting":"original"}'
+    )

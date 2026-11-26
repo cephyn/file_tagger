@@ -8,6 +8,7 @@ import shutil
 
 from ..domain.errors import CredentialRecoveryError
 from ..infrastructure.app_paths import AppPaths
+from .file_transactions import replace_files_transactionally
 from .password_vault import PasswordVault
 
 
@@ -25,6 +26,10 @@ def reset_encrypted_configuration(
         raise CredentialRecoveryError("A new password is required.")
 
     paths.ensure_directories()
+    target_snapshot = {
+        path: path.read_bytes() if path.is_file() else None
+        for path in _target_credential_files(paths)
+    }
     sources = _active_credential_files(paths)
     backup_dir, quarantined = _quarantine_files(paths, sources)
     try:
@@ -34,7 +39,7 @@ def reset_encrypted_configuration(
         config = Config(new_password)
         config.save()
     except Exception as exc:
-        _rollback_reset(paths, quarantined, backup_dir)
+        _rollback_reset(target_snapshot, quarantined, backup_dir)
         raise CredentialRecoveryError(
             "The configuration reset could not be completed safely."
         ) from exc
@@ -111,18 +116,36 @@ def _quarantine_files(
 
 
 def _rollback_reset(
-    paths: AppPaths,
+    target_snapshot: dict[Path, bytes | None],
     quarantined: list[tuple[Path, Path]],
     backup_dir: Path,
 ) -> None:
     rollback_error: OSError | None = None
-    for path in _target_credential_files(paths):
+    try:
+        replace_files_transactionally(
+            {
+                path: content
+                for path, content in target_snapshot.items()
+                if content is not None
+            }
+        )
+    except OSError as exc:
+        rollback_error = exc
+    for path, content in target_snapshot.items():
+        if content is not None:
+            continue
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
             rollback_error = exc
     try:
-        _restore_quarantined(quarantined)
+        _restore_quarantined(
+            [
+                (source, backup)
+                for source, backup in quarantined
+                if source not in target_snapshot
+            ]
+        )
     except OSError as exc:
         rollback_error = exc
     if rollback_error is not None:

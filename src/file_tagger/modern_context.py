@@ -1474,10 +1474,7 @@ def initialize_modern_runtime(
             "Legacy configuration migration was not applied (%s).",
             exc.__class__.__name__,
         )
-        if (
-            (paths.legacy_database.parent / "config.encrypted").is_file()
-            and not paths.config_file.is_file()
-        ):
+        if (paths.legacy_database.parent / "config.encrypted").is_file():
             raise
 
     legacy_database = paths.legacy_database.expanduser().resolve()

@@ -20,6 +20,7 @@ from ..domain.errors import (
     CredentialRecoveryError,
 )
 from ..infrastructure.app_paths import AppPaths
+from .file_transactions import replace_files_transactionally
 
 PASSWORD_ENVELOPE_VERSION = 1
 PBKDF2_ITERATIONS = 310_000
@@ -75,6 +76,7 @@ class PasswordVault:
                 paths.password_hash_file,
                 paths.recovery_file,
                 paths.salt_file,
+                paths.config_file,
             )
         ):
             raise CredentialFormatError("Credential metadata already exists.")
@@ -132,6 +134,7 @@ class PasswordVault:
     ) -> "PasswordVault":
         recovery_envelope = _read_envelope(paths.recovery_file)
         data_key = _unwrap_data_key(recovery_envelope, recovery_key)
+        _validate_data_key_for_config(paths.config_file, data_key)
         material = _password_material(new_password, data_key)
         _replace_transaction(
             {
@@ -349,6 +352,17 @@ def _unwrap_data_key(envelope: dict[str, Any], secret: str) -> bytes:
         raise CredentialFormatError("Credential envelope is invalid.") from exc
 
 
+def _validate_data_key_for_config(config_file: Path, data_key: bytes) -> None:
+    if not config_file.is_file():
+        return
+    try:
+        Fernet(data_key).decrypt(config_file.read_bytes())
+    except (InvalidToken, OSError, ValueError) as exc:
+        raise CredentialRecoveryError(
+            "Recovery credentials do not match the active configuration."
+        ) from exc
+
+
 def _json_bytes(value: dict[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -384,44 +398,7 @@ def _backup_credential_files(paths: AppPaths) -> Path:
 
 
 def _replace_transaction(files: dict[Path, bytes]) -> None:
-    token = secrets.token_hex(8)
-    staged: dict[Path, Path] = {}
-    originals: dict[Path, bytes | None] = {}
-    replaced: list[Path] = []
     try:
-        for destination, content in files.items():
-            temporary = destination.with_name(f".{destination.name}.{token}.tmp")
-            with temporary.open("wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            staged[destination] = temporary
-            originals[destination] = (
-                destination.read_bytes() if destination.is_file() else None
-            )
-        for destination, temporary in staged.items():
-            temporary.replace(destination)
-            replaced.append(destination)
+        replace_files_transactionally(files)
     except OSError as exc:
-        rollback_error: OSError | None = None
-        for destination in reversed(replaced):
-            try:
-                original = originals[destination]
-                if original is None:
-                    destination.unlink(missing_ok=True)
-                else:
-                    rollback = destination.with_name(
-                        f".{destination.name}.{token}.rollback"
-                    )
-                    rollback.write_bytes(original)
-                    rollback.replace(destination)
-            except OSError as error:
-                rollback_error = error
-        if rollback_error is not None:
-            raise CredentialRecoveryError(
-                "Credential update failed and rollback was incomplete."
-            ) from rollback_error
         raise CredentialRecoveryError("Credential update failed safely.") from exc
-    finally:
-        for temporary in staged.values():
-            temporary.unlink(missing_ok=True)

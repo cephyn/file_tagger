@@ -188,6 +188,13 @@ class PasswordRecoveryDialog(QDialog):
 
     def _apply_credential_status(self) -> None:
         status = PasswordVault.status(self.paths)
+        if (
+            status is CredentialStatus.UNINITIALIZED
+            and (
+                self.paths.legacy_database.parent / "config.encrypted"
+            ).is_file()
+        ):
+            status = CredentialStatus.LEGACY
         messages = {
             CredentialStatus.ENVELOPE: (
                 "Enter the recovery key that was shown when File Tagger was set up "

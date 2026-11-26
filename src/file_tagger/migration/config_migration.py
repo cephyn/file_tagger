@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ..domain.errors import PasswordEncryptionError
 from ..infrastructure.app_paths import AppPaths
+from ..security.file_transactions import replace_files_transactionally
 
 
 CLOUD_FIELDS = {"api_keys", "selected_provider", "local_models"}
@@ -64,14 +65,12 @@ def _backup_legacy_config(legacy_root: Path, backup_dir: Path) -> Path:
     ):
         source = legacy_root / name
         if source.is_file():
-            shutil.copy2(source, destination / name)
+            backup = destination / name
+            content = source.read_bytes()
+            shutil.copy2(source, backup)
+            if backup.read_bytes() != content:
+                raise OSError("Legacy configuration backup verification failed.")
     return destination
-
-
-def _atomic_write(destination: Path, content: bytes) -> None:
-    temporary = destination.with_suffix(f"{destination.suffix}.migration")
-    temporary.write_bytes(content)
-    temporary.replace(destination)
 
 
 def migrate_legacy_config(
@@ -115,16 +114,26 @@ def migrate_legacy_config(
     sanitized = {key: value for key, value in config.items() if key not in CLOUD_FIELDS}
     removed = len(config.keys() & CLOUD_FIELDS)
     backups = backup_dir or legacy_root / "migration-backups"
-    backup = _backup_legacy_config(legacy_root, backups)
+    try:
+        backup = _backup_legacy_config(legacy_root, backups)
+    except OSError as exc:
+        raise PasswordEncryptionError(
+            "Legacy configuration backup could not be completed safely."
+        ) from exc
 
     try:
         target_paths.ensure_directories()
-        _atomic_write(target_paths.config_file, fernet.encrypt(json.dumps(sanitized).encode()))
-        _atomic_write(target_paths.salt_file, salt)
-        _atomic_write(target_paths.password_hash_file, required[1].read_bytes())
+        replacements = {
+            target_paths.config_file: fernet.encrypt(
+                json.dumps(sanitized).encode()
+            ),
+            target_paths.salt_file: salt,
+            target_paths.password_hash_file: required[1].read_bytes(),
+        }
         recovery_file = legacy_root / ".recovery"
         if recovery_file.is_file():
-            _atomic_write(target_paths.recovery_file, recovery_file.read_bytes())
+            replacements[target_paths.recovery_file] = recovery_file.read_bytes()
+        replace_files_transactionally(replacements)
     except OSError as exc:
         raise PasswordEncryptionError(
             f"Configuration migration failed; backup remains at {backup}."

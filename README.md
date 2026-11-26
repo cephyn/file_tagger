@@ -64,6 +64,27 @@ creates a backup and migrates the available file/tag metadata. It inventories
 legacy Chroma paths but does not copy old embeddings; those files must be
 reindexed by the current Ollama embedding profile.
 
+## Password recovery
+
+Use **Forgot password** on the login screen to recover access with the recovery
+key shown during first setup or after a key rotation. Recovery keys are shown
+only once, are not stored in plaintext, and should be saved outside File
+Tagger. A successful recovery resets the login password without re-encrypting
+the existing configuration.
+
+Successful login to an older password format migrates the encrypted
+configuration to the current format and shows a new recovery key. An already
+locked legacy installation cannot be recovered with its old recovery file
+because that file was encrypted with the forgotten password.
+
+If the recovery key is unavailable, **Reset configuration** requires typing
+`RESET` and a new password. File Tagger quarantines the encrypted configuration
+and credential files under `<per-user data>/password-reset-backups/` before
+creating a new default encrypted configuration. SQLite tagging/search data,
+index data, cache data, and legacy `file_tags.db`/`.chroma` data are not removed.
+Treat the backup as recovery material: a manual restoration can be attempted
+only after understanding the original password and credential format.
+
 ## Configure Ollama
 
 1. Start Ollama locally.
@@ -207,6 +228,8 @@ src/file_tagger/
 - Cloud model tags are rejected.
 - API keys and provider credentials are not required.
 - Configuration is password-protected and encrypted locally.
+- Recovery keys are displayed once and never written to logs or status text.
+- Reset quarantines encrypted settings while preserving SQLite and index data.
 - Legacy cleanup requires explicit confirmation.
 - RAG answers require resolved chunk citations and do not use uncited model
   knowledge as evidence.

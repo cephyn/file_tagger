@@ -1992,8 +1992,33 @@ def test_initialization_worker_failure_emits_three_tuple(monkeypatch) -> None:
     worker.run()
 
     assert len(results) == 1
-    assert results[0] == (None, None, None)
+    assert results[0] == (None, config, None)
     assert len(results[0]) == 3
+
+
+def test_partial_pending_legacy_migration_failure_is_not_suppressed(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    (paths.legacy_database.parent / "config.encrypted").write_bytes(b"legacy")
+
+    def partially_migrate(*args, **kwargs):
+        paths.config_file.parent.mkdir(parents=True, exist_ok=True)
+        paths.config_file.write_bytes(b"partial")
+        raise ValueError("migration failed")
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.migrate_legacy_config",
+        partially_migrate,
+    )
+
+    with pytest.raises(ValueError, match="migration failed"):
+        initialize_modern_runtime(
+            paths,
+            ReloadableConfig(paths),
+            "password",
+            start_readiness=False,
+        )
 
 
 def test_login_accepts_modern_runtime_without_legacy_search(
