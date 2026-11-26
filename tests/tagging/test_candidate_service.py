@@ -30,7 +30,11 @@ from file_tagger.tagging.cache import (
     DatabaseTagRecommendationCache,
     InMemoryTagRecommendationCache,
 )
-from file_tagger.tagging.candidate_service import _embed_document_query, recommend_tags
+from file_tagger.tagging.candidate_service import (
+    _embed_document_query,
+    _split_document_state_text,
+    recommend_tags,
+)
 
 
 class FakeSearch:
@@ -178,7 +182,13 @@ def test_tag_query_embedding_splits_context_rejections() -> None:
         max_candidates=4,
     )
 
-    assert search.calls[0]["query_embedding"] == (0.5, 0.5)
+    query_embedding = search.calls[0]["query_embedding"]
+    assert abs(query_embedding[0] - 0.5) < 0.1
+    assert abs(query_embedding[1] - 0.5) < 0.1
+    assert gateway.embedding_calls[0]["text"] == document_state
+    paragraph_split = _split_document_state_text(document_state)
+    assert paragraph_split is not None
+    assert paragraph_split[0] + paragraph_split[1] == document_state
     assert len(gateway.embedding_calls) >= 3
     assert all(call["truncate"] is False for call in gateway.embedding_calls)
     assert all(
@@ -186,6 +196,28 @@ def test_tag_query_embedding_splits_context_rejections() -> None:
         and (call["text"] in document_state or call["text"] == document_state)
         for call in gateway.embedding_calls
     )
+
+
+def test_tag_query_split_preserves_exact_document_state() -> None:
+    document_state = "left paragraph\n\nright paragraph"
+
+    split = _split_document_state_text(document_state)
+
+    assert split == ("left paragraph", "\n\nright paragraph")
+
+
+def test_tag_query_split_keeps_heading_marker_with_heading() -> None:
+    document_state = "Intro\n# Heading\nBody"
+
+    split = _split_document_state_text(document_state)
+
+    assert split == ("Intro", "\n# Heading\nBody")
+
+
+def test_tag_query_split_does_not_break_unicode_grapheme() -> None:
+    split = _split_document_state_text("A👩‍💻B")
+
+    assert split == ("A", "👩‍💻B")
 
 
 def test_tag_query_embedding_rejects_unsplittable_text() -> None:
