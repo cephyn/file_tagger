@@ -3,6 +3,7 @@ from collections.abc import Coroutine, Mapping, Sequence
 import hashlib
 import inspect
 import json
+import re
 from typing import Any, Protocol, TypeVar
 import unicodedata
 
@@ -10,6 +11,7 @@ from pydantic import AliasChoices, ConfigDict, Field, TypeAdapter
 
 from ..adapters.ollama.gateway import ModelRole, OllamaGateway
 from ..domain.contracts import DomainRecord, ModelProfile, TagDecision
+from ..domain.errors import EmbeddingContextRejectedError
 from .cache import CachedTagRecommendations, TagRecommendationCache
 from .decision_service import (
     DEFAULT_DECISION_MODEL,
@@ -404,14 +406,80 @@ async def _embed_document_query(
     embed = getattr(gateway, "embed", None)
     if not callable(embed):
         raise ValueError("The configured gateway cannot embed tag search queries.")
-    result = embed(
-        profile.model,
+
+    return await _embed_document_state_text(
+        embed,
         document_state,
-        dimensions=profile.dimensions,
-        truncate=False,
+        profile,
     )
-    if inspect.isawaitable(result):
-        result = await result
+
+
+def _split_document_state_text(text: str) -> tuple[str, str] | None:
+    if len(text) <= 1:
+        return None
+
+    midpoint = len(text) // 2
+    candidates: list[int] = []
+    patterns = (
+        r"\n\s*\n",
+        r"\n#{1,6}[ \t]+",
+        r"(?<=[.!?])\s+",
+        r"\n",
+        r"[ \t]+",
+    )
+    for pattern in patterns:
+        candidates.extend(
+            match.end()
+            for match in re.finditer(pattern, text)
+            if 0 < match.end() < len(text)
+        )
+
+    offset = (
+        min(candidates, key=lambda candidate: abs(candidate - midpoint))
+        if candidates
+        else midpoint
+    )
+    if offset <= 0 or offset >= len(text):
+        return None
+    return text[:offset], text[offset:]
+
+
+async def _embed_document_state_text(
+    embed: Any,
+    text: str,
+    profile: ModelProfile,
+) -> tuple[float, ...]:
+    try:
+        result = embed(
+            profile.model,
+            text,
+            dimensions=profile.dimensions,
+            truncate=False,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+    except EmbeddingContextRejectedError as exc:
+        split = _split_document_state_text(text)
+        if split is None:
+            raise EmbeddingContextRejectedError(
+                "Document-state embedding text is unsplittable after context rejection."
+            ) from exc
+        left_text, right_text = split
+        left_embedding = await _embed_document_state_text(
+            embed,
+            left_text,
+            profile,
+        )
+        right_embedding = await _embed_document_state_text(
+            embed,
+            right_text,
+            profile,
+        )
+        return tuple(
+            (left + right) / 2.0
+            for left, right in zip(left_embedding, right_embedding)
+        )
+
     if not isinstance(result, Sequence) or len(result) != 1:
         raise ValueError("The embedding gateway returned an invalid query vector.")
     vector = result[0]

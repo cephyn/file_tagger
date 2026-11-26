@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
 import json
 from pathlib import Path
 import struct
@@ -11,6 +12,7 @@ import pytest
 from sqlalchemy import event, inspect, text
 
 from file_tagger.domain.contracts import ModelProfile, TagDecision
+from file_tagger.domain.errors import EmbeddingContextRejectedError
 from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.infrastructure.app_paths import AppPaths
@@ -28,7 +30,7 @@ from file_tagger.tagging.cache import (
     DatabaseTagRecommendationCache,
     InMemoryTagRecommendationCache,
 )
-from file_tagger.tagging.candidate_service import recommend_tags
+from file_tagger.tagging.candidate_service import _embed_document_query, recommend_tags
 
 
 class FakeSearch:
@@ -115,6 +117,109 @@ class FakeGateway:
                 "confidence": confidence,
             }
         return SimpleNamespace(answers=answers)
+
+
+def test_tag_query_embedding_splits_context_rejections() -> None:
+    document_state = "left paragraph\n\nright paragraph"
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="embedding-digest",
+        context_length=128,
+        dimensions=2,
+    )
+
+    class RejectingEmbeddingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.embedding_calls: list[dict[str, Any]] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            assert isinstance(text, str)
+            self.embedding_calls.append(
+                {
+                    "model": model,
+                    "text": text,
+                    "dimensions": dimensions,
+                    "truncate": truncate,
+                    "keep_alive": keep_alive,
+                }
+            )
+            if len(text) > 12:
+                raise EmbeddingContextRejectedError(
+                    "Embedding input exceeded the model context without truncation."
+                )
+            if "left" in text:
+                return ((1.0, 0.0),)
+            if "right" in text:
+                return ((0.0, 1.0),)
+            return ((0.5, 0.5),)
+
+    gateway = RejectingEmbeddingGateway()
+    search = FakeSearch(["existing"])
+
+    recommend_tags(
+        document_state,
+        file_hash="same-content",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        candidate_model_digest="candidate-digest",
+        decision_model_digest="decision-digest",
+        embedding_profile=profile,
+        max_candidates=4,
+    )
+
+    assert search.calls[0]["query_embedding"] == (0.5, 0.5)
+    assert len(gateway.embedding_calls) >= 3
+    assert all(call["truncate"] is False for call in gateway.embedding_calls)
+    assert all(
+        call["dimensions"] == 2
+        and (call["text"] in document_state or call["text"] == document_state)
+        for call in gateway.embedding_calls
+    )
+
+
+def test_tag_query_embedding_rejects_unsplittable_text() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="embedding-digest",
+        context_length=128,
+        dimensions=2,
+    )
+
+    class UnsplittableEmbeddingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            del model, text, dimensions, truncate, keep_alive
+            raise EmbeddingContextRejectedError(
+                "Embedding input exceeded the model context without truncation."
+            )
+
+    with pytest.raises(EmbeddingContextRejectedError, match="unsplittable"):
+        asyncio.run(
+            _embed_document_query(
+                UnsplittableEmbeddingGateway(),
+                "x",
+                profile,
+            )
+        )
 
 
 def test_model_digest_change_invalidates_cached_tags() -> None:
