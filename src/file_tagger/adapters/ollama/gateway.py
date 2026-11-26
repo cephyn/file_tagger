@@ -327,7 +327,9 @@ class OllamaGateway:
             )
         except ResponseError as exc:
             message = str(exc)
-            if exc.status_code == 400 and "context" in message.lower():
+            if exc.status_code == 413 or (
+                exc.status_code == 400 and "context" in message.lower()
+            ):
                 raise EmbeddingContextRejectedError(
                     "Embedding input exceeded the model context without truncation."
                 ) from exc
@@ -385,6 +387,10 @@ class OllamaGateway:
         except (ConnectionError, TimeoutError, httpx.TimeoutException) as exc:
             raise self._translate_transport_error(exc) from exc
         except ResponseError as exc:
+            if exc.status_code == 413:
+                raise GenerationContextRejectedError(
+                    "Local Ollama chat input exceeded the model context."
+                ) from exc
             if exc.status_code == 404:
                 raise ModelMissingError(f"Local Ollama model is not installed: {model}.") from exc
             message = str(exc).casefold()

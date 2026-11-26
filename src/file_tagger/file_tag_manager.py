@@ -2026,22 +2026,14 @@ class FileTagManager(QMainWindow):
             report,
             runtime_refresh_provider=runtime,
             parent=self,
+            model_selection_applier=(
+                runtime.apply_model_selections
+                if runtime is not None
+                and callable(getattr(runtime, "apply_model_selections", None))
+                else None
+            ),
         )
-        result = dialog.exec()
-        if (
-            result == QDialog.DialogCode.Accepted
-            and runtime is not None
-            and callable(getattr(runtime, "apply_model_selections", None))
-        ):
-            try:
-                runtime.apply_model_selections(dialog.selected_models())
-            except (TypeError, ValueError) as exc:
-                self.logger.warning("Could not apply Ollama model selections: %s", exc)
-                QMessageBox.warning(
-                    self,
-                    "Ollama Models",
-                    f"Could not apply the selected models: {exc}",
-                )
+        dialog.exec()
 
     def show_password_management(self):
         """Show the password management dialog."""

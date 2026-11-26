@@ -344,6 +344,20 @@ def test_embedding_context_rejection_is_explicit() -> None:
         asyncio.run(gateway.embed("embeddinggemma-2:270m", "too large"))
 
 
+class PayloadTooLargeClient(FakeAsyncClient):
+    async def embed(self, **kwargs):
+        from ollama import ResponseError
+
+        raise ResponseError("request body too large", status_code=413)
+
+
+def test_embedding_payload_too_large_is_context_rejection() -> None:
+    gateway = OllamaGateway(client=PayloadTooLargeClient())
+
+    with pytest.raises(EmbeddingContextRejectedError):
+        asyncio.run(gateway.embed("embeddinggemma-2:270m", "too large"))
+
+
 class StructuredOutputRejectedClient(FakeAsyncClient):
     async def chat(self, **kwargs):
         from ollama import ResponseError
@@ -369,6 +383,25 @@ class ChatContextRejectedClient(FakeAsyncClient):
         from ollama import ResponseError
 
         raise ResponseError("prompt is too long for the context window", status_code=400)
+
+
+class ChatPayloadTooLargeClient(FakeAsyncClient):
+    async def chat(self, **kwargs):
+        from ollama import ResponseError
+
+        raise ResponseError("request body too large", status_code=413)
+
+
+def test_chat_payload_too_large_is_context_rejection() -> None:
+    gateway = OllamaGateway(client=ChatPayloadTooLargeClient())
+
+    with pytest.raises(GenerationContextRejectedError):
+        asyncio.run(
+            gateway.chat(
+                "gemma4:e4b",
+                messages=[{"role": "user", "content": "Find the guide"}],
+            )
+        )
 
 
 def test_local_chat_context_failure_is_explicit() -> None:

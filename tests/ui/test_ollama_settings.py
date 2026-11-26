@@ -7,6 +7,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMainWindow, QPushButton
 
 from file_tagger.domain.contracts import HardwareReport, ModelProfile, OllamaReadiness
+from file_tagger.infrastructure.app_paths import AppPaths
+from file_tagger.modern_context import ModernRuntime
 from file_tagger.ollama.model_recommender import (
     ModelRecommendation,
     RecommendedModel,
@@ -456,7 +458,11 @@ def test_manager_passes_runtime_readiness_to_dialog(qtbot, monkeypatch) -> None:
     manager.logger = logging.getLogger("test-file-tagger-manager")
     qtbot.addWidget(manager)
     report = _report()
-    runtime = SimpleNamespace(readiness=report, start_readiness=lambda: None)
+    runtime = SimpleNamespace(
+        readiness=report,
+        start_readiness=lambda: None,
+        apply_model_selections=lambda selections: None,
+    )
     manager.modern_runtime = runtime
     captured: dict[str, object] = {}
 
@@ -474,10 +480,14 @@ def test_manager_passes_runtime_readiness_to_dialog(qtbot, monkeypatch) -> None:
 
     assert captured["readiness"] is report
     assert captured["runtime_refresh_provider"] is runtime
+    assert (
+        captured["model_selection_applier"]
+        is runtime.apply_model_selections
+    )
     assert captured["parent"] is manager
 
 
-def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
+def test_manager_does_not_duplicate_dialog_selection_applier(qtbot, monkeypatch) -> None:
     module = _manager_module()
     manager = module.FileTagManager.__new__(module.FileTagManager)
     QMainWindow.__init__(manager)
@@ -498,8 +508,10 @@ def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
     class Dialog:
         def __init__(self, readiness, **kwargs) -> None:
             self.readiness = readiness
+            self.model_selection_applier = kwargs["model_selection_applier"]
 
         def exec(self) -> int:
+            self.model_selection_applier(selections)
             return int(module.QDialog.DialogCode.Accepted)
 
         def selected_models(self) -> dict[str, str | None]:
@@ -510,6 +522,151 @@ def test_manager_applies_accepted_model_selections(qtbot, monkeypatch) -> None:
     manager.show_ollama_settings()
 
     assert applied == [selections]
+
+
+def test_closing_settings_after_selection_changes_persists_choices(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path / "app"))
+    paths = AppPaths.discover()
+    runtime = ModernRuntime(paths, None)
+    report = _report(ready=True).model_copy(
+        update={
+            "profiles": (
+                _profile("embedding", "embeddinggemma-2:270m"),
+                _profile("embedding", "embeddinggemma-2:440m"),
+                _profile("decision", "nimble:9b"),
+                _profile("decision", "tev1:4b"),
+                _profile("generation", "gemma4:e4b"),
+                _profile("generation", "gemma4:e2b"),
+            )
+        }
+    )
+    runtime.readiness = report
+    monkeypatch.setattr(runtime, "start_readiness", lambda: None)
+
+    dialog = OllamaSettingsDialog(
+        report,
+        model_selection_applier=runtime.apply_model_selections,
+    )
+    qtbot.addWidget(dialog)
+    dialog.model_selectors["embedding"].setCurrentText(
+        "embeddinggemma-2:440m"
+    )
+    dialog.model_selectors["decision"].setCurrentText("tev1:4b")
+    dialog.model_selectors["generation"].setCurrentText("gemma4:e2b")
+
+    dialog.close()
+
+    restarted = ModernRuntime(paths, None)
+    assert restarted.model_overrides == {
+        "embedding": "embeddinggemma-2:440m",
+        "decision": "tev1:4b",
+        "generation": "gemma4:e2b",
+    }
+
+
+def test_accepting_settings_applies_selection_before_closing(
+    qtbot,
+) -> None:
+    report = _report(ready=True).model_copy(
+        update={
+            "profiles": (
+                _profile("embedding", "embeddinggemma-2:270m"),
+                _profile("embedding", "embeddinggemma-2:440m"),
+                _profile("decision", "nimble:9b"),
+                _profile("decision", "tev1:4b"),
+                _profile("generation", "gemma4:e4b"),
+                _profile("generation", "gemma4:e2b"),
+            )
+        }
+    )
+    applied: list[dict[str, str | None]] = []
+    dialog = OllamaSettingsDialog(
+        report,
+        model_selection_applier=applied.append,
+    )
+    qtbot.addWidget(dialog)
+    dialog.model_selectors["embedding"].setCurrentText(
+        "embeddinggemma-2:440m"
+    )
+    dialog.model_selectors["decision"].setCurrentText("tev1:4b")
+    dialog.model_selectors["generation"].setCurrentText("gemma4:e2b")
+
+    dialog.accept()
+
+    assert applied == [
+        {
+            "embedding": "embeddinggemma-2:440m",
+            "decision": "tev1:4b",
+            "generation": "gemma4:e2b",
+        }
+    ]
+
+
+def test_refresh_preserves_user_selection_until_applied(
+    qtbot,
+) -> None:
+    report = _report(ready=True).model_copy(
+        update={
+            "profiles": (
+                _profile("embedding", "embeddinggemma-2:270m"),
+                _profile("embedding", "embeddinggemma-2:440m"),
+                _profile("decision", "nimble:9b"),
+                _profile("decision", "tev1:4b"),
+                _profile("generation", "gemma4:e4b"),
+                _profile("generation", "gemma4:e2b"),
+            )
+        }
+    )
+    dialog = OllamaSettingsDialog(report)
+    qtbot.addWidget(dialog)
+    dialog.model_selectors["embedding"].setCurrentText(
+        "embeddinggemma-2:440m"
+    )
+
+    dialog.set_report(report)
+
+    assert dialog.model_selectors["embedding"].currentText() == (
+        "embeddinggemma-2:440m"
+    )
+
+
+def test_canceling_settings_does_not_persist_selection_changes(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path / "app"))
+    paths = AppPaths.discover()
+    runtime = ModernRuntime(paths, None)
+    report = _report(ready=True).model_copy(
+        update={
+            "profiles": (
+                _profile("embedding", "embeddinggemma-2:270m"),
+                _profile("embedding", "embeddinggemma-2:440m"),
+                _profile("decision", "nimble:9b"),
+                _profile("decision", "tev1:4b"),
+                _profile("generation", "gemma4:e4b"),
+                _profile("generation", "gemma4:e2b"),
+            )
+        }
+    )
+    runtime.readiness = report
+
+    dialog = OllamaSettingsDialog(
+        report,
+        model_selection_applier=runtime.apply_model_selections,
+    )
+    qtbot.addWidget(dialog)
+    dialog.model_selectors["embedding"].setCurrentText(
+        "embeddinggemma-2:440m"
+    )
+    dialog.reject()
+
+    assert not paths.config_dir.joinpath("ollama-models.json").is_file()
 
 
 def test_manager_import_preserves_modern_tag_suggestion() -> None:

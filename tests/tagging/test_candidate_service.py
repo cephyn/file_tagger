@@ -12,7 +12,10 @@ import pytest
 from sqlalchemy import event, inspect, text
 
 from file_tagger.domain.contracts import ModelProfile, TagDecision
-from file_tagger.domain.errors import EmbeddingContextRejectedError
+from file_tagger.domain.errors import (
+    EmbeddingContextRejectedError,
+    GenerationContextRejectedError,
+)
 from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
 from file_tagger.infrastructure.app_paths import AppPaths
@@ -32,6 +35,7 @@ from file_tagger.tagging.cache import (
 )
 from file_tagger.tagging.candidate_service import (
     _embed_document_query,
+    _generate_candidates,
     _split_document_state_text,
     recommend_tags,
 )
@@ -250,6 +254,81 @@ def test_tag_query_embedding_rejects_unsplittable_text() -> None:
                 UnsplittableEmbeddingGateway(),
                 "x",
                 profile,
+            )
+        )
+
+
+def test_candidate_chat_splits_context_rejections() -> None:
+    document_state = "left paragraph\n\nright paragraph"
+
+    class ContextSplittingGateway:
+        def __init__(self) -> None:
+            self.chat_calls: list[dict[str, Any]] = []
+
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            del model, schema, keep_alive
+            self.chat_calls.append({"messages": messages})
+            content = str(messages[1]["content"])
+            if content.endswith(document_state):
+                raise GenerationContextRejectedError("generation context rejected")
+            if "left" in content:
+                candidates = ("left-tag", "shared")
+            elif "right" in content:
+                candidates = ("right-tag", "shared")
+            else:
+                candidates = ("shared",)
+            return json.dumps({"candidates": candidates})
+
+    gateway = ContextSplittingGateway()
+
+    result = asyncio.run(
+        _generate_candidates(
+            gateway,
+            document_state=document_state,
+            model="inkling-2-mini",
+            limit=4,
+            existing=("existing",),
+        )
+    )
+
+    assert len(gateway.chat_calls) >= 3
+    assert document_state in str(gateway.chat_calls[0]["messages"][1]["content"])
+    for call in gateway.chat_calls[1:]:
+        content = str(call["messages"][1]["content"])
+        assert document_state not in content
+    assert len(result) <= 4
+    assert len(set(result)) == len(result)
+    assert sum(candidate == "shared" for candidate in result) == 1
+
+
+def test_candidate_chat_rejects_unsplittable_text() -> None:
+    class UnsplittableCandidateGateway:
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            del model, messages, schema, keep_alive
+            raise GenerationContextRejectedError("generation context rejected")
+
+    with pytest.raises(GenerationContextRejectedError, match="unsplittable"):
+        asyncio.run(
+            _generate_candidates(
+                UnsplittableCandidateGateway(),
+                document_state="x",
+                model="inkling-2-mini",
+                limit=4,
+                existing=(),
             )
         )
 

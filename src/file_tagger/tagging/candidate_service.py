@@ -11,7 +11,10 @@ from pydantic import AliasChoices, ConfigDict, Field, TypeAdapter
 
 from ..adapters.ollama.gateway import ModelRole, OllamaGateway
 from ..domain.contracts import DomainRecord, ModelProfile, TagDecision
-from ..domain.errors import EmbeddingContextRejectedError
+from ..domain.errors import (
+    EmbeddingContextRejectedError,
+    GenerationContextRejectedError,
+)
 from .cache import CachedTagRecommendations, TagRecommendationCache
 from .decision_service import (
     DEFAULT_DECISION_MODEL,
@@ -613,28 +616,65 @@ async def _generate_candidates(
 ) -> tuple[str, ...]:
     schema = CandidateEnvelope.model_json_schema()
     exclusions = ", ".join(existing) if existing else "none"
-    raw = await gateway.chat(
-        model,
-        messages=(
-            {
-                "role": "system",
-                "content": (
-                    "Generate concise, reusable file tags. Return JSON only. "
-                    "Do not repeat existing tags and do not invent facts unsupported "
-                    "by the document."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Generate no more than {limit} new tag candidates for this "
-                    f"document state. Exclude these existing tags exactly or by case: "
-                    f"{exclusions}.\n\n{document_state}"
-                ),
-            },
-        ),
-        schema=schema,
-    )
+    try:
+        raw = await gateway.chat(
+            model,
+            messages=(
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate concise, reusable file tags. Return JSON only. "
+                        "Do not repeat existing tags and do not invent facts unsupported "
+                        "by the document."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Generate no more than {limit} new tag candidates for this "
+                        f"document state. Exclude these existing tags exactly or by case: "
+                        f"{exclusions}.\n\n{document_state}"
+                    ),
+                },
+            ),
+            schema=schema,
+        )
+    except GenerationContextRejectedError as exc:
+        split = _split_document_state_text(document_state)
+        if split is None:
+            raise GenerationContextRejectedError(
+                "Document-state candidate-generation text is unsplittable "
+                "after context rejection."
+            ) from exc
+        left_state, right_state = split
+        left = await _generate_candidates(
+            gateway,
+            document_state=left_state,
+            model=model,
+            limit=limit,
+            existing=existing,
+        )
+        right = await _generate_candidates(
+            gateway,
+            document_state=right_state,
+            model=model,
+            limit=limit,
+            existing=existing,
+        )
+        merged: list[str] = []
+        seen = {_tag_key(tag) for tag in existing}
+        for candidate in (*left, *right):
+            normalized = _display_tag(candidate)
+            if normalized is None:
+                continue
+            key = _tag_key(normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(normalized)
+            if len(merged) >= limit:
+                break
+        return tuple(merged)
     try:
         envelope = _CANDIDATE_ENVELOPE.validate_json(raw)
     except (TypeError, ValueError) as exc:

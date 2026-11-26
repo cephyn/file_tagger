@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 import inspect
 import queue
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QVBoxLayout,
     QWidget,
+    QMessageBox,
 )
 
 from ..adapters.ollama.gateway import (
@@ -35,6 +36,7 @@ _NO_REFRESH_RESULT = object()
 
 RefreshProvider = Callable[[], ReadinessReport | None]
 CompletionCallback = Callable[[ReadinessReport | None], None]
+ModelSelectionApplier = Callable[[Mapping[str, str | None]], Any]
 
 
 def _gib(byte_count: int) -> str:
@@ -63,6 +65,7 @@ class OllamaSettingsDialog(QDialog):
         recommendation: ModelRecommendation | None = None,
         runtime_refresh_provider: Any | None = None,
         parent: QWidget | None = None,
+        model_selection_applier: ModelSelectionApplier | None = None,
         *,
         hardware_report: HardwareReport | None = None,
         refresh_provider: Any | None = None,
@@ -71,6 +74,8 @@ class OllamaSettingsDialog(QDialog):
         self._report = report
         self._hardware = hardware_report or hardware or report.hardware
         self._recommendation = recommendation or report.recommendation
+        self._model_selection_applier = model_selection_applier
+        self._selections_dirty = False
         self._refresh_provider = (
             runtime_refresh_provider or refresh_provider
         )
@@ -134,6 +139,7 @@ class OllamaSettingsDialog(QDialog):
             selector = QComboBox()
             selector.setObjectName(f"{role}_model_selector")
             selector.setEnabled(False)
+            selector.currentTextChanged.connect(self._mark_selections_dirty)
             selection_layout.addRow(f"{role.title()}:", selector)
             self.model_selectors[role] = selector
         content_layout.addWidget(selection_group)
@@ -174,6 +180,11 @@ class OllamaSettingsDialog(QDialog):
 
     def set_report(self, report: ReadinessReport) -> None:
         self._report = report
+        pending_selections = (
+            self.selected_models()
+            if self._selections_dirty
+            else None
+        )
         if report.hardware is not None:
             self._hardware = report.hardware
         if report.recommendation is not None:
@@ -203,7 +214,7 @@ class OllamaSettingsDialog(QDialog):
         self.disk_fit.setText(self._disk_fit_text())
         self.installed_models.setText(self._installed_models_text())
         self.benchmark_results.setText(self._benchmark_text())
-        self._populate_selectors()
+        self._populate_selectors(preferred=pending_selections)
 
         valid_host = _is_loopback_host(
             report.ollama.base_url
@@ -349,7 +360,11 @@ class OllamaSettingsDialog(QDialog):
             )
         return "\n".join(dict.fromkeys(lines))
 
-    def _populate_selectors(self) -> None:
+    def _populate_selectors(
+        self,
+        *,
+        preferred: Mapping[str, str | None] | None = None,
+    ) -> None:
         for role, selector in self.model_selectors.items():
             selector.blockSignals(True)
             selector.clear()
@@ -363,13 +378,18 @@ class OllamaSettingsDialog(QDialog):
             selector.addItems(installed or ("No compatible installed model",))
             selector.setEnabled(bool(installed))
             selected = (
-                self._report.selected_models.as_mapping()
-                if self._report.selected_models is not None
-                else {}
+                preferred.get(role)
+                if preferred is not None
+                else None
             )
-            preferred = selected.get(role)
-            if preferred is not None and installed:
-                index = selector.findText(preferred)
+            if selected is None:
+                selected = (
+                    self._report.selected_models.as_mapping()
+                    if self._report.selected_models is not None
+                    else {}
+                ).get(role)
+            if selected is not None and installed:
+                index = selector.findText(selected)
                 if index >= 0:
                     selector.setCurrentIndex(index)
             elif self._recommendation is not None and installed:
@@ -386,6 +406,39 @@ class OllamaSettingsDialog(QDialog):
                 selector.currentText() if selector.isEnabled() else None
             )
         return selections
+
+    def _mark_selections_dirty(self, _text: str) -> None:
+        self._selections_dirty = True
+
+    def _apply_selection_changes(self) -> bool:
+        if not self._selections_dirty or self._model_selection_applier is None:
+            return True
+        try:
+            self._model_selection_applier(self.selected_models())
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.warning(
+                self,
+                "Ollama Models",
+                f"Could not apply the selected models: {exc}",
+            )
+            return False
+        self._selections_dirty = False
+        return True
+
+    def accept(self) -> None:
+        if not self._apply_selection_changes():
+            return
+        super().accept()
+
+    def reject(self) -> None:
+        self._selections_dirty = False
+        super().reject()
+
+    def closeEvent(self, event: Any) -> None:
+        if not self._apply_selection_changes():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def refresh(self) -> None:
         provider = self._refresh_provider
