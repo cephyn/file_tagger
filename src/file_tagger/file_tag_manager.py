@@ -1938,6 +1938,8 @@ class FileTagManager(QMainWindow):
                     # Initialize progress
                     total_files = len(files)
                     if total_files == 0:
+                        if self.stop_requested:
+                            return
                         self.scan_finished.emit({})
                         return
 
@@ -1972,9 +1974,13 @@ class FileTagManager(QMainWindow):
                         self.scan_progress.emit(idx + 1, total_files)
 
                     # Emit result with file-specific suggestions
+                    if self.stop_requested:
+                        return
                     self.scan_finished.emit(untagged_files)
 
                 except Exception as e:
+                    if self.stop_requested:
+                        return
                     self.scan_error.emit(str(e))
 
         # Create progress dialog
@@ -1997,9 +2003,11 @@ class FileTagManager(QMainWindow):
         self.scan_thread.scan_progress.connect(
             lambda current, total: progress.setValue(int(current / total * 100))
         )
+        self.scan_thread.scan_finished.connect(progress.close)
         self.scan_thread.scan_finished.connect(
             lambda files: self.show_untagged_files_dialog(files, dir_path)
         )
+        self.scan_thread.scan_error.connect(progress.close)
         self.scan_thread.scan_error.connect(
             lambda error: QMessageBox.critical(
                 self, "Scan Error", f"Error scanning directory: {error}"
