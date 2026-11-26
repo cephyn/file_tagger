@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QTreeView,
     QListWidget,
     QPushButton,
-    QInputDialog,
     QColorDialog,
     QLabel,
     QFileSystemModel,
