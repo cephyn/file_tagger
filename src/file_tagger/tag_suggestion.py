@@ -10,11 +10,13 @@ import mimetypes
 import os
 import random
 from typing import Any, Protocol
+from pathlib import Path
 
 from .domain.contracts import ModelProfile
 from .infrastructure.app_paths import AppPaths
 from .infrastructure.database import create_session_factory, upgrade_database
-from .models import File, Tag, TagSuggestionCache as LegacySuggestionCache
+from .models import TagSuggestionCache as LegacySuggestionCache
+from .persistence.models import File, FileTag, Tag
 from .search.hybrid import HybridSearch
 from .tagging.cache import (
     CachedTagRecommendations,
@@ -36,6 +38,19 @@ TAG_SUGGESTION_EXTRACTION_VERSION = "tag-suggestion-state-v1"
 
 class TagSuggestionConfig(Protocol):
     pass
+
+
+def _canonical_path(file_path: str) -> str:
+    return os.path.normpath(str(Path(file_path).expanduser().resolve()))
+
+
+def _modern_file_tags(file_obj: File) -> list[Tag]:
+    tags: list[Tag] = []
+    for item in file_obj.tags:
+        tag = getattr(item, "tag", item)
+        if tag:
+            tags.append(tag)
+    return tags
 
 
 def _document_state(file_path: str) -> str:
@@ -661,16 +676,29 @@ class TagSuggestionDialog(QDialog):
                 return
             
             # Get or create file record
-            file_obj = self.db_session.query(File).filter_by(path=self.file_path).first()
+            canonical_path = _canonical_path(self.file_path)
+            file_obj = (
+                self.db_session.query(File)
+                .filter_by(canonical_path=canonical_path)
+                .first()
+            )
             if not file_obj:
-                file_obj = File(path=self.file_path)
+                file_obj = File(
+                    canonical_path=canonical_path,
+                    indexing_state="not_indexed",
+                )
                 self.db_session.add(file_obj)
             
             # Add existing tags
+            existing_tag_names = {tag.name for tag in _modern_file_tags(file_obj)}
             for tag_name in selected_existing:
                 tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
-                if tag and tag not in file_obj.tags:
-                    file_obj.tags.append(tag)
+                if tag and tag.name not in existing_tag_names:
+                    if hasattr(tag, "id") and getattr(tag, "id", None) is not None:
+                        file_obj.tags.append(FileTag(file=file_obj, tag=tag))
+                    else:
+                        file_obj.tags.append(tag)
+                    existing_tag_names.add(tag.name)
             
             # Create and add new tags with random colors
             for tag_name in selected_new:
@@ -683,8 +711,13 @@ class TagSuggestionDialog(QDialog):
                     random_color = QColor.fromHsv(hue, saturation, value).name()
                     tag = Tag(name=tag_name, color=random_color)
                     self.db_session.add(tag)
-                if tag not in file_obj.tags:
-                    file_obj.tags.append(tag)
+                    self.db_session.flush()
+                if tag.name not in existing_tag_names:
+                    if hasattr(tag, "id") and getattr(tag, "id", None) is not None:
+                        file_obj.tags.append(FileTag(file=file_obj, tag=tag))
+                    else:
+                        file_obj.tags.append(tag)
+                    existing_tag_names.add(tag.name)
             
             # Commit changes to the database
             self.db_session.commit()
@@ -693,7 +726,10 @@ class TagSuggestionDialog(QDialog):
                 try:
                     runtime.sync_file(
                         self.file_path,
-                        [(tag.name, tag.color) for tag in file_obj.tags],
+                        [
+                            (tag.name, tag.color)
+                            for tag in _modern_file_tags(file_obj)
+                        ],
                     )
                 except Exception:
                     pass

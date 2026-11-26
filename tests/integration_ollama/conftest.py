@@ -104,8 +104,12 @@ class RealOllama:
                 questions={
                     "answer": {
                         "type": "choice",
-                        "prompt": prompt,
-                        "choices": ["accepted", "rejected", "review"],
+                        "instructions": prompt,
+                        "criteria": {
+                            "accepted": "The request was accepted.",
+                            "rejected": "The request was rejected.",
+                            "review": "The request requires human review.",
+                        },
                     }
                 },
             )

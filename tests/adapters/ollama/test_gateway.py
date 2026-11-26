@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from file_tagger.adapters.ollama.gateway import OllamaGateway
+import file_tagger.adapters.ollama.gateway as gateway_module
 from file_tagger.domain.errors import (
     EmbeddingContextRejectedError,
     GenerationContextRejectedError,
@@ -103,6 +104,24 @@ def test_loopback_host_is_allowed(host) -> None:
     assert OllamaGateway(host, client=FakeAsyncClient()).host == host
 
 
+def test_default_timeout_allows_large_model_cold_load(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class RecordingClient:
+        def __init__(self, *, host, timeout, follow_redirects) -> None:
+            captured.update(
+                host=host,
+                timeout=timeout,
+                follow_redirects=follow_redirects,
+            )
+
+    monkeypatch.setattr(gateway_module, "AsyncClient", RecordingClient)
+
+    OllamaGateway()
+
+    assert float(captured["timeout"]) >= 120.0
+
+
 @pytest.mark.parametrize(
     "host",
     [
@@ -181,6 +200,51 @@ def test_model_profile_resolves_untagged_model_to_latest_metadata() -> None:
     assert profile.context_length == 32_768
     assert client.show_calls == ["inkling-2-mini:latest"]
     assert client.chat_calls[0]["model"] == "inkling-2-mini"
+
+
+def test_embedding_profile_resolves_suffixed_dimension_metadata() -> None:
+    class SuffixedMetadataClient(FakeAsyncClient):
+        async def show(self, model):
+            return SimpleNamespace(
+                capabilities=["embedding"],
+                modelinfo={
+                    "gemma-embedding2.context_length": 262_144,
+                    "gemma-embedding2.embedding_length": 512,
+                },
+            )
+
+    gateway = OllamaGateway(client=SuffixedMetadataClient())
+
+    profile = asyncio.run(
+        gateway.model_profile("embedding", "embeddinggemma-2:270m")
+    )
+
+    assert profile.dimensions == 512
+
+
+def test_decision_profile_accepts_modern_decision_capability() -> None:
+    class DecisionCapabilityClient(FakeAsyncClient):
+        async def list(self):
+            return SimpleNamespace(
+                models=[
+                    SimpleNamespace(model="tev1:4b", digest="sha256:decision"),
+                ]
+            )
+
+        async def show(self, model):
+            return SimpleNamespace(
+                capabilities=["decision"],
+                modelinfo={
+                    "qwen35.context_length": 262_144,
+                },
+            )
+
+    gateway = OllamaGateway(client=DecisionCapabilityClient())
+
+    profile = asyncio.run(gateway.model_profile("decision", "tev1:4b"))
+
+    assert profile.role == "decision"
+    assert profile.capabilities == ("decision",)
 
 
 def test_old_server_and_missing_model_are_not_ready() -> None:

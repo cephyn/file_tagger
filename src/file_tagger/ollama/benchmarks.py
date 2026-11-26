@@ -39,8 +39,11 @@ async def run_model_benchmark(
                 questions={
                     "ready": {
                         "type": "choice",
-                        "prompt": "Can local inference run?",
-                        "choices": ["yes", "no"],
+                        "instructions": "Decide whether local Ollama inference is ready.",
+                        "criteria": {
+                            "yes": "Local Ollama returned an available inference result.",
+                            "no": "Local Ollama did not return an available inference result.",
+                        },
                     }
                 },
             )

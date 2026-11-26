@@ -163,6 +163,26 @@ def test_slow_successful_benchmarks_receive_warning_not_failure() -> None:
     assert any("slow" in warning.lower() for warning in report.warnings)
 
 
+def test_decision_readiness_probe_uses_complete_choice_schema() -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingGateway(FakeGateway):
+        async def system_one(self, model, **kwargs):
+            captured.update(kwargs)
+            return await super().system_one(model, **kwargs)
+
+    report = asyncio.run(
+        OllamaReadinessService(CapturingGateway()).check(required_models())
+    )
+
+    assert report.ready is True
+    question = captured["questions"]["ready"]
+    assert "instructions" in question
+    assert "criteria" in question
+    assert "prompt" not in question
+    assert "choices" not in question
+
+
 def test_unsupported_selected_embedding_dimensions_block_search() -> None:
     class UnsupportedEmbeddingGateway(FakeGateway):
         async def model_profile(self, role, model):

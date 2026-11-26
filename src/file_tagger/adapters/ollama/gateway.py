@@ -23,6 +23,7 @@ from ...domain.errors import (
 ModelRole = Literal["embedding", "decision", "generation"]
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 MINIMUM_OLLAMA_VERSION = (0, 35, 0)
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 CLOUD_MARKERS = (":cloud", "-cloud", "cloud:", ".cloud")
 _VERSION_PATTERN = re.compile(
     r"v?(\d+)\.(\d+)\.(\d+)"
@@ -86,7 +87,7 @@ class OllamaGateway:
         host: str = DEFAULT_OLLAMA_HOST,
         *,
         client: Any | None = None,
-        timeout_seconds: float = 15.0,
+        timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.host = validate_ollama_host(host)
         self._client: Any = (
@@ -181,11 +182,14 @@ class OllamaGateway:
     def _dimensions(model_info: Mapping[str, Any] | None) -> int | None:
         if not model_info:
             return None
-        try:
-            dimensions = int(model_info.get("embedding_length", 0))
-        except (TypeError, ValueError):
-            return None
-        return dimensions if dimensions > 0 else None
+        for key, value in model_info.items():
+            if key == "embedding_length" or str(key).endswith(".embedding_length"):
+                try:
+                    dimensions = int(value)
+                except (TypeError, ValueError):
+                    return None
+                return dimensions if dimensions > 0 else None
+        return None
 
     async def model_profile(self, role: ModelRole, model: str) -> ModelProfile:
         self._validate_model(model)
@@ -222,12 +226,16 @@ class OllamaGateway:
             raise self._translate_transport_error(exc) from exc
 
         capabilities = tuple(details.capabilities or ())
-        required_capability = {
-            "embedding": "embedding",
-            "decision": "systemone",
-            "generation": "completion",
+        required_capabilities = {
+            "embedding": ("embedding",),
+            "decision": ("decision", "systemone"),
+            "generation": ("completion",),
         }[role]
-        if required_capability not in capabilities:
+        if not any(
+            required in capabilities
+            for required in required_capabilities
+        ):
+            required_capability = "/".join(required_capabilities)
             raise ModelIncompatibleError(
                 f"Model {model} lacks the required {required_capability} capability."
             )
