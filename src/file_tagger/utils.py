@@ -1,7 +1,74 @@
 from PySide6.QtGui import QColor
 import os
+import stat
 import subprocess
 import sys
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+
+def is_hidden_path(path: str | os.PathLike[str]) -> bool:
+    path_obj = Path(path)
+    if path_obj.name.startswith("."):
+        return True
+    if os.name != "nt":
+        return False
+
+    try:
+        attributes = getattr(
+            os.stat(path_obj),
+            "st_file_attributes",
+            0,
+        )
+    except OSError:
+        return False
+
+    hidden_attribute = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
+    return bool(attributes & hidden_attribute)
+
+
+def iter_visible_files(
+    directory: str | os.PathLike[str],
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> Iterator[str]:
+    root = os.fspath(directory)
+    if should_stop is not None and should_stop():
+        return
+    if os.path.islink(root):
+        return
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current_root, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        onerror=raise_walk_error,
+        followlinks=False,
+    ):
+        if should_stop is not None and should_stop():
+            return
+
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not os.path.islink(os.path.join(current_root, name))
+            and not is_hidden_path(os.path.join(current_root, name))
+        ]
+
+        for name in file_names:
+            if should_stop is not None and should_stop():
+                return
+
+            file_path = os.path.join(current_root, name)
+            if (
+                os.path.islink(file_path)
+                or not os.path.isfile(file_path)
+                or is_hidden_path(file_path)
+            ):
+                continue
+            yield file_path
 
 def is_dark_color(color):
     """
