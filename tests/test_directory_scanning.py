@@ -36,6 +36,27 @@ def test_iter_visible_files_skips_hidden_directories(tmp_path: Path) -> None:
     assert list(iter_visible_files(tmp_path)) == [str(visible)]
 
 
+def test_iter_visible_files_skips_hidden_root(tmp_path: Path) -> None:
+    hidden_root = tmp_path / ".hidden-root"
+    hidden_root.mkdir()
+    (hidden_root / "child.txt").write_text("hidden", encoding="utf-8")
+    assert list(iter_visible_files(hidden_root)) == []
+
+
+def test_iter_visible_files_cancellation_suppresses_walk_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cancelled = False
+
+    def cancelled_walk(*args, **kwargs):
+        nonlocal cancelled
+        del args
+        cancelled = True
+        kwargs["onerror"](PermissionError("cancelled scan"))
+        return iter(())
+
+    monkeypatch.setattr("file_tagger.utils.os.walk", cancelled_walk)
+    assert list(iter_visible_files(tmp_path, should_stop=lambda: cancelled)) == []
+
+
 def test_is_hidden_path_detects_windows_hidden_attribute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     hidden = tmp_path / "hidden.txt"
     hidden.write_text("hidden", encoding="utf-8")
@@ -86,6 +107,53 @@ def test_iter_visible_files_skips_symlinks(tmp_path: Path) -> None:
     assert str(directory_target / "inside.txt") in visible_files
     assert str(directory_link / "inside.txt") not in visible_files
     assert str(file_link) not in visible_files
+
+
+def test_iter_visible_files_skips_junction_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    junction_root = tmp_path / "junction-root"
+    junction_root.mkdir()
+    (junction_root / "child.txt").write_text("hidden", encoding="utf-8")
+    monkeypatch.setattr(
+        "file_tagger.utils.os.path.isjunction",
+        lambda path: Path(path).name == "junction-root",
+        raising=False,
+    )
+
+    assert list(iter_visible_files(junction_root)) == []
+
+
+def test_iter_visible_files_skips_junction_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    junction_directory = tmp_path / "junction-directory"
+    junction_directory.mkdir()
+    (junction_directory / "inside.txt").write_text("hidden", encoding="utf-8")
+    monkeypatch.setattr(
+        "file_tagger.utils.os.path.isjunction",
+        lambda path: Path(path).name == "junction-directory",
+        raising=False,
+    )
+
+    assert list(iter_visible_files(tmp_path)) == []
+
+
+def test_iter_visible_files_skips_junction_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    junction_file = tmp_path / "junction-file.txt"
+    junction_file.write_text("hidden", encoding="utf-8")
+    monkeypatch.setattr(
+        "file_tagger.utils.os.path.isjunction",
+        lambda path: Path(path).name == "junction-file.txt",
+        raising=False,
+    )
+
+    assert list(iter_visible_files(tmp_path)) == []
 
 
 def test_iter_visible_files_propagates_walk_errors(

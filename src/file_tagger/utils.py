@@ -27,6 +27,14 @@ def is_hidden_path(path: str | os.PathLike[str]) -> bool:
     return bool(attributes & hidden_attribute)
 
 
+def _is_link_or_junction(path: str | os.PathLike[str]) -> bool:
+    if os.path.islink(path):
+        return True
+
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction is not None and isjunction(path))
+
+
 def iter_visible_files(
     directory: str | os.PathLike[str],
     *,
@@ -35,10 +43,12 @@ def iter_visible_files(
     root = os.fspath(directory)
     if should_stop is not None and should_stop():
         return
-    if os.path.islink(root):
+    if is_hidden_path(root) or _is_link_or_junction(root):
         return
 
     def raise_walk_error(error: OSError) -> None:
+        if should_stop is not None and should_stop():
+            return
         raise error
 
     for current_root, directory_names, file_names in os.walk(
@@ -53,7 +63,7 @@ def iter_visible_files(
         directory_names[:] = [
             name
             for name in directory_names
-            if not os.path.islink(os.path.join(current_root, name))
+            if not _is_link_or_junction(os.path.join(current_root, name))
             and not is_hidden_path(os.path.join(current_root, name))
         ]
 
@@ -63,7 +73,7 @@ def iter_visible_files(
 
             file_path = os.path.join(current_root, name)
             if (
-                os.path.islink(file_path)
+                _is_link_or_junction(file_path)
                 or not os.path.isfile(file_path)
                 or is_hidden_path(file_path)
             ):
