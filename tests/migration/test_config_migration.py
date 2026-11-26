@@ -4,6 +4,7 @@ import json
 
 from file_tagger.infrastructure.app_paths import AppPaths
 from file_tagger.migration.config_migration import migrate_legacy_config
+from file_tagger.security.password_vault import CredentialStatus, PasswordVault
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -61,6 +62,10 @@ def test_config_migration_removes_cloud_fields_without_exposing_values(
 
     target_root = tmp_path / "target"
     monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(target_root))
+    monkeypatch.chdir(legacy_dir)
+    from file_tagger.config import Config
+
+    active_config = Config(password)
     paths = AppPaths.discover()
     report = migrate_legacy_config(
         legacy_dir, paths, password, backup_dir=tmp_path / "backups"
@@ -76,9 +81,17 @@ def test_config_migration_removes_cloud_fields_without_exposing_values(
     assert paths.salt_file.read_bytes() == salt
     assert paths.password_hash_file.is_file()
     assert paths.recovery_file.is_file()
+    assert PasswordVault.status(paths) is CredentialStatus.LEGACY
     assert "must-not-migrate" not in paths.config_file.read_bytes().decode(
         errors="ignore"
     )
+
+    active_config.reload_after_migration()
+
+    assert PasswordVault.status(paths) is CredentialStatus.ENVELOPE
+    assert active_config.pending_recovery_key
+    assert active_config.get_home_directory() == r"C:\Users\owner"
+    assert active_config.get_system_message() == "Keep this setting"
 
 
 def test_missing_legacy_config_is_a_no_op(tmp_path, monkeypatch) -> None:

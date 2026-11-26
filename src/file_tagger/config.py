@@ -8,7 +8,13 @@ import base64
 import hashlib
 import secrets
 import string
+from .domain.errors import (
+    CredentialFormatError,
+    CredentialRecoveryError,
+    PasswordEncryptionError,
+)
 from .infrastructure.app_paths import AppPaths
+from .security.password_vault import CredentialStatus, PasswordVault
 
 
 def _get_app_paths() -> AppPaths:
@@ -119,165 +125,116 @@ def get_recovery_key(password: str) -> str | None:
 
 class Config:
     def __init__(self, password: str):
-        """Initialize config with password verification."""
         self.paths = _get_app_paths()
-        if not verify_password(password):
-            raise ValueError("Invalid password")
-
-        legacy_config_pending = (
+        self._pending_recovery_key: str | None = None
+        self._vault: PasswordVault | None = None
+        pending_legacy_config = (
             self.paths.legacy_database.parent / "config.encrypted"
         ).is_file() and not self.paths.config_file.is_file()
+        status = PasswordVault.status(self.paths)
 
-        # Store password hash if this is first time setup
-        if (
-            not legacy_config_pending
-            and not os.path.exists(self.paths.password_hash_file)
-        ):
-            store_password_hash(password)
-            
+        if status is CredentialStatus.ENVELOPE:
+            self._vault = PasswordVault.open(self.paths, password)
+        elif status is CredentialStatus.LEGACY:
+            self._vault, self._pending_recovery_key = PasswordVault.migrate_legacy(
+                self.paths, password
+            )
+        elif status is CredentialStatus.CORRUPT:
+            raise CredentialFormatError("Credential metadata is corrupt or inconsistent.")
+        elif not pending_legacy_config:
+            self._vault, self._pending_recovery_key = PasswordVault.create(
+                self.paths, password
+            )
         self.password = password
-        self.fernet = get_encryption_key(password)
         self.config_data = self._load_config()
-        
-        # Generate recovery key on first setup
-        if (
-            not legacy_config_pending
-            and not os.path.exists(self.paths.recovery_file)
-        ):
-            recovery_key = generate_recovery_key()
-            store_recovery_key(recovery_key, password)
-    
-    def _load_config(self) -> dict:
-        """Load and decrypt configuration file."""
-        if not os.path.exists(self.paths.config_file):
-            return {
-                'home_directory': str(Path.home()),  # Default to user's home directory
-                'system_message': DEFAULT_SYSTEM_MESSAGE
-            }
-        
-        try:
-            with open(self.paths.config_file, 'rb') as f:
-                encrypted_data = f.read()
-            decrypted_data = self.fernet.decrypt(encrypted_data)
-            config = json.loads(decrypted_data)
 
-            # Add home_directory if it doesn't exist in older config files
-            if 'home_directory' not in config:
-                config['home_directory'] = str(Path.home())
-            
-            # Add system_message if it doesn't exist in older config files
-            if 'system_message' not in config:
-                config['system_message'] = DEFAULT_SYSTEM_MESSAGE
-                
-            return config
-        except Exception:
-            return {
-                'home_directory': str(Path.home()),
-                'system_message': DEFAULT_SYSTEM_MESSAGE
-            }
-    
-    def save(self):
-        """Encrypt and save configuration."""
-        encrypted_data = self.fernet.encrypt(json.dumps(self.config_data).encode())
-        with open(self.paths.config_file, 'wb') as f:
-            f.write(encrypted_data)
+    @property
+    def pending_recovery_key(self) -> str | None:
+        return self._pending_recovery_key
+
+    def acknowledge_recovery_key(self) -> None:
+        self._pending_recovery_key = None
+
+    def _load_config(self) -> dict:
+        if not self.paths.config_file.is_file():
+            return self._default_config()
+        if self._vault is None:
+            return self._default_config()
+
+        try:
+            config = json.loads(
+                self._vault.decrypt(self.paths.config_file.read_bytes())
+            )
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise PasswordEncryptionError("Encrypted configuration is invalid.") from exc
+        if not isinstance(config, dict):
+            raise PasswordEncryptionError("Encrypted configuration is invalid.")
+        config.setdefault("home_directory", str(Path.home()))
+        config.setdefault("system_message", DEFAULT_SYSTEM_MESSAGE)
+        return config
+
+    @staticmethod
+    def _default_config() -> dict:
+        return {
+            "home_directory": str(Path.home()),
+            "system_message": DEFAULT_SYSTEM_MESSAGE,
+        }
+
+    def save(self) -> None:
+        if self._vault is None:
+            raise PasswordEncryptionError(
+                "Configuration cannot be saved before legacy migration completes."
+            )
+        encrypted_data = self._vault.encrypt(json.dumps(self.config_data).encode())
+        self.paths.config_file.write_bytes(encrypted_data)
 
     def reload_after_migration(self) -> None:
-        """Reload encryption state and settings after legacy config migration."""
-        if not verify_password(self.password):
-            raise ValueError("Invalid password after configuration migration")
-        self.fernet = get_encryption_key(self.password)
+        status = PasswordVault.status(self.paths)
+        if status is CredentialStatus.ENVELOPE:
+            self._vault = PasswordVault.open(self.paths, self.password)
+        elif status is CredentialStatus.LEGACY:
+            self._vault, self._pending_recovery_key = (
+                PasswordVault.migrate_legacy(self.paths, self.password)
+            )
+        elif status is CredentialStatus.CORRUPT:
+            raise CredentialFormatError("Migrated credential metadata is invalid.")
+        else:
+            raise CredentialFormatError("Migrated credential metadata is missing.")
         self.config_data = self._load_config()
-    
+
     def change_password(self, old_password: str, new_password: str) -> bool:
-        """Change the encryption password."""
-        if not verify_password(old_password):
+        if self._vault is None:
             return False
-            
         try:
-            # Re-encrypt configuration with new password
-            old_fernet = get_encryption_key(old_password)
-            new_fernet = get_encryption_key(new_password)
-            
-            # Re-encrypt config file
-            if os.path.exists(self.paths.config_file):
-                with open(self.paths.config_file, 'rb') as f:
-                    encrypted_data = f.read()
-                decrypted_data = old_fernet.decrypt(encrypted_data)
-                new_encrypted_data = new_fernet.encrypt(decrypted_data)
-                with open(self.paths.config_file, 'wb') as f:
-                    f.write(new_encrypted_data)
-            
-            # Re-encrypt recovery key
-            if os.path.exists(self.paths.recovery_file):
-                with open(self.paths.recovery_file, 'rb') as f:
-                    encrypted_key = f.read()
-                recovery_key = old_fernet.decrypt(encrypted_key).decode()
-                store_recovery_key(recovery_key, new_password)
-            
-            # Update password hash
-            store_password_hash(new_password)
-            
-            self.password = new_password
-            self.fernet = new_fernet
-            return True
-            
-        except Exception:
+            self._vault.change_password(old_password, new_password)
+        except (CredentialFormatError, CredentialRecoveryError):
             return False
-    
+        self.password = new_password
+        return True
+
     def recover_password(self, recovery_key: str, new_password: str) -> bool:
-        """Recover access using recovery key and set new password."""
         try:
-            # Try each possible encryption key until we find one that works
-            if not os.path.exists(self.paths.recovery_file):
-                return False
-                
-            with open(self.paths.recovery_file, 'rb') as f:
-                stored_encrypted_key = f.read()
-            
-            # First verify the recovery key by trying to decrypt stored key
-            old_passwords = []  # We'll collect working passwords
-            
-            for password in self._get_recent_passwords():
-                try:
-                    fernet = get_encryption_key(password)
-                    decrypted_key = fernet.decrypt(stored_encrypted_key).decode()
-                    if decrypted_key == recovery_key:
-                        old_passwords.append(password)
-                except Exception:
-                    continue
-            
-            if not old_passwords:
-                return False
-            
-            # Use the first working password to migrate to new password
-            return self.change_password(old_passwords[0], new_password)
-            
-        except Exception:
+            self._vault = PasswordVault.recover(
+                self.paths, recovery_key, new_password
+            )
+        except (CredentialFormatError, CredentialRecoveryError):
             return False
-    
-    def _get_recent_passwords(self) -> list:
-        """Get list of possible recent passwords based on salt file age."""
-        # This is a placeholder - in a real implementation, you might want to
-        # keep a secure log of recent password hashes or implement a more
-        # sophisticated recovery mechanism
-        if os.path.exists(self.paths.salt_file):
-            return [self.password]  # Current password
-        return []
+        self.password = new_password
+        self.config_data = self._load_config()
+        return True
 
     def reset_recovery_key(self, current_password: str) -> tuple[bool, str]:
-        """Reset the recovery key. Returns (success, new_key)."""
         try:
-            if not verify_password(current_password):
-                return False, ""
-                
-            # Generate and store new recovery key
-            new_key = generate_recovery_key()
-            store_recovery_key(new_key, current_password)
-            return True, new_key
-            
-        except Exception:
+            return True, self.rotate_recovery_key(current_password)
+        except (CredentialFormatError, CredentialRecoveryError, PasswordEncryptionError):
             return False, ""
+
+    def rotate_recovery_key(self, current_password: str) -> str:
+        if self._vault is None:
+            raise PasswordEncryptionError(
+                "Recovery keys cannot be rotated before legacy migration completes."
+            )
+        return self._vault.rotate_recovery_key(current_password)
 
     def set_home_directory(self, path: str):
         """Set the home directory for the file browser."""

@@ -1,11 +1,52 @@
-import pytest
+import base64
+import hashlib
+import json
 
+import pytest
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+from file_tagger.config import Config
 from file_tagger.domain.errors import (
     CredentialFormatError,
     CredentialRecoveryError,
 )
 from file_tagger.infrastructure.app_paths import AppPaths
 from file_tagger.security.password_vault import CredentialStatus, PasswordVault
+
+
+def _legacy_fernet(password: str, salt: bytes) -> Fernet:
+    material = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100_000,
+    ).derive(password.encode())
+    return Fernet(base64.urlsafe_b64encode(material))
+
+
+def _write_legacy_credentials(paths, password: str, config: dict) -> None:
+    encryption_salt = b"legacy-encryption-salt"
+    password_salt = b"legacy-password-salt"
+    legacy_fernet = _legacy_fernet(password, encryption_salt)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), password_salt, 100_000
+    )
+    paths.salt_file.write_bytes(encryption_salt)
+    paths.password_hash_file.write_text(
+        json.dumps(
+            {
+                "hash": base64.b64encode(password_hash).decode(),
+                "salt": base64.b64encode(password_salt).decode(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    paths.recovery_file.write_bytes(legacy_fernet.encrypt(b"old-recovery-key"))
+    paths.config_file.write_bytes(
+        legacy_fernet.encrypt(json.dumps(config).encode())
+    )
 
 
 def test_password_vault_discovers_first_run_and_envelope_paths(
@@ -98,3 +139,51 @@ def test_rotating_recovery_key_invalidates_only_old_recovery_key(
     with pytest.raises(CredentialRecoveryError):
         PasswordVault.recover(paths, old_key, "invalid")
     PasswordVault.recover(paths, new_key, "replacement")
+
+
+def test_legacy_config_migrates_after_authenticated_login(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    _write_legacy_credentials(
+        paths,
+        "legacy-password",
+        {
+            "home_directory": r"C:\Users\owner",
+            "system_message": "Keep this setting",
+        },
+    )
+
+    config = Config("legacy-password")
+
+    assert PasswordVault.status(paths) is CredentialStatus.ENVELOPE
+    assert config.get_home_directory() == r"C:\Users\owner"
+    assert config.pending_recovery_key
+    assert Config("legacy-password").get_system_message() == "Keep this setting"
+    with pytest.raises(CredentialRecoveryError):
+        PasswordVault.open(paths, "old-wrong-password")
+
+
+def test_legacy_migration_preserves_files_when_password_is_wrong(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    _write_legacy_credentials(paths, "legacy-password", {"setting": "value"})
+    originals = {
+        path: path.read_bytes()
+        for path in (
+            paths.salt_file,
+            paths.password_hash_file,
+            paths.recovery_file,
+            paths.config_file,
+        )
+    }
+
+    with pytest.raises(CredentialRecoveryError):
+        Config("wrong-password")
+
+    assert all(path.read_bytes() == content for path, content in originals.items())

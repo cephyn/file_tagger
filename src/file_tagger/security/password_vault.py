@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
 import hashlib
 import hmac
 from enum import Enum, auto
@@ -58,6 +59,8 @@ class PasswordVault:
             or paths.salt_file.exists()
         ):
             return CredentialStatus.LEGACY
+        if paths.config_file.exists():
+            return CredentialStatus.CORRUPT
         return CredentialStatus.UNINITIALIZED
 
     @classmethod
@@ -157,6 +160,55 @@ class PasswordVault:
         )
         return recovery_key
 
+    @classmethod
+    def migrate_legacy(
+        cls, paths: AppPaths, password: str
+    ) -> tuple["PasswordVault", str]:
+        if cls.status(paths) is not CredentialStatus.LEGACY:
+            raise CredentialFormatError("Legacy credentials are not available.")
+
+        verifier = _read_json(paths.password_hash_file)
+        _verify_legacy_password(password, verifier)
+        try:
+            legacy_fernet = _derive_legacy_fernet(
+                password, paths.salt_file.read_bytes()
+            )
+        except OSError as exc:
+            raise CredentialFormatError("Legacy encryption metadata is missing.") from exc
+
+        replacement_config: bytes | None = None
+        if paths.config_file.is_file():
+            try:
+                plaintext = legacy_fernet.decrypt(paths.config_file.read_bytes())
+                config = json.loads(plaintext)
+            except (InvalidToken, UnicodeError, json.JSONDecodeError) as exc:
+                raise CredentialFormatError(
+                    "Legacy configuration could not be decrypted safely."
+                ) from exc
+            if not isinstance(config, dict):
+                raise CredentialFormatError("Legacy configuration is invalid.")
+
+        data_key = Fernet.generate_key()
+        recovery_key = secrets.token_urlsafe(24)
+        material = _password_material(password, data_key)
+        replacements = {
+            paths.password_hash_file: _json_bytes(material.verifier),
+            paths.password_key_file: _json_bytes(material.envelope),
+            paths.recovery_file: _json_bytes(
+                _recovery_material(recovery_key, data_key)
+            ),
+        }
+        if paths.config_file.is_file():
+            replacement_config = Fernet(data_key).encrypt(plaintext)
+            replacements[paths.config_file] = replacement_config
+
+        _backup_credential_files(paths)
+        try:
+            _replace_transaction(replacements)
+        except CredentialRecoveryError:
+            raise
+        return cls(paths, data_key), recovery_key
+
 
 class _PasswordMaterial:
     def __init__(self, verifier: dict[str, Any], envelope: dict[str, Any]) -> None:
@@ -171,6 +223,16 @@ def _derive_fernet(secret: str, salt: bytes) -> Fernet:
         salt=salt,
         iterations=PBKDF2_ITERATIONS,
     ).derive(secret.encode("utf-8"))
+    return Fernet(base64.urlsafe_b64encode(material))
+
+
+def _derive_legacy_fernet(password: str, salt: bytes) -> Fernet:
+    material = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100_000,
+    ).derive(password.encode("utf-8"))
     return Fernet(base64.urlsafe_b64encode(material))
 
 
@@ -260,6 +322,20 @@ def _verify_password(password: str, verifier: dict[str, Any]) -> None:
         raise CredentialRecoveryError("Password authentication failed.")
 
 
+def _verify_legacy_password(password: str, verifier: dict[str, Any]) -> None:
+    try:
+        salt = base64.b64decode(verifier["salt"], validate=True)
+        expected = base64.b64decode(verifier["hash"], validate=True)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CredentialFormatError("Legacy password metadata is invalid.") from exc
+
+    actual = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, 100_000
+    )
+    if not hmac.compare_digest(actual, expected):
+        raise CredentialRecoveryError("Legacy password authentication failed.")
+
+
 def _unwrap_data_key(envelope: dict[str, Any], secret: str) -> bytes:
     try:
         salt = base64.b64decode(envelope["salt"], validate=True)
@@ -275,6 +351,36 @@ def _unwrap_data_key(envelope: dict[str, Any], secret: str) -> bytes:
 
 def _json_bytes(value: dict[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _backup_credential_files(paths: AppPaths) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+    backup_dir = (
+        paths.data_dir
+        / "password-envelope-backups"
+        / f"credentials-{timestamp}-{secrets.token_hex(3)}"
+    )
+    try:
+        backup_dir.mkdir(parents=True)
+        for source in (
+            paths.config_file,
+            paths.salt_file,
+            paths.password_hash_file,
+            paths.password_key_file,
+            paths.recovery_file,
+        ):
+            if not source.is_file():
+                continue
+            destination = backup_dir / source.name
+            content = source.read_bytes()
+            destination.write_bytes(content)
+            if destination.read_bytes() != content:
+                raise OSError("Credential backup verification failed.")
+    except OSError as exc:
+        raise CredentialRecoveryError(
+            "Credential migration backup could not be completed."
+        ) from exc
+    return backup_dir
 
 
 def _replace_transaction(files: dict[Path, bytes]) -> None:
