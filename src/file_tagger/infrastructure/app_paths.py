@@ -16,6 +16,7 @@ class AppPaths:
     config_file: Path
     salt_file: Path
     password_hash_file: Path
+    password_key_file: Path
     recovery_file: Path
     legacy_database: Path
     legacy_chroma: Path
@@ -43,6 +44,7 @@ class AppPaths:
             config_file=config_dir / "config.encrypted",
             salt_file=config_dir / ".salt",
             password_hash_file=config_dir / ".passhash",
+            password_key_file=config_dir / ".password-key",
             recovery_file=config_dir / ".recovery",
             legacy_database=legacy_root / "file_tags.db",
             legacy_chroma=legacy_root / ".chroma",

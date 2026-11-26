@@ -54,6 +54,14 @@ class PasswordEncryptionError(FileTaggerError):
     """Raised when configuration encryption or password handling fails."""
 
 
+class CredentialFormatError(PasswordEncryptionError):
+    """Raised when credential metadata is incomplete or unsupported."""
+
+
+class CredentialRecoveryError(PasswordEncryptionError):
+    """Raised when recovery or reset cannot be completed safely."""
+
+
 class IndexTransactionError(FileTaggerError):
     """Raised when a file revision cannot be indexed transactionally."""
 
