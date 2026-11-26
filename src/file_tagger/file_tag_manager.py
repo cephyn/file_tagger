@@ -2005,11 +2005,15 @@ class FileTagManager(QMainWindow):
         )
         self.scan_thread.scan_finished.connect(progress.close)
         self.scan_thread.scan_finished.connect(
-            lambda files: self.show_untagged_files_dialog(files, dir_path)
+            lambda files: None
+            if self.scan_thread.stop_requested
+            else self.show_untagged_files_dialog(files, dir_path)
         )
         self.scan_thread.scan_error.connect(progress.close)
         self.scan_thread.scan_error.connect(
-            lambda error: QMessageBox.critical(
+            lambda error: None
+            if self.scan_thread.stop_requested
+            else QMessageBox.critical(
                 self, "Scan Error", f"Error scanning directory: {error}"
             )
         )
