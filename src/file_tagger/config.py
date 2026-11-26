@@ -133,7 +133,9 @@ class Config:
         ).is_file() and not self.paths.config_file.is_file()
         status = PasswordVault.status(self.paths)
 
-        if status is CredentialStatus.ENVELOPE:
+        if pending_legacy_config:
+            self._vault = None
+        elif status is CredentialStatus.ENVELOPE:
             self._vault = PasswordVault.open(self.paths, password)
         elif status is CredentialStatus.LEGACY:
             self._vault, self._pending_recovery_key = PasswordVault.migrate_legacy(

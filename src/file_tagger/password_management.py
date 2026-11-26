@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtWidgets import (
     QDialog,
     QGroupBox,
@@ -20,6 +22,8 @@ from .domain.errors import (
 from .infrastructure.app_paths import AppPaths
 from .security.password_reset import reset_encrypted_configuration
 from .security.password_vault import CredentialStatus, PasswordVault
+
+logger = logging.getLogger(__name__)
 
 
 def get_password(parent=None) -> str | None:
@@ -256,7 +260,11 @@ class PasswordRecoveryDialog(QDialog):
             return
         try:
             result = reset_encrypted_configuration(self.paths, new_password)
-        except CredentialRecoveryError:
+        except CredentialRecoveryError as exc:
+            logger.error(
+                "Password reset dialog failed (%s).",
+                exc.__class__.__name__,
+            )
             QMessageBox.warning(
                 self,
                 "Reset Failed",

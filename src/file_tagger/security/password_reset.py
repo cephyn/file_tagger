@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import logging
 from pathlib import Path
 import secrets
 import shutil
@@ -10,6 +11,8 @@ from ..domain.errors import CredentialRecoveryError
 from ..infrastructure.app_paths import AppPaths
 from .file_transactions import replace_files_transactionally
 from .password_vault import PasswordVault
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +42,11 @@ def reset_encrypted_configuration(
         config = Config(new_password)
         config.save()
     except Exception as exc:
+        logger.error(
+            "Password reset failed during credential initialization (%s); backup=%s",
+            exc.__class__.__name__,
+            backup_dir,
+        )
         _rollback_reset(target_snapshot, quarantined, backup_dir)
         raise CredentialRecoveryError(
             "The configuration reset could not be completed safely."
@@ -48,13 +56,9 @@ def reset_encrypted_configuration(
 
 
 def _active_credential_files(paths: AppPaths) -> tuple[Path, ...]:
-    if paths.config_file.is_file():
-        return _target_credential_files(paths)
-
     legacy_root = paths.legacy_database.parent
-    legacy_config = legacy_root / "config.encrypted"
-    if legacy_config.is_file():
-        return tuple(
+    if (legacy_root / "config.encrypted").is_file():
+        sources = [
             legacy_root / name
             for name in (
                 "config.encrypted",
@@ -63,7 +67,16 @@ def _active_credential_files(paths: AppPaths) -> tuple[Path, ...]:
                 ".password-key",
                 ".recovery",
             )
-        )
+        ]
+        sources.extend(_target_credential_files(paths))
+        unique: list[Path] = []
+        for source in sources:
+            if source not in unique:
+                unique.append(source)
+        return tuple(unique)
+
+    if paths.config_file.is_file():
+        return _target_credential_files(paths)
     return _target_credential_files(paths)
 
 
@@ -92,6 +105,10 @@ def _quarantine_files(
         staged: list[tuple[Path, Path]] = []
         for source in existing:
             destination = backup_dir / source.name
+            if destination.exists() and source.parent != backup_dir:
+                target_dir = backup_dir / "target"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                destination = target_dir / source.name
             original = source.read_bytes()
             shutil.copy2(source, destination)
             if destination.read_bytes() != original:
@@ -140,11 +157,7 @@ def _rollback_reset(
             rollback_error = exc
     try:
         _restore_quarantined(
-            [
-                (source, backup)
-                for source, backup in quarantined
-                if source not in target_snapshot
-            ]
+            quarantined
         )
     except OSError as exc:
         rollback_error = exc

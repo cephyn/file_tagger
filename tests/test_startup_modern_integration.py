@@ -239,6 +239,25 @@ def test_pending_legacy_config_does_not_bootstrap_a_modern_password(
     assert not paths.recovery_file.exists()
 
 
+def test_pending_legacy_config_ignores_stale_target_salt(
+    tmp_path, monkeypatch
+) -> None:
+    from file_tagger.config import Config
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path / "modern"))
+    (tmp_path / "config.encrypted").write_bytes(b"legacy")
+    stale_paths = _paths(tmp_path, monkeypatch)
+    stale_paths.ensure_directories()
+    stale_paths.salt_file.write_bytes(b"stale-salt")
+
+    config = Config("candidate-password")
+
+    assert config._vault is None
+    assert stale_paths.salt_file.read_bytes() == b"stale-salt"
+    assert not stale_paths.password_hash_file.exists()
+
+
 def test_bad_pending_legacy_password_fails_instead_of_poisoning_startup(
     tmp_path, monkeypatch
 ) -> None:
