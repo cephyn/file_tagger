@@ -2,10 +2,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtWidgets import QDialog, QMainWindow, QProgressDialog
+from PySide6.QtWidgets import QDialog, QLineEdit, QMainWindow, QProgressDialog
 
 from file_tagger.file_tag_manager import FileTagManager, hide_scan_progress
-from file_tagger.persistence.models import Tag
+from file_tagger.persistence.models import File, Tag
+from file_tagger.tag_suggestion import TagSuggester
 from file_tagger.utils import is_hidden_path, iter_visible_files
 
 
@@ -224,3 +225,57 @@ def test_show_untagged_files_dialog_lists_nested_file_and_suggestion(
     manager.untagged_files_list.setCurrentRow(0)
     assert manager.file_suggestions_list.count() == 1
     assert "nested-tag" in manager.file_suggestions_list.item(0).text()
+
+
+def test_scan_directory_for_untagged_runs_qthread_and_finds_nested_file(
+    tmp_path: Path,
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_directory = tmp_path / "nested"
+    nested_directory.mkdir()
+    nested_file = nested_directory / "nested.txt"
+    nested_file.write_text("nested", encoding="utf-8")
+    nested_path = str(nested_file.resolve())
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.path_display = QLineEdit(str(tmp_path))
+    manager.db_session = SimpleNamespace(
+        query=lambda model: (
+            SimpleNamespace(
+                filter_by=lambda **kwargs: SimpleNamespace(first=lambda: None)
+            )
+            if model is File
+            else SimpleNamespace(all=lambda: [])
+            if model is Tag
+            else pytest.fail(f"unexpected query model: {model}")
+        )
+    )
+    manager.config = SimpleNamespace()
+    manager.modern_runtime = None
+
+    monkeypatch.setattr(TagSuggester, "__init__", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        TagSuggester,
+        "suggest_tags_for_file",
+        lambda self, file_path: {"nested-tag": 0.9},
+    )
+
+    captured = {}
+
+    def capture_files(files, directory):
+        captured["files"] = files
+        captured["directory"] = directory
+
+    monkeypatch.setattr(manager, "show_untagged_files_dialog", capture_files)
+
+    manager.scan_directory_for_untagged()
+
+    qtbot.waitUntil(
+        lambda: nested_path in captured.get("files", {}),
+        timeout=5000,
+    )
+    assert nested_path in captured["files"]
+    assert captured["directory"] == str(tmp_path)
