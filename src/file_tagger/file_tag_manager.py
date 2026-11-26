@@ -1254,28 +1254,39 @@ class FileTagManager(QMainWindow):
 
     def add_tag(self):
         """Add a new tag."""
-        tag_name, ok = QInputDialog.getText(self, "Add Tag", "Enter tag name:")
-        if ok and tag_name:
-            # Check if tag already exists
-            existing = self.db_session.query(Tag).filter_by(name=tag_name).first()
-            if existing:
-                QMessageBox.warning(
-                    self, "Error", "A tag with this name already exists!"
-                )
-                return
+        existing_colors = [
+            tag.color
+            for tag in self.db_session.query(Tag).all()
+            if tag.color
+        ]
+        dialog = TagEditDialog(
+            self,
+            tag_name="",
+            existing_colors=existing_colors,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
 
-            # Get color for the tag
-            color = QColorDialog.getColor()
-            if color.isValid():
-                # Create new tag
-                new_tag = Tag(name=tag_name, color=color.name())
-                self.db_session.add(new_tag)
-                self._commit_legacy_changes(
-                    tag_upserts=[(tag_name, color.name())]
-                )
+        tag_name = dialog.get_tag_name()
+        selected_color = dialog.get_selected_color()
+        if not selected_color.isValid():
+            return
 
-                # Refresh tag lists
-                self.refresh_tags()
+        existing = self.db_session.query(Tag).filter_by(name=tag_name).first()
+        if existing:
+            QMessageBox.warning(
+                self,
+                "Error",
+                "A tag with this name already exists!",
+            )
+            return
+
+        new_tag = Tag(name=tag_name, color=selected_color.name())
+        self.db_session.add(new_tag)
+        self._commit_legacy_changes(
+            tag_upserts=[(tag_name, selected_color.name())]
+        )
+        self.refresh_tags()
 
     def edit_tag(self):
         """Edit the selected tag."""
@@ -1290,16 +1301,27 @@ class FileTagManager(QMainWindow):
         if not tag:
             return
 
-        # Get new name
         old_name = tag.name
-        new_name, ok = QInputDialog.getText(
-            self, "Edit Tag", "Enter new tag name:", text=tag.name
+        existing_colors = [
+            existing_tag.color
+            for existing_tag in self.db_session.query(Tag).all()
+            if existing_tag.color
+        ]
+        dialog = TagEditDialog(
+            self,
+            tag_name=tag.name,
+            initial_color=QColor(tag.color),
+            existing_colors=existing_colors,
         )
-        if not ok or not new_name:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Check if new name already exists (if different from current)
-        if new_name != tag.name:
+        new_name = dialog.get_tag_name()
+        selected_color = dialog.get_selected_color()
+        if not selected_color.isValid():
+            return
+
+        if new_name != old_name:
             existing = self.db_session.query(Tag).filter_by(name=new_name).first()
             if existing:
                 QMessageBox.warning(
@@ -1307,28 +1329,21 @@ class FileTagManager(QMainWindow):
                 )
                 return
 
-        # Get new color
-        initial_color = QColor(tag.color)
-        color = QColorDialog.getColor(initial=initial_color)
-        if color.isValid():
-            # Update tag
-            tag.name = new_name
-            tag.color = color.name()
-            self._commit_legacy_changes(
-                tag_upserts=[(new_name, color.name())],
-                tag_deletes=[old_name] if old_name != new_name else [],
-                file_paths=[
-                    (
-                        association.file.canonical_path,
-                        self._tag_data(association.file),
-                    )
-                    for association in tag.files
-                ],
-            )
-
-            # Refresh tag lists
-            self.refresh_tags()
-            self.refresh_file_tags()
+        tag.name = new_name
+        tag.color = selected_color.name()
+        self._commit_legacy_changes(
+            tag_upserts=[(new_name, selected_color.name())],
+            tag_deletes=[old_name] if old_name != new_name else [],
+            file_paths=[
+                (
+                    association.file.canonical_path,
+                    self._tag_data(association.file),
+                )
+                for association in tag.files
+            ],
+        )
+        self.refresh_tags()
+        self.refresh_file_tags()
 
     def delete_tag(self):
         """Delete the selected tag(s)."""
