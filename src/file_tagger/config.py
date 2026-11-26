@@ -173,6 +173,8 @@ class Config:
             raise PasswordEncryptionError("Encrypted configuration is invalid.")
         config.setdefault("home_directory", str(Path.home()))
         config.setdefault("system_message", DEFAULT_SYSTEM_MESSAGE)
+        config.setdefault("ai_provider", "ollama")
+        config.setdefault("gemini_api_key", None)
         return config
 
     @staticmethod
@@ -180,6 +182,8 @@ class Config:
         return {
             "home_directory": str(Path.home()),
             "system_message": DEFAULT_SYSTEM_MESSAGE,
+            "ai_provider": "ollama",
+            "gemini_api_key": None,
         }
 
     def save(self) -> None:
@@ -262,4 +266,33 @@ class Config:
     def reset_system_message(self):
         """Reset the system message to the default value."""
         self.config_data['system_message'] = DEFAULT_SYSTEM_MESSAGE
+        self.save()
+
+    def set_ai_provider(self, provider: str) -> bool:
+        if provider not in ("ollama", "gemini"):
+            return False
+        self.config_data["ai_provider"] = provider
+        self.save()
+        return True
+
+    def get_ai_provider(self) -> str:
+        provider = self.config_data.get("ai_provider", "ollama")
+        return provider if provider in ("ollama", "gemini") else "ollama"
+
+    def set_gemini_api_key(self, api_key: str) -> None:
+        trimmed = api_key.strip()
+        if not trimmed:
+            raise ValueError("Gemini API key cannot be blank.")
+        self.config_data["gemini_api_key"] = trimmed
+        self.save()
+
+    def get_gemini_api_key(self) -> str | None:
+        api_key = self.config_data.get("gemini_api_key")
+        if not isinstance(api_key, str):
+            return None
+        trimmed = api_key.strip()
+        return trimmed or None
+
+    def clear_gemini_api_key(self) -> None:
+        self.config_data["gemini_api_key"] = None
         self.save()

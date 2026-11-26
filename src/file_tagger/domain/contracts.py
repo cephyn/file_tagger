@@ -1,7 +1,6 @@
-import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DomainRecord(BaseModel):
@@ -52,13 +51,6 @@ class ModelProfile(DomainRecord):
         if self.dimensions is None:
             return None
         return f"{self.model}@{self.digest}:{self.dimensions}"
-
-    @field_validator("model")
-    @classmethod
-    def reject_cloud_model(cls, model: str) -> str:
-        if re.search(r"(^|[:-])cloud(?:$|[:-])", model, flags=re.IGNORECASE):
-            raise ValueError("cloud-hosted model variants are not supported")
-        return model
 
 
 class ExtractionRecord(DomainRecord):

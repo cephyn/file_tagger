@@ -18,6 +18,18 @@ class RemoteOllamaHostError(FileTaggerError):
     """Raised when Ollama is configured with a non-loopback origin."""
 
 
+class GeminiUnavailableError(FileTaggerError):
+    """Raised when Gemini provider operations are unavailable."""
+
+
+class GeminiTimeoutError(GeminiUnavailableError):
+    """Raised when a Gemini operation exceeds its timeout."""
+
+
+class GeminiAuthenticationError(FileTaggerError):
+    """Raised when Gemini authentication fails."""
+
+
 class ModelMissingError(FileTaggerError):
     """Raised when a required Ollama model is not installed."""
 
@@ -32,6 +44,10 @@ class GenerationContextRejectedError(ModelIncompatibleError):
 
 class StructuredOutputError(ModelIncompatibleError, ValueError):
     """Raised when a model cannot produce the requested structured output."""
+
+
+class GeminiStructuredOutputError(StructuredOutputError):
+    """Raised when Gemini cannot produce the requested structured output."""
 
 
 class UncitedAnswerError(StructuredOutputError):

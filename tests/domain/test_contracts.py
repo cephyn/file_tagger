@@ -16,6 +16,10 @@ from file_tagger.domain.contracts import (
 from file_tagger.domain.errors import (
     EmbeddingContextRejectedError,
     FileTaggerError,
+    GeminiAuthenticationError,
+    GeminiStructuredOutputError,
+    GeminiTimeoutError,
+    GeminiUnavailableError,
     IndexTransactionError,
     ModelIncompatibleError,
     ModelMissingError,
@@ -26,14 +30,15 @@ from file_tagger.domain.errors import (
 )
 
 
-def test_model_profile_rejects_cloud_model() -> None:
-    with pytest.raises(ValidationError):
-        ModelProfile(
-            role="generation",
-            model="gemma4:cloud",
-            digest="sha256:test",
-            context_length=256_000,
-        )
+def test_model_profile_accepts_provider_neutral_model_names() -> None:
+    profile = ModelProfile(
+        role="generation",
+        model="gemma4:cloud",
+        digest="sha256:test",
+        context_length=256_000,
+    )
+
+    assert profile.model == "gemma4:cloud"
 
 
 def test_local_ai_contracts_preserve_provenance_and_bounds() -> None:
@@ -134,6 +139,10 @@ def test_readiness_and_hardware_profiles_are_typed() -> None:
     [
         NotIndexedError,
         OllamaUnavailableError,
+        GeminiUnavailableError,
+        GeminiTimeoutError,
+        GeminiAuthenticationError,
+        GeminiStructuredOutputError,
         ModelMissingError,
         ModelIncompatibleError,
         EmbeddingContextRejectedError,
