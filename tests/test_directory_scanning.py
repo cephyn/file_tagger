@@ -2,9 +2,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtWidgets import QProgressDialog
+from PySide6.QtWidgets import QDialog, QMainWindow, QProgressDialog
 
-from file_tagger.file_tag_manager import hide_scan_progress
+from file_tagger.file_tag_manager import FileTagManager, hide_scan_progress
+from file_tagger.persistence.models import Tag
 from file_tagger.utils import is_hidden_path, iter_visible_files
 
 
@@ -186,3 +187,40 @@ def test_hide_scan_progress_does_not_emit_cancelled(qtbot) -> None:
     hide_scan_progress(progress)
 
     assert cancelled is False
+
+
+def test_show_untagged_files_dialog_lists_nested_file_and_suggestion(
+    tmp_path: Path,
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_directory = tmp_path / "nested"
+    nested_directory.mkdir()
+    nested_file = nested_directory / "nested.txt"
+    nested_file.write_text("nested", encoding="utf-8")
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.db_session = SimpleNamespace(
+        query=lambda model: SimpleNamespace(
+            all=lambda: [] if model is Tag else pytest.fail(
+                f"unexpected query model: {model}"
+            )
+        )
+    )
+    monkeypatch.setattr(QDialog, "exec", lambda self: 0)
+
+    manager.show_untagged_files_dialog(
+        {str(nested_file): {"nested-tag": 0.9}},
+        str(tmp_path),
+    )
+
+    assert manager.untagged_files_list.count() == 1
+    file_item = manager.untagged_files_list.item(0)
+    assert file_item.toolTip() == str(nested_file)
+
+    manager.untagged_files_list.setCurrentRow(-1)
+    manager.untagged_files_list.setCurrentRow(0)
+    assert manager.file_suggestions_list.count() == 1
+    assert "nested-tag" in manager.file_suggestions_list.item(0).text()
