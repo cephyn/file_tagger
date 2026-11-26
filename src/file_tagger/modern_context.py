@@ -356,6 +356,10 @@ class ModernRuntime:
         with self._lock:
             self._model_overrides = updated
             self.required_models = selected
+            if selected is not None and self._model_readiness is not None:
+                self._model_readiness = self._model_readiness.model_copy(
+                    update={"selected_models": selected}
+                )
             self._indexing_service = None
             self._embedding_gateway = None
         return self.start_readiness()
@@ -1456,7 +1460,7 @@ def initialize_modern_runtime(
             paths,
             None,
             unavailable_reason=(
-                f"{exc.__class__.__name__}: modern database is unavailable."
+                f"{exc.__class__.__name__}: modern database is unavailable: {exc}"
             ),
         )
 

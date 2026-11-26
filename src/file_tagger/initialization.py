@@ -57,6 +57,16 @@ class InitializationWorker(QThread):
             logger.debug("Modern sidecar initialization completed")
             modern_factory = getattr(modern_runtime, "session_factory", None)
             db_session = modern_factory() if modern_factory is not None else None
+            if db_session is None:
+                unavailable_reason = getattr(
+                    modern_runtime,
+                    "unavailable_reason",
+                    "The modern database is unavailable.",
+                )
+                logger.error(
+                    "Modern database initialization unavailable: %s",
+                    unavailable_reason,
+                )
 
             # Inventory legacy search data without deleting or reusing it.
             self.progress_signal.emit(

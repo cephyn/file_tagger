@@ -150,6 +150,83 @@ def _parser_version() -> str:
             return "unknown"
 
 
+def _pypdfium_version() -> str:
+    try:
+        return version("pypdfium2")
+    except Exception:
+        return "unknown"
+
+
+def _extract_pdf_with_pypdfium2(
+    path: Path,
+    file_hash: str,
+) -> ExtractedDocument:
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        return _conversion_failure(
+            path,
+            file_hash,
+            (f"The pypdfium2 package is required to parse PDF files: {exc}",),
+        )
+
+    try:
+        pdf = pdfium.PdfDocument(str(path))
+    except (OSError, ValueError, RuntimeError) as exc:
+        return _conversion_failure(path, file_hash, (str(exc),))
+
+    pages: list[ExtractedPage] = []
+    try:
+        for ordinal in range(len(pdf)):
+            page = pdf[ordinal]
+            text_page = page.get_textpage()
+            try:
+                markdown = str(text_page.get_text_range() or "").strip()
+            finally:
+                text_page.close()
+                page.close()
+            text_chars = useful_text_length(markdown)
+            pages.append(
+                ExtractedPage(
+                    number=ordinal + 1,
+                    ordinal=ordinal,
+                    text=markdown,
+                    markdown=markdown,
+                    headings=extract_headings(markdown),
+                    quality=(
+                        "good"
+                        if text_chars >= MINIMUM_PAGE_TEXT_CHARS
+                        else "degraded"
+                    ),
+                    text_chars=text_chars,
+                )
+            )
+    except (OSError, ValueError, RuntimeError) as exc:
+        return _conversion_failure(path, file_hash, (str(exc),))
+    finally:
+        pdf.close()
+
+    full_markdown = "\n\n".join(page.markdown for page in pages if page.markdown)
+    diagnostics: tuple[ExtractionDiagnostic, ...] = ()
+    if any(page.quality == "degraded" for page in pages):
+        diagnostics = (
+            ExtractionDiagnostic(
+                code="low_text_quality",
+                message="One or more PDF pages contained little extractable text.",
+            ),
+        )
+    return ExtractedDocument(
+        file_path=str(path),
+        file_hash=file_hash,
+        parser="pypdfium2",
+        parser_version=_pypdfium_version(),
+        status="warnings" if diagnostics else "complete",
+        pages=tuple(pages),
+        full_markdown=full_markdown,
+        diagnostics=diagnostics,
+    )
+
+
 def _conversion_failure(
     path: Path,
     file_hash: str,
@@ -416,10 +493,26 @@ class DoclingAdapter:
                 path,
                 raises_on_error=False,
             )
-        except (ConversionError, OSError, ValueError) as exc:
+        except (ConversionError, OSError, ValueError, ImportError) as exc:
+            if path.suffix.casefold() == ".pdf":
+                return _extract_pdf_with_pypdfium2(path, file_hash)
             return _conversion_failure(path, file_hash, (str(exc),))
 
         document = _from_result(path, file_hash, result, used_ocr=False)
+        if (
+            path.suffix.casefold() == ".pdf"
+            and (
+                document.status == "failed"
+                or useful_text_length(document.full_markdown) < MINIMUM_PAGE_TEXT_CHARS
+            )
+            and document.failure not in {"encrypted", "unsupported"}
+        ):
+            fallback = _extract_pdf_with_pypdfium2(path, file_hash)
+            if (
+                fallback.status != "failed"
+                and useful_text_length(fallback.full_markdown) >= MINIMUM_PAGE_TEXT_CHARS
+            ):
+                return fallback
         if (
             path.suffix.casefold() == ".pdf"
             and document.status != "failed"
@@ -430,8 +523,8 @@ class DoclingAdapter:
                     path,
                     raises_on_error=False,
                 )
-            except (ConversionError, OSError, ValueError) as exc:
-                return _conversion_failure(path, file_hash, (f"OCR failed: {exc}",))
+            except (ConversionError, OSError, ValueError, ImportError):
+                return _extract_pdf_with_pypdfium2(path, file_hash)
             document = _from_result(path, file_hash, result, used_ocr=True)
         return document
 

@@ -15,6 +15,12 @@ def test_packaging_spec_collects_required_packages_and_fails_closed() -> None:
     assert '"PySide6"' in spec
     assert '"sqlite_vec"' in spec
     assert '"docling"' in spec
+    assert '"docling_parse"' in spec
+    assert '"pypdfium2"' in spec
+    assert '"latex2mathml"' in spec
+    assert '    "alembic",\n' in spec
+    assert '    "sqlalchemy",\n' in spec
+    assert '"logging.config"' in spec
     assert "HookError" in spec
     assert "collect_all(package)" in spec
     assert "except Exception:\n        pass" not in spec

@@ -17,19 +17,27 @@ PACKAGING_ROOT = SPEC_DIR
 SRC_ROOT = PROJECT_ROOT / "src"
 
 hiddenimports = []
+hiddenimports += [
+    "logging.config",
+    "logging.handlers",
+]
 datas = []
 binaries = []
 
 required_packages = (
     "PySide6",
     "sqlite_vec",
+    "sqlalchemy",
+    "alembic",
     "docling",
+    "docling_parse",
+    "pypdfium2",
+    "latex2mathml",
 )
 
 optional_packages = (
     "docling_core",
     "docling_ibm_models",
-    "pypdfium2",
 )
 
 for package in required_packages:

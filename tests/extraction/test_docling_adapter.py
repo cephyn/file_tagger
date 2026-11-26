@@ -161,3 +161,12 @@ def test_docling_adapter_extracts_modern_text(
 
     assert content is not None
     assert "# Local text" in content
+
+
+def test_real_pdf_fixture_extracts_text() -> None:
+    source = Path(__file__).resolve().parents[1] / "fixtures" / "library" / "encounters.pdf"
+
+    document = extract_document(source)
+
+    assert document.status in {"complete", "warnings"}
+    assert document.full_markdown.strip()

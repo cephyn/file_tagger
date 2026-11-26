@@ -101,6 +101,28 @@ class ReloadableConfig:
         self.reloads += 1
 
 
+def test_modern_database_unavailable_reason_includes_missing_module(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "file_tagger.modern_context.upgrade_database",
+        lambda database: (_ for _ in ()).throw(
+            ModuleNotFoundError("No module named 'alembic'")
+        ),
+    )
+
+    runtime = initialize_modern_runtime(
+        paths,
+        ReloadableConfig(paths),
+        "password",
+        start_readiness=False,
+    )
+
+    assert runtime.session_factory is None
+    assert "No module named 'alembic'" in runtime.unavailable_reason
+
+
 def test_startup_upgrades_and_idempotently_migrates_legacy_tags(
     tmp_path, monkeypatch
 ) -> None:
@@ -967,6 +989,12 @@ def test_runtime_persists_model_selections_and_refreshes(
     }
 
     runtime.apply_model_selections(selected)
+    assert runtime.readiness is not None
+    assert runtime.readiness.selected_models == RequiredModels(
+        embedding="embeddinggemma-2:440m",
+        decision="tev1:4b",
+        generation="gemma4:e2b",
+    )
     restarted = ModernRuntime(paths, object())  # type: ignore[arg-type]
 
     assert refreshed == [
@@ -2038,6 +2066,30 @@ def test_partial_pending_legacy_migration_failure_is_not_suppressed(
             "password",
             start_readiness=False,
         )
+
+
+def test_login_screen_reports_modern_database_unavailability(monkeypatch, qtbot) -> None:
+    from types import SimpleNamespace
+
+    from file_tagger.login import LoginScreen
+
+    screen = LoginScreen()
+    qtbot.addWidget(screen)
+    errors: list[str] = []
+    cleaned_up: list[bool] = []
+    monkeypatch.setattr(screen, "show_error", errors.append)
+    monkeypatch.setattr(screen, "cleanup_worker", lambda: cleaned_up.append(True))
+    config = SimpleNamespace(pending_recovery_key=None)
+    runtime = SimpleNamespace(
+        session_factory=None,
+        unavailable_reason="DatabaseExtensionError: sqlite-vec unavailable.",
+    )
+
+    screen.on_initialization_finished((None, config, runtime))
+
+    assert len(errors) == 1
+    assert "sqlite-vec unavailable" in errors[0]
+    assert cleaned_up == [True]
 
 
 def test_login_accepts_modern_runtime_without_legacy_search(

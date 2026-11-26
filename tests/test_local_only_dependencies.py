@@ -31,6 +31,14 @@ def test_lockfile_has_no_forbidden_runtime_stacks() -> None:
     assert residuals == []
 
 
+def test_pdf_extraction_uses_docling_format_pdf_extra() -> None:
+    root = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    dependencies = project["dependencies"]
+
+    assert "docling-slim[format-pdf]==2.152.0" in dependencies
+
+
 def test_runtime_source_has_no_cloud_or_competing_model_stacks() -> None:
     root = Path(__file__).resolve().parents[1]
     source_root = root / "src" / "file_tagger"

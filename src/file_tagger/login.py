@@ -319,7 +319,20 @@ class LoginScreen(QWidget):
                     self.cleanup_worker()
             else:
                 logger.error("Initialization failed - missing required components")
-                self.show_error("Failed to initialize the application. Incorrect password or corrupted configuration.")
+                unavailable_reason = getattr(
+                    modern_runtime,
+                    "unavailable_reason",
+                    None,
+                )
+                if unavailable_reason:
+                    self.show_error(
+                        f"Failed to initialize the modern database: {unavailable_reason}"
+                    )
+                else:
+                    self.show_error(
+                        "Failed to initialize the application. "
+                        "Incorrect password or corrupted configuration."
+                    )
                 self.cleanup_worker()
         except Exception as e:
             logger.error(f"Unexpected error in on_initialization_finished: {str(e)}")

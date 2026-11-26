@@ -40,6 +40,27 @@ def test_packaged_upgrade_resolves_migrations_from_meipass(
     assert captured["revision"] == "head"
 
 
+def test_installed_app_can_create_modern_database(tmp_path: Path) -> None:
+    data_dir = tmp_path / "user-data"
+    env = os.environ.copy()
+    env["FILE_TAGGER_DATA_DIR"] = str(data_dir)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "file_tagger", "--print-modern-database"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "modern_database=ok" in result.stdout
+    assert (data_dir / "file_tagger.sqlite3").is_file()
+
+
 def test_installed_app_uses_per_user_data_directory(tmp_path: Path) -> None:
     data_dir = tmp_path / "user-data"
     cwd = tmp_path / "cwd"

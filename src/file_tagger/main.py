@@ -3,6 +3,7 @@ import logging
 import traceback
 from datetime import datetime
 from PySide6.QtWidgets import QApplication
+from sqlalchemy import text
 from .infrastructure.app_paths import AppPaths
 
 # Set up error logging to file
@@ -45,6 +46,21 @@ def main(argv=None):
         print(f"legacy_database={paths.legacy_database}")
         print(f"legacy_chroma={paths.legacy_chroma}")
         print(f"config_file={paths.config_file}")
+        return
+    if "--print-modern-database" in arguments:
+        from .infrastructure.database import create_session_factory, upgrade_database
+
+        paths = AppPaths.discover()
+        paths.ensure_directories()
+        try:
+            upgrade_database(paths.database)
+            session_factory = create_session_factory(paths.database)
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+            print("modern_database=ok")
+        except Exception as exc:
+            print(f"modern_database=error: {exc.__class__.__name__}: {exc}")
+            return
         return
 
     # Initialize logging first
