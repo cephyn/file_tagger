@@ -62,3 +62,39 @@ def test_password_vault_rejects_corrupt_envelope(tmp_path, monkeypatch) -> None:
     assert PasswordVault.status(paths) is CredentialStatus.CORRUPT
     with pytest.raises(CredentialFormatError):
         PasswordVault.open(paths, "old-password")
+
+
+def test_recovery_key_resets_password_without_reencrypting_config(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    vault, recovery_key = PasswordVault.create(paths, "forgotten")
+    ciphertext = vault.encrypt(b"config")
+    paths.config_file.write_bytes(ciphertext)
+    original_recovery = paths.recovery_file.read_bytes()
+
+    recovered = PasswordVault.recover(paths, recovery_key, "replacement")
+
+    assert recovered.decrypt(paths.config_file.read_bytes()) == b"config"
+    assert paths.config_file.read_bytes() == ciphertext
+    assert paths.recovery_file.read_bytes() == original_recovery
+    with pytest.raises(CredentialRecoveryError):
+        PasswordVault.open(paths, "forgotten")
+
+
+def test_rotating_recovery_key_invalidates_only_old_recovery_key(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(tmp_path))
+    paths = AppPaths.discover()
+    paths.ensure_directories()
+    vault, old_key = PasswordVault.create(paths, "current-password")
+
+    new_key = vault.rotate_recovery_key("current-password")
+
+    assert new_key != old_key
+    with pytest.raises(CredentialRecoveryError):
+        PasswordVault.recover(paths, old_key, "invalid")
+    PasswordVault.recover(paths, new_key, "replacement")

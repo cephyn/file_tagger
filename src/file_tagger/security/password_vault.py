@@ -123,6 +123,40 @@ class PasswordVault:
             }
         )
 
+    @classmethod
+    def recover(
+        cls, paths: AppPaths, recovery_key: str, new_password: str
+    ) -> "PasswordVault":
+        recovery_envelope = _read_envelope(paths.recovery_file)
+        data_key = _unwrap_data_key(recovery_envelope, recovery_key)
+        material = _password_material(new_password, data_key)
+        _replace_transaction(
+            {
+                paths.password_hash_file: _json_bytes(material.verifier),
+                paths.password_key_file: _json_bytes(material.envelope),
+            }
+        )
+        return cls(paths, data_key)
+
+    def rotate_recovery_key(self, current_password: str) -> str:
+        verifier = _read_json(self.paths.password_hash_file)
+        _verify_password(current_password, verifier)
+        envelope = _read_envelope(self.paths.password_key_file)
+        if not hmac.compare_digest(
+            _unwrap_data_key(envelope, current_password), self.data_key
+        ):
+            raise CredentialRecoveryError("Credential metadata is inconsistent.")
+
+        recovery_key = secrets.token_urlsafe(24)
+        _replace_transaction(
+            {
+                self.paths.recovery_file: _json_bytes(
+                    _recovery_material(recovery_key, self.data_key)
+                )
+            }
+        )
+        return recovery_key
+
 
 class _PasswordMaterial:
     def __init__(self, verifier: dict[str, Any], envelope: dict[str, Any]) -> None:
