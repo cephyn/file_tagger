@@ -2,7 +2,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtWidgets import QDialog, QLineEdit, QMainWindow, QProgressDialog
+from PySide6.QtWidgets import (
+    QDialog,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressDialog,
+)
+from PySide6.QtGui import QCloseEvent
 
 from file_tagger.file_tag_manager import FileTagManager, hide_scan_progress
 from file_tagger.persistence.models import File, Tag
@@ -190,6 +197,55 @@ def test_hide_scan_progress_does_not_emit_cancelled(qtbot) -> None:
     assert cancelled is False
 
 
+def test_scan_directory_for_untagged_rejects_overlapping_scan(
+    tmp_path: Path,
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.path_display = QLineEdit(str(tmp_path))
+    manager.db_session = SimpleNamespace()
+    manager.config = SimpleNamespace()
+    manager.modern_runtime = None
+    manager.scan_thread = SimpleNamespace(isRunning=lambda: True)
+
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    manager.scan_directory_for_untagged()
+
+    assert len(warnings) == 1
+
+
+def test_close_event_stops_running_scan_and_waits(
+    qtbot,
+) -> None:
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+
+    waited_for = []
+    manager.scan_thread = SimpleNamespace(
+        stop_requested=False,
+        isRunning=lambda: True,
+        requestInterruption=lambda: None,
+        wait=lambda timeout: waited_for.append(timeout) or False,
+    )
+    event = QCloseEvent()
+
+    manager.closeEvent(event)
+
+    assert manager.scan_thread.stop_requested is True
+    assert waited_for == [1000]
+    assert event.isAccepted() is False
+
+
 def test_show_untagged_files_dialog_lists_nested_file_and_suggestion(
     tmp_path: Path,
     qtbot,
@@ -279,3 +335,115 @@ def test_scan_directory_for_untagged_runs_qthread_and_finds_nested_file(
     )
     assert nested_path in captured["files"]
     assert captured["directory"] == str(tmp_path)
+
+
+def test_scan_directory_uses_dedicated_bound_session(
+    tmp_path: Path,
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_directory = tmp_path / "nested"
+    nested_directory.mkdir()
+    nested_file = nested_directory / "nested.txt"
+    nested_file.write_text("nested", encoding="utf-8")
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.path_display = QLineEdit(str(tmp_path))
+    manager.config = SimpleNamespace()
+    manager.modern_runtime = None
+
+    bind = object()
+    manager.db_session = SimpleNamespace(
+        get_bind=lambda: bind,
+        query=lambda model: pytest.fail("scan used the shared database session"),
+    )
+
+    dedicated_session = SimpleNamespace(
+        closed=False,
+        query=lambda model: SimpleNamespace(
+            filter_by=lambda **kwargs: SimpleNamespace(first=lambda: None)
+        ),
+        close=lambda: setattr(dedicated_session, "closed", True),
+    )
+    factory_calls = []
+
+    import file_tagger.file_tag_manager as file_tag_manager_module
+
+    def fake_sessionmaker(*, bind):
+        factory_calls.append(bind)
+        return lambda: dedicated_session
+
+    monkeypatch.setattr(
+        file_tag_manager_module,
+        "sessionmaker",
+        fake_sessionmaker,
+        raising=False,
+    )
+    monkeypatch.setattr(TagSuggester, "__init__", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        TagSuggester,
+        "suggest_tags_for_file",
+        lambda self, file_path: {},
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        manager,
+        "show_untagged_files_dialog",
+        lambda files, directory: captured.update(files=files, directory=directory),
+    )
+
+    manager.scan_directory_for_untagged()
+
+    qtbot.waitUntil(
+        lambda: "files" in captured,
+        timeout=5000,
+    )
+    assert factory_calls == [bind]
+    assert dedicated_session.closed is True
+
+
+def test_scan_result_uses_captured_thread_not_replaced_manager_thread(
+    tmp_path: Path,
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_file = tmp_path / "nested.txt"
+    nested_file.write_text("nested", encoding="utf-8")
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.path_display = QLineEdit(str(tmp_path))
+    manager.db_session = SimpleNamespace(
+        query=lambda model: SimpleNamespace(
+            filter_by=lambda **kwargs: SimpleNamespace(first=lambda: None)
+        )
+    )
+    manager.config = SimpleNamespace()
+    manager.modern_runtime = None
+
+    monkeypatch.setattr(TagSuggester, "__init__", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        TagSuggester,
+        "suggest_tags_for_file",
+        lambda self, file_path: {},
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        manager,
+        "show_untagged_files_dialog",
+        lambda files, directory: captured.update(files=files, directory=directory),
+    )
+
+    manager.scan_directory_for_untagged()
+    manager.scan_thread = SimpleNamespace(stop_requested=True)
+
+    qtbot.waitUntil(
+        lambda: "files" in captured,
+        timeout=5000,
+    )
+    assert str(nested_file.resolve()) in captured["files"]

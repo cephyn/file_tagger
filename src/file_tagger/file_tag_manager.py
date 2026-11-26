@@ -39,6 +39,7 @@ from PySide6.QtGui import (
     QTextDocument,
 )
 from PySide6.QtCore import QSize
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.exc import NoResultFound
 from .persistence.models import File, FileTag, Tag
 from .ollama.readiness import ReadinessReport
@@ -375,6 +376,24 @@ class FileTagManager(QMainWindow):
         )
         logger.debug("Stack trace at close event:")
         logger.debug("".join(traceback.format_stack()))
+
+        scan_thread = getattr(self, "scan_thread", None)
+        if scan_thread is not None:
+            is_running = getattr(scan_thread, "isRunning", None)
+            if callable(is_running) and is_running():
+                scan_thread.stop_requested = True
+                request_interruption = getattr(
+                    scan_thread, "requestInterruption", None
+                )
+                if callable(request_interruption):
+                    request_interruption()
+                wait = getattr(scan_thread, "wait", None)
+                if not callable(wait) or not wait(1_000):
+                    logger.warning(
+                        "Window close deferred because directory scan is stopping."
+                    )
+                    event.ignore()
+                    return
 
         indexing_status = getattr(self, "indexing_status", None)
         shutdown = getattr(indexing_status, "shutdown", None)
@@ -1913,6 +1932,19 @@ class FileTagManager(QMainWindow):
             )
             return
 
+        existing_scan = getattr(self, "scan_thread", None)
+        if (
+            existing_scan is not None
+            and callable(getattr(existing_scan, "isRunning", None))
+            and existing_scan.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "Scan in Progress",
+                "A directory scan is already in progress. Please wait for it to finish or cancel it.",
+            )
+            return
+
         # Import threading here to avoid circular imports
         from PySide6.QtCore import QThread, Signal
 
@@ -1934,7 +1966,22 @@ class FileTagManager(QMainWindow):
                 self.stop_requested = False
 
             def run(self):
+                scan_session = None
+                owns_scan_session = False
                 try:
+                    bind = None
+                    get_bind = getattr(self.db_session, "get_bind", None)
+                    if callable(get_bind):
+                        bind = get_bind()
+                    if bind is None:
+                        bind = getattr(self.db_session, "bind", None)
+
+                    if bind is not None:
+                        scan_session = sessionmaker(bind=bind)()
+                        owns_scan_session = True
+                    else:
+                        scan_session = self.db_session
+
                     files = list(iter_visible_files(self.directory, should_stop=lambda: self.stop_requested))
                     if self.stop_requested:
                         return
@@ -1965,7 +2012,7 @@ class FileTagManager(QMainWindow):
                             str(Path(file_path).expanduser().resolve())
                         )
                         file_obj = (
-                            self.db_session.query(File)
+                            scan_session.query(File)
                             .filter_by(canonical_path=canonical_path)
                             .first()
                         )
@@ -1986,6 +2033,9 @@ class FileTagManager(QMainWindow):
                     if self.stop_requested:
                         return
                     self.scan_error.emit(str(e))
+                finally:
+                    if owns_scan_session and callable(getattr(scan_session, "close", None)):
+                        scan_session.close()
 
         # Create progress dialog
         progress = QProgressDialog(
@@ -1996,41 +2046,42 @@ class FileTagManager(QMainWindow):
         progress.setValue(0)
 
         # Create and configure scan thread
-        self.scan_thread = ScanThread(
+        scan_thread = ScanThread(
             dir_path,
             self.db_session,
             self.config,
             getattr(self, "modern_runtime", None),
         )
+        self.scan_thread = scan_thread
 
         # Connect signals
-        self.scan_thread.scan_progress.connect(
+        scan_thread.scan_progress.connect(
             lambda current, total: progress.setValue(int(current / total * 100))
         )
-        self.scan_thread.scan_finished.connect(
+        scan_thread.scan_finished.connect(
             lambda *_args: hide_scan_progress(progress)
         )
-        self.scan_thread.scan_finished.connect(
+        scan_thread.scan_finished.connect(
             lambda files: None
-            if self.scan_thread.stop_requested
+            if scan_thread.stop_requested
             else self.show_untagged_files_dialog(files, dir_path)
         )
-        self.scan_thread.scan_error.connect(
+        scan_thread.scan_error.connect(
             lambda *_args: hide_scan_progress(progress)
         )
-        self.scan_thread.scan_error.connect(
+        scan_thread.scan_error.connect(
             lambda error: None
-            if self.scan_thread.stop_requested
+            if scan_thread.stop_requested
             else QMessageBox.critical(
                 self, "Scan Error", f"Error scanning directory: {error}"
             )
         )
         progress.canceled.connect(
-            lambda: setattr(self.scan_thread, "stop_requested", True)
+            lambda: setattr(scan_thread, "stop_requested", True)
         )
 
         # Start the scan
-        self.scan_thread.start()
+        scan_thread.start()
 
     def show_untagged_files_dialog(self, untagged_files, directory_path):
         """Show dialog with untagged files and provide options to tag them."""
