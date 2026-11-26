@@ -2,6 +2,7 @@ import os
 import logging
 import traceback
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, cast
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -38,7 +39,8 @@ from PySide6.QtGui import (
     QTextDocument,
 )
 from PySide6.QtCore import QSize
-from .models import File, Tag
+from sqlalchemy.orm.exc import NoResultFound
+from .persistence.models import File, FileTag, Tag
 from .ollama.readiness import ReadinessReport
 from .password_management import PasswordManagementDialog
 from .tag_suggestion import TagSuggestionDialog
@@ -47,7 +49,7 @@ from .ui.contextual_search import ContextualSearchDialog
 from .ui.indexing_status import IndexingStatus
 from .ui.ollama_settings import OllamaSettingsDialog
 from .migration.legacy_chroma import cleanup_legacy_chroma, inspect_legacy_chroma
-from .utils import is_dark_color, get_score_color, open_file, open_containing_folder
+from .utils import is_dark_color, get_score_color, iter_visible_files, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
 from .modern_context import ModernIndexingUnavailable, ModernSearchUnavailable
 
@@ -880,7 +882,7 @@ class FileTagManager(QMainWindow):
 
         tags = self.db_session.query(Tag).all()
         for tag in tags:
-            tag_color = QColor(tag.color)
+            tag_color = QColor(tag.color or "#808080")
             text_color = Qt.white if is_dark_color(tag_color) else Qt.black
 
             # Add to main tag list
@@ -901,18 +903,52 @@ class FileTagManager(QMainWindow):
             item.setBackground(tag_color)
             item.setForeground(text_color)
 
+    @staticmethod
+    def _canonical_path(file_path: str) -> str:
+        return os.path.normpath(str(Path(file_path).expanduser().resolve()))
+
+    def _get_file(self, file_path: str) -> File | None:
+        query = self.db_session.query(File).filter_by(
+            canonical_path=self._canonical_path(file_path)
+        )
+        if hasattr(query, "first"):
+            return query.first()
+        if hasattr(query, "one"):
+            try:
+                return query.one()
+            except NoResultFound:
+                return None
+        return None
+
+    @staticmethod
+    def _file_tags(file_obj: File) -> list[Tag]:
+        tags: list[Tag] = []
+        for item in file_obj.tags:
+            tag = getattr(item, "tag", item)
+            if tag:
+                tags.append(tag)
+        return tags
+
+    @staticmethod
+    def _tag_data(file_obj: File | None) -> list[tuple[str, str | None]]:
+        if file_obj is None:
+            return []
+        return [(tag.name, tag.color) for tag in FileTagManager._file_tags(file_obj)]
+
+    @staticmethod
+    def _file_path(file_obj: File) -> str:
+        return str(getattr(file_obj, "canonical_path", getattr(file_obj, "path", "")))
+
     def refresh_file_tags(self):
         """Update the file tags list for the currently selected file."""
         self.file_tags_list.clear()
         if not self.current_file_path:
             return
 
-        file_obj = (
-            self.db_session.query(File).filter_by(path=self.current_file_path).first()
-        )
+        file_obj = self._get_file(self.current_file_path)
         if file_obj:
-            for tag in file_obj.tags:
-                tag_color = QColor(tag.color)
+            for tag in self._file_tags(file_obj):
+                tag_color = QColor(tag.color or "#808080")
                 text_color = Qt.white if is_dark_color(tag_color) else Qt.black
 
                 self.file_tags_list.addItem(tag.name)
@@ -1013,7 +1049,7 @@ class FileTagManager(QMainWindow):
             success_tags = False
             success_modern = False
             try:
-                file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+                file_obj = self._get_file(file_path)
                 if file_obj:
                     self.db_session.delete(file_obj)
                     success_modern = self._commit_legacy_changes(
@@ -1143,10 +1179,10 @@ class FileTagManager(QMainWindow):
                 tag_deletes=[old_name] if old_name != new_name else [],
                 file_paths=[
                     (
-                        file.path,
-                        [(file_tag.name, file_tag.color) for file_tag in file.tags],
+                        association.file.canonical_path,
+                        self._tag_data(association.file),
                     )
-                    for file in tag.files
+                    for association in tag.files
                 ],
             )
 
@@ -1197,13 +1233,14 @@ class FileTagManager(QMainWindow):
         print(f"\n=== DEBUGGING: Adding tags to file: {self.current_file_path} ===")
 
         # Get or create file record
-        file_obj = (
-            self.db_session.query(File).filter_by(path=self.current_file_path).first()
-        )
+        file_obj = self._get_file(self.current_file_path)
         is_new_file = False
         if not file_obj:
             print("DEBUGGING: File not found in database, creating new record")
-            file_obj = File(path=self.current_file_path)
+            file_obj = File(
+                canonical_path=self._canonical_path(self.current_file_path),
+                indexing_state="not_indexed",
+            )
             self.db_session.add(file_obj)
             is_new_file = True
         else:
@@ -1219,10 +1256,12 @@ class FileTagManager(QMainWindow):
 
         # Add selected tags
         tags_added = []
+        existing_tags = {tag.id for tag in self._file_tags(file_obj)}
         for item in selected_items:
             tag = self.db_session.query(Tag).filter_by(name=item.text()).first()
-            if tag and tag not in file_obj.tags:
-                file_obj.tags.append(tag)
+            if tag and tag.id not in existing_tags:
+                file_obj.tags.append(FileTag(file=file_obj, tag=tag))
+                existing_tags.add(tag.id)
                 tags_added.append(tag.name)
 
         print(f"DEBUGGING: Added tags: {tags_added}")
@@ -1232,7 +1271,7 @@ class FileTagManager(QMainWindow):
             file_paths=[
                 (
                     self.current_file_path,
-                    [(tag.name, tag.color) for tag in file_obj.tags],
+                    self._tag_data(file_obj),
                 )
             ]
         )
@@ -1255,20 +1294,21 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select tag(s) to remove!")
             return
 
-        file_obj = (
-            self.db_session.query(File).filter_by(path=self.current_file_path).first()
-        )
+        file_obj = self._get_file(self.current_file_path)
         if file_obj:
             for item in selected_items:
                 tag = self.db_session.query(Tag).filter_by(name=item.text()).first()
-                if tag in file_obj.tags:
-                    file_obj.tags.remove(tag)
+                if tag:
+                    for association in list(file_obj.tags):
+                        if association.tag_id == tag.id:
+                            self.db_session.delete(association)
+                            file_obj.tags.remove(association)
 
             self._commit_legacy_changes(
                 file_paths=[
                     (
                         self.current_file_path,
-                        [(tag.name, tag.color) for tag in file_obj.tags],
+                        self._tag_data(file_obj),
                     )
                 ]
             )
@@ -1297,27 +1337,21 @@ class FileTagManager(QMainWindow):
             QMessageBox.warning(self, "Error", "Please select tag(s) to search for!")
             return
 
-        # Build query
-        query = self.db_session.query(File).distinct()
         tag_names = [item.text() for item in selected_items]
-
-        if self.and_radio.isChecked():
-            # Files must have ALL selected tags
-            for tag_name in tag_names:
-                tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
-                if tag:
-                    query = query.filter(File.tags.contains(tag))
-        else:
-            # Files must have ANY of the selected tags
-            tags = self.db_session.query(Tag).filter(Tag.name.in_(tag_names)).all()
-            query = query.filter(File.tags.any(Tag.id.in_([t.id for t in tags])))
+        use_all = self.and_radio.isChecked()
 
         # Display results
         self.search_results.clear()
-        for file in query.all():
-            if os.path.exists(file.path):
-                item = QListWidgetItem(os.path.basename(file.path))
-                item.setToolTip(file.path)
+        for file_obj in self.db_session.query(File).all():
+            file_tag_names = {tag.name for tag in self._file_tags(file_obj)}
+            matches = (
+                all(tag_name in file_tag_names for tag_name in tag_names)
+                if use_all
+                else any(tag_name in file_tag_names for tag_name in tag_names)
+            )
+            if matches and os.path.exists(file_obj.canonical_path):
+                item = QListWidgetItem(os.path.basename(file_obj.canonical_path))
+                item.setToolTip(file_obj.canonical_path)
                 self.search_results.addItem(item)
 
     def search_by_content(self) -> None:
@@ -1572,7 +1606,8 @@ class FileTagManager(QMainWindow):
 
         if reply == QMessageBox.Yes:
             file_paths = [
-                file_obj.path for file_obj in self.db_session.query(File).all()
+                self._file_path(file_obj)
+                for file_obj in self.db_session.query(File).all()
             ]
             if not self._index_modern_files(file_paths):
                 QMessageBox.warning(
@@ -1896,12 +1931,9 @@ class FileTagManager(QMainWindow):
 
             def run(self):
                 try:
-                    # List all files in directory (not subdirectories)
-                    files = []
-                    with os.scandir(self.directory) as entries:
-                        for entry in entries:
-                            if entry.is_file() and not entry.name.startswith("."):
-                                files.append(entry.path)
+                    files = list(iter_visible_files(self.directory, should_stop=lambda: self.stop_requested))
+                    if self.stop_requested:
+                        return
 
                     # Initialize progress
                     total_files = len(files)
@@ -1923,9 +1955,12 @@ class FileTagManager(QMainWindow):
                         if self.stop_requested:
                             return
 
+                        canonical_path = os.path.normpath(
+                            str(Path(file_path).expanduser().resolve())
+                        )
                         file_obj = (
                             self.db_session.query(File)
-                            .filter_by(path=file_path)
+                            .filter_by(canonical_path=canonical_path)
                             .first()
                         )
                         if not file_obj or not file_obj.tags:
@@ -2205,15 +2240,7 @@ class FileTagManager(QMainWindow):
                 file_paths=[
                     (
                         file_path,
-                        [
-                            (tag.name, tag.color)
-                            for tag in (
-                                self.db_session.query(File)
-                                .filter_by(path=file_path)
-                                .one()
-                                .tags
-                            )
-                        ],
+                        self._tag_data(self._get_file(file_path)),
                     )
                     for file_path in applied_paths
                 ]
@@ -2240,13 +2267,17 @@ class FileTagManager(QMainWindow):
             return
 
         # Get or create file record
-        file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+        file_obj = self._get_file(file_path)
 
         if not file_obj:
-            file_obj = File(path=file_path)
+            file_obj = File(
+                canonical_path=self._canonical_path(file_path),
+                indexing_state="not_indexed",
+            )
             self.db_session.add(file_obj)
 
         # Add tags (create them if they don't exist)
+        existing_tag_ids = {tag.id for tag in self._file_tags(file_obj)}
         for tag_name in tag_names:
             tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
             if not tag:
@@ -2262,8 +2293,9 @@ class FileTagManager(QMainWindow):
                 self.db_session.add(tag)
                 self.db_session.flush()  # Generate ID without committing transaction
 
-            if tag not in file_obj.tags:
-                file_obj.tags.append(tag)
+            if tag.id not in existing_tag_ids:
+                file_obj.tags.append(FileTag(file=file_obj, tag=tag))
+                existing_tag_ids.add(tag.id)
 
         # The caller commits the legacy snapshot and queues modern indexing.
 
@@ -2286,15 +2318,7 @@ class FileTagManager(QMainWindow):
             file_paths=[
                 (
                     file_path,
-                    [
-                        (tag.name, tag.color)
-                        for tag in (
-                            self.db_session.query(File)
-                            .filter_by(path=file_path)
-                            .one()
-                            .tags
-                        )
-                    ],
+                    self._tag_data(self._get_file(file_path)),
                 )
                 for file_path in file_paths
             ]
@@ -2336,7 +2360,7 @@ class FileTagManager(QMainWindow):
 
         try:
             # Get the file from database
-            file_obj = self.db_session.query(File).filter_by(path=file_path).first()
+            file_obj = self._get_file(file_path)
             if not file_obj:
                 QMessageBox.warning(
                     self, "Error", f"The file {file_path} is not in the tag database."
