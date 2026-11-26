@@ -3,6 +3,7 @@ from collections.abc import Coroutine, Mapping, Sequence
 import hashlib
 import inspect
 import json
+import re
 from typing import Any, Protocol, TypeVar
 import unicodedata
 
@@ -10,6 +11,7 @@ from pydantic import AliasChoices, ConfigDict, Field, TypeAdapter
 
 from ..adapters.ollama.gateway import ModelRole, OllamaGateway
 from ..domain.contracts import DomainRecord, ModelProfile, TagDecision
+from ..domain.errors import EmbeddingContextRejectedError
 from .cache import CachedTagRecommendations, TagRecommendationCache
 from .decision_service import (
     DEFAULT_DECISION_MODEL,
@@ -404,14 +406,124 @@ async def _embed_document_query(
     embed = getattr(gateway, "embed", None)
     if not callable(embed):
         raise ValueError("The configured gateway cannot embed tag search queries.")
-    result = embed(
-        profile.model,
+
+    return await _embed_document_state_text(
+        embed,
         document_state,
-        dimensions=profile.dimensions,
-        truncate=False,
+        profile,
     )
-    if inspect.isawaitable(result):
-        result = await result
+
+
+def _is_unicode_safe_boundary(text: str, offset: int) -> bool:
+    if offset <= 0 or offset >= len(text):
+        return False
+
+    left = text[offset - 1]
+    right = text[offset]
+    if left == "\u200d" or right == "\u200d":
+        return False
+    if unicodedata.category(right) in {"Mn", "Mc", "Me", "Cf"}:
+        return False
+    if unicodedata.category(left) in {"Mn", "Mc", "Me", "Cf"}:
+        return False
+
+    def is_regional_indicator(character: str) -> bool:
+        return "\U0001f1e6" <= character <= "\U0001f1ff"
+
+    if is_regional_indicator(left) and is_regional_indicator(right):
+        return False
+    return True
+
+
+def _nearest_unicode_safe_boundary(text: str, midpoint: int) -> int | None:
+    for distance in range(1, len(text)):
+        left = midpoint - distance
+        right = midpoint + distance
+        if 0 < left < len(text) and _is_unicode_safe_boundary(text, left):
+            return left
+        if 0 < right < len(text) and _is_unicode_safe_boundary(text, right):
+            return right
+    return None
+
+
+def _split_document_state_text(text: str) -> tuple[str, str] | None:
+    if len(text) <= 1:
+        return None
+
+    midpoint = len(text) // 2
+    patterns = (
+        (r"\n\s*\n", "start"),
+        (r"\n(?=#{1,6}[ \t]+)", "start"),
+        (r"(?<=[.!?])\s+", "end"),
+        (r"\n", "start"),
+        (r"[ \t]+", "start"),
+    )
+    offset: int | None = None
+    for pattern, offset_kind in patterns:
+        candidates = [
+            (match.start() if offset_kind == "start" else match.end())
+            for match in re.finditer(pattern, text)
+            if 0
+            < (match.start() if offset_kind == "start" else match.end())
+            < len(text)
+        ]
+        safe_candidates = [
+            candidate
+            for candidate in candidates
+            if _is_unicode_safe_boundary(text, candidate)
+        ]
+        if safe_candidates:
+            offset = min(
+                safe_candidates,
+                key=lambda candidate: abs(candidate - midpoint),
+            )
+            break
+
+    if offset is None:
+        offset = _nearest_unicode_safe_boundary(text, midpoint)
+        if offset is None:
+            return None
+    if offset <= 0 or offset >= len(text):
+        return None
+    return text[:offset], text[offset:]
+
+
+async def _embed_document_state_text(
+    embed: Any,
+    text: str,
+    profile: ModelProfile,
+) -> tuple[float, ...]:
+    try:
+        result = embed(
+            profile.model,
+            text,
+            dimensions=profile.dimensions,
+            truncate=False,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+    except EmbeddingContextRejectedError as exc:
+        split = _split_document_state_text(text)
+        if split is None:
+            raise EmbeddingContextRejectedError(
+                "Document-state embedding text is unsplittable after context rejection."
+            ) from exc
+        left_text, right_text = split
+        left_embedding = await _embed_document_state_text(
+            embed,
+            left_text,
+            profile,
+        )
+        right_embedding = await _embed_document_state_text(
+            embed,
+            right_text,
+            profile,
+        )
+        return tuple(
+            (left + right) / 2.0
+            for left, right in zip(left_embedding, right_embedding)
+        )
+
     if not isinstance(result, Sequence) or len(result) != 1:
         raise ValueError("The embedding gateway returned an invalid query vector.")
     vector = result[0]
