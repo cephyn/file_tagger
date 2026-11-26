@@ -1,232 +1,269 @@
-# filepath: c:\Users\cephy\Documents\App Development\file_tagger\password_management.py
+from __future__ import annotations
+
 from PySide6.QtWidgets import (
     QDialog,
-    QVBoxLayout,
-    QHBoxLayout,
+    QGroupBox,
+    QInputDialog,
     QLabel,
     QLineEdit,
-    QPushButton,
-    QTabWidget,
     QMessageBox,
-    QWidget,
-    QInputDialog,
+    QPushButton,
+    QVBoxLayout,
 )
-from .config import Config, get_recovery_key
+
+from .config import Config
+from .domain.errors import (
+    CredentialFormatError,
+    CredentialRecoveryError,
+    PasswordEncryptionError,
+)
+from .infrastructure.app_paths import AppPaths
+from .security.password_reset import reset_encrypted_configuration
+from .security.password_vault import CredentialStatus, PasswordVault
 
 
-# Function to get the password from the user
-def get_password(parent=None):
-    """
-    Prompts the user for their password or retrieves a stored password.
-    Returns the password string or None if canceled.
-    """
+def get_password(parent=None) -> str | None:
     password, ok = QInputDialog.getText(
-        parent, "Password Required", "Enter your password:", QLineEdit.Password
+        parent,
+        "Password Required",
+        "Enter your password:",
+        QLineEdit.EchoMode.Password,
     )
-
-    if ok and password:
-        return password
-    return None
+    return password if ok and password else None
 
 
 class PasswordManagementDialog(QDialog):
-    def __init__(self, config: Config, parent=None):
+    def __init__(self, config: Config, parent=None) -> None:
         super().__init__(parent)
         self.config = config
-        self.initUI()
+        self._new_password: str | None = None
+        self.init_ui()
 
-    def initUI(self):
+    def init_ui(self) -> None:
         self.setWindowTitle("Password Management")
         self.setModal(True)
         layout = QVBoxLayout(self)
 
-        # Create tab widget
-        tab_widget = QTabWidget()
+        change_group = QGroupBox("Change Password")
+        change_layout = QVBoxLayout(change_group)
+        self.old_pass_input = _password_input("Current password")
+        self.new_pass_input = _password_input("New password")
+        self.confirm_pass_input = _password_input("Confirm new password")
+        change_button = QPushButton("Change Password")
+        change_button.clicked.connect(self.change_password)
+        change_layout.addWidget(self.old_pass_input)
+        change_layout.addWidget(self.new_pass_input)
+        change_layout.addWidget(self.confirm_pass_input)
+        change_layout.addWidget(change_button)
+        layout.addWidget(change_group)
 
-        # Change Password tab
-        change_tab = QWidget()
-        change_layout = QVBoxLayout(change_tab)
+        rotate_group = QGroupBox("Recovery Key")
+        rotate_layout = QVBoxLayout(rotate_group)
+        rotate_layout.addWidget(
+            QLabel(
+                "Recovery keys are shown only when created or rotated. "
+                "Rotating invalidates the previous key."
+            )
+        )
+        rotate_button = QPushButton("Rotate Recovery Key")
+        rotate_button.clicked.connect(self.rotate_recovery_key)
+        rotate_layout.addWidget(rotate_button)
+        layout.addWidget(rotate_group)
 
-        # Old password
-        old_pass_layout = QHBoxLayout()
-        old_pass_label = QLabel("Current Password:")
-        self.old_pass_input = QLineEdit()
-        self.old_pass_input.setEchoMode(QLineEdit.Password)
-        old_pass_layout.addWidget(old_pass_label)
-        old_pass_layout.addWidget(self.old_pass_input)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        layout.addWidget(close_button)
 
-        # New password
-        new_pass_layout = QHBoxLayout()
-        new_pass_label = QLabel("New Password:")
-        self.new_pass_input = QLineEdit()
-        self.new_pass_input.setEchoMode(QLineEdit.Password)
-        new_pass_layout.addWidget(new_pass_label)
-        new_pass_layout.addWidget(self.new_pass_input)
-
-        # Confirm new password
-        confirm_pass_layout = QHBoxLayout()
-        confirm_pass_label = QLabel("Confirm Password:")
-        self.confirm_pass_input = QLineEdit()
-        self.confirm_pass_input.setEchoMode(QLineEdit.Password)
-        confirm_pass_layout.addWidget(confirm_pass_label)
-        confirm_pass_layout.addWidget(self.confirm_pass_input)
-
-        # Change password button
-        change_btn = QPushButton("Change Password")
-        change_btn.clicked.connect(self.change_password)
-
-        # Add to change password tab
-        change_layout.addLayout(old_pass_layout)
-        change_layout.addLayout(new_pass_layout)
-        change_layout.addLayout(confirm_pass_layout)
-        change_layout.addWidget(change_btn)
-        change_layout.addStretch()
-
-        # Recovery tab
-        recovery_tab = QWidget()
-        recovery_layout = QVBoxLayout(recovery_tab)
-
-        # Recovery key section
-        key_layout = QHBoxLayout()
-        key_label = QLabel("Recovery Key:")
-        self.key_input = QLineEdit()
-        key_layout.addWidget(key_label)
-        key_layout.addWidget(self.key_input)
-
-        # New password for recovery
-        recovery_pass_layout = QHBoxLayout()
-        recovery_pass_label = QLabel("New Password:")
-        self.recovery_pass_input = QLineEdit()
-        self.recovery_pass_input.setEchoMode(QLineEdit.Password)
-        recovery_pass_layout.addWidget(recovery_pass_label)
-        recovery_pass_layout.addWidget(self.recovery_pass_input)
-
-        # Confirm new password for recovery
-        recovery_confirm_layout = QHBoxLayout()
-        recovery_confirm_label = QLabel("Confirm Password:")
-        self.recovery_confirm_input = QLineEdit()
-        self.recovery_confirm_input.setEchoMode(QLineEdit.Password)
-        recovery_confirm_layout.addWidget(recovery_confirm_label)
-        recovery_confirm_layout.addWidget(self.recovery_confirm_input)
-
-        # Recover button
-        recover_btn = QPushButton("Recover Access")
-        recover_btn.clicked.connect(self.recover_password)
-
-        # Show recovery key button
-        show_key_btn = QPushButton("Show My Recovery Key")
-        show_key_btn.clicked.connect(self.show_recovery_key)
-
-        # Reset recovery key button
-        reset_key_btn = QPushButton("Reset Recovery Key")
-        reset_key_btn.clicked.connect(self.reset_recovery_key)
-
-        # Add to recovery tab
-        recovery_layout.addLayout(key_layout)
-        recovery_layout.addLayout(recovery_pass_layout)
-        recovery_layout.addLayout(recovery_confirm_layout)
-        recovery_layout.addWidget(recover_btn)
-        recovery_layout.addWidget(show_key_btn)
-        recovery_layout.addWidget(reset_key_btn)
-        recovery_layout.addStretch()
-
-        # Add tabs to widget
-        tab_widget.addTab(change_tab, "Change Password")
-        tab_widget.addTab(recovery_tab, "Recovery")
-
-        # Add tab widget to main layout
-        layout.addWidget(tab_widget)
-
-        # Add close button
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.reject)
-        layout.addWidget(close_btn)
-
-    def change_password(self):
-        old_pass = self.old_pass_input.text()
-        new_pass = self.new_pass_input.text()
-        confirm_pass = self.confirm_pass_input.text()
-
-        if not old_pass or not new_pass or not confirm_pass:
-            QMessageBox.warning(self, "Error", "All fields are required")
+    def change_password(self) -> None:
+        old_password = self.old_pass_input.text()
+        new_password = self.new_pass_input.text()
+        confirm_password = self.confirm_pass_input.text()
+        if not old_password or not new_password or not confirm_password:
+            QMessageBox.warning(self, "Error", "All fields are required.")
             return
-
-        if new_pass != confirm_pass:
-            QMessageBox.warning(self, "Error", "New passwords do not match")
+        if new_password != confirm_password:
+            QMessageBox.warning(self, "Error", "New passwords do not match.")
             return
-
-        if self.config.change_password(old_pass, new_pass):
-            QMessageBox.information(self, "Success", "Password changed successfully")
+        if self.config.change_password(old_password, new_password):
+            QMessageBox.information(self, "Success", "Password changed successfully.")
             self.accept()
         else:
-            QMessageBox.warning(self, "Error", "Current password is incorrect")
+            QMessageBox.warning(self, "Error", "Current password is incorrect.")
 
-    def recover_password(self):
-        recovery_key = self.key_input.text()
-        new_pass = self.recovery_pass_input.text()
-        confirm_pass = self.recovery_confirm_input.text()
-
-        if not recovery_key or not new_pass or not confirm_pass:
-            QMessageBox.warning(self, "Error", "All fields are required")
-            return
-
-        if new_pass != confirm_pass:
-            QMessageBox.warning(self, "Error", "New passwords do not match")
-            return
-
-        if self.config.recover_password(recovery_key, new_pass):
-            QMessageBox.information(
-                self,
-                "Success",
-                "Access recovered successfully\n"
-                "Please restart the application to continue",
-            )
-            self.accept()
-        else:
-            QMessageBox.warning(self, "Error", "Invalid recovery key")
-
-    def show_recovery_key(self):
-        current_pass, ok = QInputDialog.getText(
+    def rotate_recovery_key(self) -> None:
+        current_password, ok = QInputDialog.getText(
             self,
             "Verify Password",
-            "Enter current password to view recovery key:",
-            QLineEdit.Password,
+            "Enter current password to rotate the recovery key:",
+            QLineEdit.EchoMode.Password,
         )
-
-        if not ok or not current_pass:
+        if not ok or not current_password:
             return
-
-        recovery_key = get_recovery_key(current_pass)
-        if recovery_key:
-            QMessageBox.information(
-                self,
-                "Recovery Key",
-                f"Your recovery key is:\n\n{recovery_key}\n\n"
-                "Store this key in a safe place. You will need it if you "
-                "forget your password.",
-            )
-        else:
-            QMessageBox.warning(self, "Error", "Incorrect password")
-
-    def reset_recovery_key(self):
-        current_pass, ok = QInputDialog.getText(
+        try:
+            recovery_key = self.config.rotate_recovery_key(current_password)
+        except (
+            CredentialFormatError,
+            CredentialRecoveryError,
+            PasswordEncryptionError,
+        ):
+            QMessageBox.warning(self, "Error", "Current password is incorrect.")
+            return
+        QMessageBox.information(
             self,
-            "Verify Password",
-            "Enter current password to reset recovery key:",
-            QLineEdit.Password,
+            "New Recovery Key",
+            f"Your new recovery key is:\n\n{recovery_key}\n\n"
+            "Store this key in a safe place. It will not be shown again, "
+            "and the previous recovery key is now invalid.",
         )
 
-        if not ok or not current_pass:
-            return
 
-        success, new_key = self.config.reset_recovery_key(current_pass)
-        if success:
-            QMessageBox.information(
-                self,
-                "Success",
-                f"Your new recovery key is:\n\n{new_key}\n\n"
-                "Store this key in a safe place. You will need it if you "
-                "forget your password. The old recovery key is no longer valid.",
+class PasswordRecoveryDialog(QDialog):
+    def __init__(self, parent=None, paths: AppPaths | None = None) -> None:
+        super().__init__(parent)
+        self.paths = paths or AppPaths.discover()
+        self._new_password: str | None = None
+        self._new_recovery_key: str | None = None
+        self._init_ui()
+
+    @property
+    def new_password(self) -> str | None:
+        return self._new_password
+
+    @property
+    def new_recovery_key(self) -> str | None:
+        return self._new_recovery_key
+
+    def _init_ui(self) -> None:
+        self.setWindowTitle("Password Recovery")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        recover_group = QGroupBox("Recover with key")
+        recover_layout = QVBoxLayout(recover_group)
+        self.recovery_key_input = QLineEdit()
+        self.recovery_key_input.setPlaceholderText("Recovery key")
+        self.recover_new_password_input = _password_input("New password")
+        self.recover_confirm_password_input = _password_input(
+            "Confirm new password"
+        )
+        self.recover_button = QPushButton("Recover Password")
+        self.recover_button.clicked.connect(self.recover_password)
+        recover_layout.addWidget(self.recovery_key_input)
+        recover_layout.addWidget(self.recover_new_password_input)
+        recover_layout.addWidget(self.recover_confirm_password_input)
+        recover_layout.addWidget(self.recover_button)
+        layout.addWidget(recover_group)
+
+        reset_group = QGroupBox("Reset configuration")
+        reset_layout = QVBoxLayout(reset_group)
+        reset_layout.addWidget(
+            QLabel(
+                "Reset is destructive to encrypted settings and stored credentials. "
+                "Tag databases and search data are preserved. Quarantined files "
+                "remain available for manual recovery."
             )
-        else:
-            QMessageBox.warning(self, "Error", "Incorrect password")
+        )
+        self.reset_new_password_input = _password_input("New password")
+        self.reset_confirm_password_input = _password_input(
+            "Confirm new password"
+        )
+        self.reset_confirmation_input = QLineEdit()
+        self.reset_confirmation_input.setPlaceholderText("Type RESET to confirm")
+        self.reset_button = QPushButton("Reset Configuration")
+        self.reset_button.clicked.connect(self.reset_configuration)
+        reset_layout.addWidget(self.reset_new_password_input)
+        reset_layout.addWidget(self.reset_confirm_password_input)
+        reset_layout.addWidget(self.reset_confirmation_input)
+        reset_layout.addWidget(self.reset_button)
+        layout.addWidget(reset_group)
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        layout.addWidget(cancel_button)
+        self._apply_credential_status()
+
+    def _apply_credential_status(self) -> None:
+        status = PasswordVault.status(self.paths)
+        messages = {
+            CredentialStatus.ENVELOPE: (
+                "Enter the recovery key that was shown when File Tagger was set up "
+                "or the key was rotated."
+            ),
+            CredentialStatus.LEGACY: (
+                "The legacy recovery key cannot recover this installation because "
+                "it was encrypted with the forgotten password. Use Reset configuration "
+                "if the old password is unavailable."
+            ),
+            CredentialStatus.CORRUPT: (
+                "Credential metadata is missing, corrupt, or unsupported. Recovery is "
+                "disabled to protect existing files; Reset configuration is available."
+            ),
+            CredentialStatus.UNINITIALIZED: (
+                "No password-protected configuration has been initialized. Recovery "
+                "is unavailable, but the configuration can be reset."
+            ),
+        }
+        self.status_label.setText(messages[status])
+        self.recover_button.setEnabled(status is CredentialStatus.ENVELOPE)
+
+    def recover_password(self) -> None:
+        recovery_key = self.recovery_key_input.text().strip()
+        new_password = self.recover_new_password_input.text()
+        confirm_password = self.recover_confirm_password_input.text()
+        if not recovery_key or not new_password or not confirm_password:
+            QMessageBox.warning(self, "Error", "All fields are required.")
+            return
+        if new_password != confirm_password:
+            QMessageBox.warning(self, "Error", "New passwords do not match.")
+            return
+        try:
+            PasswordVault.recover(self.paths, recovery_key, new_password)
+        except (CredentialFormatError, CredentialRecoveryError):
+            QMessageBox.warning(
+                self,
+                "Recovery Failed",
+                "The recovery key is invalid or the credential metadata cannot be used. "
+                "Existing configuration was not changed.",
+            )
+            return
+        self._new_password = new_password
+        self.accept()
+
+    def reset_configuration(self) -> None:
+        new_password = self.reset_new_password_input.text()
+        confirm_password = self.reset_confirm_password_input.text()
+        if not new_password or not confirm_password:
+            QMessageBox.warning(self, "Error", "All fields are required.")
+            return
+        if new_password != confirm_password:
+            QMessageBox.warning(self, "Error", "New passwords do not match.")
+            return
+        if self.reset_confirmation_input.text() != "RESET":
+            QMessageBox.warning(
+                self, "Confirmation Required", 'Type "RESET" exactly to continue.'
+            )
+            return
+        try:
+            result = reset_encrypted_configuration(self.paths, new_password)
+        except CredentialRecoveryError:
+            QMessageBox.warning(
+                self,
+                "Reset Failed",
+                "The reset could not be completed safely. Existing files were "
+                "restored where possible; inspect the password-reset backup before retrying.",
+            )
+            return
+        self._new_password = new_password
+        self._new_recovery_key = result.recovery_key
+        self.accept()
+
+
+def _password_input(placeholder: str) -> QLineEdit:
+    widget = QLineEdit()
+    widget.setPlaceholderText(placeholder)
+    widget.setEchoMode(QLineEdit.EchoMode.Password)
+    return widget

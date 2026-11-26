@@ -1,10 +1,12 @@
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                            QLineEdit, QPushButton, QFrame, QProgressBar, QDialog)
+                            QLineEdit, QPushButton, QFrame, QProgressBar, QDialog,
+                            QMessageBox)
 from PySide6.QtCore import Qt, Signal
 import logging
 import traceback
 from .initialization import InitializationWorker
 from .infrastructure.app_paths import AppPaths
+from .password_management import PasswordRecoveryDialog
 
 # Configure additional logging for login process
 logger = logging.getLogger("Login")
@@ -150,6 +152,10 @@ class LoginScreen(QWidget):
         self.login_button.setStyleSheet("padding: 8px;")
         self.login_button.clicked.connect(self.submit_password)
         password_layout.addWidget(self.login_button)
+
+        self.forgot_password_button = QPushButton("Forgot password")
+        self.forgot_password_button.clicked.connect(self.show_password_recovery)
+        password_layout.addWidget(self.forgot_password_button)
         
         # Error message label
         self.error_label = QLabel()
@@ -213,6 +219,21 @@ class LoginScreen(QWidget):
         """Show the About dialog."""
         dialog = AboutDialog(self)
         dialog.exec()
+
+    def show_password_recovery(self):
+        """Recover or reset access, then retry login with the new password."""
+        dialog = PasswordRecoveryDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.new_password:
+            return
+        if dialog.new_recovery_key:
+            QMessageBox.information(
+                self,
+                "Save Your Recovery Key",
+                f"Your new recovery key is:\n\n{dialog.new_recovery_key}\n\n"
+                "Store it somewhere safe. It will not be shown again.",
+            )
+        self.password_input.setText(dialog.new_password)
+        self.submit_password()
     
     def submit_password(self):
         """Handle password submission."""
@@ -225,6 +246,7 @@ class LoginScreen(QWidget):
         # Hide password section and show progress
         self.password_input.setEnabled(False)
         self.login_button.setEnabled(False)
+        self.forgot_password_button.setEnabled(False)
         self.error_label.setVisible(False)
         self.progress_frame.setVisible(True)
         
@@ -314,6 +336,7 @@ class LoginScreen(QWidget):
         self.error_label.setVisible(True)
         self.password_input.setEnabled(True)
         self.login_button.setEnabled(True)
+        self.forgot_password_button.setEnabled(True)
         self.password_input.selectAll()
         self.password_input.setFocus()
     
