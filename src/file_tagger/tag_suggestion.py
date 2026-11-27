@@ -51,7 +51,7 @@ def _modern_file_tags(file_obj: File) -> list[Tag]:
     tags: list[Tag] = []
     for item in file_obj.tags:
         tag = getattr(item, "tag", item)
-        if tag:
+        if isinstance(tag, Tag):
             tags.append(tag)
     return tags
 
@@ -168,6 +168,14 @@ class TagSuggester:
             if selected_cache is None:
                 cache_session = search_session
                 selected_cache = DatabaseTagRecommendationCache(cache_session)
+            if self.modern_runtime is not None:
+                wait_for_readiness = getattr(
+                    self.modern_runtime,
+                    "wait_for_readiness",
+                    None,
+                )
+                if callable(wait_for_readiness):
+                    wait_for_readiness(timeout_seconds=30.0)
             embedding_profile = _runtime_embedding_profile(self.modern_runtime)
             candidate_model = _runtime_selected_model(
                 self.modern_runtime,
@@ -193,9 +201,7 @@ class TagSuggester:
                     cache=selected_cache,
                 )
             elif candidate_model is None or decision_model is None:
-                raise ValueError(
-                    "Modern runtime model selection is incomplete."
-                )
+                raise ValueError(_runtime_selection_error(self.modern_runtime))
             else:
                 runtime_candidate_gateway = getattr(
                     self.modern_runtime,
@@ -391,6 +397,42 @@ def _runtime_selected_model(runtime: Any | None, role: str) -> str | None:
         return None
     profile = report.selected_profile(role)
     return profile.model if profile is not None else None
+
+
+def _runtime_selection_error(runtime: Any) -> str:
+    provider = _runtime_provider(runtime)
+    report = getattr(runtime, "readiness", None)
+    if report is None:
+        reason = getattr(runtime, "unavailable_reason", None)
+        if isinstance(reason, str) and reason.strip():
+            if provider == "gemini":
+                return f"Gemini readiness is unavailable: {reason}"
+            return f"Modern runtime model selection is incomplete: {reason}"
+        if provider == "gemini":
+            return (
+                "Gemini readiness is unavailable: Gemini readiness has not completed."
+            )
+        return "Modern runtime model selection is incomplete."
+
+    if provider == "gemini":
+        gemini = getattr(report, "gemini", None)
+        if gemini is not None and getattr(gemini, "missing_key", False):
+            return "Gemini readiness is unavailable: Gemini API key is not configured."
+        reasons = list(getattr(report, "errors", ()) or ())
+        reasons.extend(getattr(report, "instructions", ()) or ())
+        if gemini is not None:
+            reasons.extend(getattr(gemini, "errors", ()) or ())
+        for reason in reasons:
+            if isinstance(reason, str) and reason.strip():
+                return f"Gemini readiness is unavailable: {reason}"
+        return "Gemini readiness is unavailable: Gemini model selection is incomplete."
+
+    reasons = list(getattr(report, "errors", ()) or ())
+    reasons.extend(getattr(report, "instructions", ()) or ())
+    for reason in reasons:
+        if isinstance(reason, str) and reason.strip():
+            return f"Modern runtime model selection is incomplete: {reason}"
+    return "Modern runtime model selection is incomplete."
 
 
 class _LegacyTagRecommendationCache:

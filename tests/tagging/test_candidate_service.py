@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event, inspect, text
 
-from file_tagger.domain.contracts import ModelProfile, TagDecision
+from file_tagger.domain.contracts import GeminiReadiness, ModelProfile, TagDecision
 from file_tagger.domain.errors import (
     EmbeddingContextRejectedError,
     GenerationContextRejectedError,
@@ -130,7 +130,6 @@ class FakeGateway:
 
 def test_gemini_candidate_and_decision_models_use_injected_gateways() -> None:
     candidate_gateway = FakeGateway(["flooded ruin"])
-    decision_gateway = FakeGateway([])
 
     class DecisionOnlyGateway:
         def __init__(self) -> None:
@@ -1404,6 +1403,85 @@ def test_production_tag_suggester_rejects_incomplete_runtime_selection(
         TagSuggester(
             SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
             gateway=FakeGateway(["generated"]),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_production_tag_suggester_reports_gemini_readiness_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    factory = create_session_factory(paths.database)
+    source = tmp_path / "gemini-readiness.txt"
+    source.write_text("gemini readiness", encoding="utf-8")
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        candidate_model=None,
+        decision_model=None,
+        embedding_profile=None,
+        readiness=ReadinessReport(
+            ready=False,
+            provider="gemini",
+            blocked_model_roles=("embedding", "decision", "generation"),
+            errors=("Gemini authentication failed.",),
+            gemini=GeminiReadiness(
+                available=False,
+                key_configured=True,
+                api_key_configured=True,
+                missing_key=False,
+                errors=("Gemini authentication failed.",),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Gemini authentication failed",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_production_tag_suggester_reports_gemini_readiness_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    factory = create_session_factory(paths.database)
+    source = tmp_path / "gemini-initializing.txt"
+    source.write_text("gemini initializing", encoding="utf-8")
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        candidate_model=None,
+        decision_model=None,
+        embedding_profile=None,
+        readiness=None,
+        unavailable_reason="Gemini readiness is still being checked.",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Gemini readiness is still being checked",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
             cache=InMemoryTagRecommendationCache(),
             modern_runtime=runtime,
         ).recommend_tags_for_file(str(source))

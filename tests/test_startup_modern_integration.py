@@ -132,6 +132,26 @@ class ProviderConfig:
         self.api_key = None
 
 
+def test_modern_runtime_wait_for_readiness_returns_published_report(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    runtime = ModernRuntime(paths, None)
+    report = ReadinessReport(ready=False, provider="gemini")
+    runtime.readiness = report
+
+    class ActiveThread:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout: float) -> None:
+            del timeout
+
+    runtime._readiness_thread = ActiveThread()  # type: ignore[assignment]
+
+    assert runtime.wait_for_readiness(timeout_seconds=0.01) is report
+
+
 def test_modern_runtime_seeds_active_gemini_provider_and_key(
     tmp_path, monkeypatch
 ) -> None:

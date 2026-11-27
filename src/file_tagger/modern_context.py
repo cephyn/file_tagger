@@ -376,6 +376,18 @@ class ModernRuntime:
         thread.start()
         return completion
 
+    def wait_for_readiness(
+        self,
+        timeout_seconds: float = 30.0,
+    ) -> ReadinessReport | None:
+        if timeout_seconds <= 0:
+            return self.readiness
+        with self._lock:
+            thread = self._readiness_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, timeout_seconds))
+        return self.readiness
+
     def apply_provider(
         self,
         provider: str,
