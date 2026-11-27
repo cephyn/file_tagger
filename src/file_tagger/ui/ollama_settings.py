@@ -308,7 +308,7 @@ class OllamaSettingsDialog(QDialog):
                 self.gemini_readiness_status.setText(
                     "Not configured. Enter a key, then save to refresh Gemini readiness."
                 )
-            self.ok_button.setEnabled(False)
+            self.ok_button.setEnabled(True)
         else:
             self.gemini_readiness_status.setText("")
             self.set_report(self._report)
@@ -420,7 +420,7 @@ class OllamaSettingsDialog(QDialog):
                 status = "Not ready"
             self.gemini_readiness_status.setText(status)
             self._refresh_gemini_key_status()
-            self.ok_button.setEnabled(gemini_ready)
+            self.ok_button.setEnabled(True)
             return
         if report.hardware is not None:
             self._hardware = report.hardware
@@ -674,12 +674,7 @@ class OllamaSettingsDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event: Any) -> None:
-        if not self._apply_provider_changes():
-            event.ignore()
-            return
-        if not self._apply_selection_changes():
-            event.ignore()
-            return
+        self._selections_dirty = False
         super().closeEvent(event)
 
     def refresh(self) -> None:
@@ -841,12 +836,20 @@ class OllamaSettingsDialog(QDialog):
         if isinstance(latest, ReadinessReport):
             self.set_report(latest)
         elif error is not None:
-            self.ok_button.setEnabled(False)
+            if self.provider_selector.currentText().lower() == "gemini":
+                self.gemini_readiness_status.setText("Not ready")
+                self.ok_button.setEnabled(True)
+            else:
+                self.ok_button.setEnabled(False)
             self.instructions.setText(
                 f"Refresh failed: {error.__class__.__name__}: {error}"
             )
         else:
-            self.ok_button.setEnabled(False)
+            if self.provider_selector.currentText().lower() == "gemini":
+                self.gemini_readiness_status.setText("Not ready")
+                self.ok_button.setEnabled(True)
+            else:
+                self.ok_button.setEnabled(False)
             reason = getattr(
                 self._refresh_provider,
                 "unavailable_reason",
@@ -860,9 +863,12 @@ class OllamaSettingsDialog(QDialog):
         self.refresh_button.setEnabled(
             self._refresh_provider is not None and not refreshing
         )
-        self.ok_button.setEnabled(
-            self.ok_button.isEnabled() and not refreshing
-        )
+        if self.provider_selector.currentText().lower() == "gemini":
+            self.ok_button.setEnabled(True)
+        else:
+            self.ok_button.setEnabled(
+                self.ok_button.isEnabled() and not refreshing
+            )
         for selector in self.model_selectors.values():
             selector.setEnabled(selector.isEnabled() and not refreshing)
         if refreshing:
