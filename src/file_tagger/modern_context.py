@@ -93,6 +93,8 @@ class _FreshOllamaEmbeddingGateway:
 class _FreshGeminiEmbeddingGateway:
     """Create and close one Gemini gateway per event-loop invocation."""
 
+    provider = "gemini"
+
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
 

@@ -41,6 +41,8 @@ def _profile_digest(model: str, canonical_profile: str) -> str:
 
 
 class GeminiGateway:
+    provider = "gemini"
+
     def __init__(
         self,
         api_key: str,

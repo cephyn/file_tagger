@@ -163,13 +163,15 @@ class RagService:
             raise GeminiUnavailableError(
                 "The Gemini generation gateway is unavailable."
             )
-        if (
+        exact_gemini_embedding_profile = (
             embedding_profile is not None
             and embedding_profile.model == GEMINI_EMBEDDING_MODEL
-            and (
-                embedding_gateway is None
-                or isinstance(embedding_gateway, OllamaGateway)
-            )
+        )
+        if exact_gemini_embedding_profile and (
+            embedding_gateway is None
+            or embedding_gateway is gateway
+            or isinstance(embedding_gateway, OllamaGateway)
+            or getattr(embedding_gateway, "provider", None) != "gemini"
         ):
             raise GeminiUnavailableError(
                 "The Gemini embedding gateway is unavailable."
@@ -181,7 +183,11 @@ class RagService:
         self.evidence_limit = evidence_limit
         self.per_query_limit = per_query_limit
         self.max_sections_per_file = max_sections_per_file
-        self._embedding_gateway = embedding_gateway or gateway or self._gateway
+        self._embedding_gateway = (
+            embedding_gateway
+            if exact_gemini_embedding_profile
+            else embedding_gateway or gateway or self._gateway
+        )
         self._embedding_profile = embedding_profile
         self._model_digest = model_digest
         self._index_version = index_version

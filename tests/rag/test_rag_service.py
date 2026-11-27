@@ -9,6 +9,7 @@ from file_tagger.adapters.gemini.gateway import (
     GEMINI_EMBEDDING_MODEL,
     GEMINI_GENERATION_MODEL,
 )
+from file_tagger.adapters.ollama.gateway import OllamaGateway
 from file_tagger.domain.contracts import ModelProfile
 from file_tagger.domain.errors import (
     GenerationContextRejectedError,
@@ -123,6 +124,8 @@ def test_gemini_rag_routes_planning_embedding_and_generation_gateways() -> None:
             return evidence
 
     class GeminiEmbeddingGateway:
+        provider = "gemini"
+
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
@@ -258,7 +261,7 @@ def test_exact_gemini_embedding_model_without_gateway_raises_unavailable(
         )
 
 
-def test_exact_gemini_embedding_profile_rejects_generation_gateway_as_embedding_gateway() -> None:
+def test_exact_gemini_embedding_profile_rejects_missing_embedding_gateway() -> None:
     generation_gateway = ProfiledFakeModel("{}")
     profile = ModelProfile(
         role="embedding",
@@ -282,10 +285,36 @@ def test_exact_gemini_embedding_profile_rejects_generation_gateway_as_embedding_
         )
 
 
-def test_exact_gemini_embedding_profile_accepts_distinct_embedding_gateway() -> None:
+def test_exact_gemini_embedding_profile_rejects_generation_gateway_as_embedding_gateway() -> None:
+    generation_gateway = ProfiledFakeModel("{}")
+    profile = ModelProfile(
+        role="embedding",
+        model=GEMINI_EMBEDDING_MODEL,
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        RagService(
+            search=object(),
+            gateway=generation_gateway,
+            embedding_gateway=generation_gateway,
+            model=GEMINI_GENERATION_MODEL,
+            embedding_profile=profile,
+        )
+
+
+def test_exact_gemini_embedding_profile_accepts_gemini_embedding_gateway() -> None:
     generation_gateway = ProfiledFakeModel("{}")
 
-    class DistinctEmbeddingGateway:
+    class GeminiEmbeddingGateway:
+        provider = "gemini"
+
         async def embed(
             self,
             model: str,
@@ -297,7 +326,7 @@ def test_exact_gemini_embedding_profile_accepts_distinct_embedding_gateway() -> 
         ) -> tuple[tuple[float, ...], ...]:
             return ((0.0,),)
 
-    embedding_gateway = DistinctEmbeddingGateway()
+    embedding_gateway = GeminiEmbeddingGateway()
     profile = ModelProfile(
         role="embedding",
         model=GEMINI_EMBEDDING_MODEL,
@@ -316,6 +345,67 @@ def test_exact_gemini_embedding_profile_accepts_distinct_embedding_gateway() -> 
     )
 
     assert service._embedding_gateway is embedding_gateway
+
+
+def test_exact_gemini_embedding_profile_rejects_gateway_without_gemini_provider() -> None:
+    generation_gateway = ProfiledFakeModel("{}")
+
+    class DuckTypedEmbeddingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            return ((0.0,),)
+
+    profile = ModelProfile(
+        role="embedding",
+        model=GEMINI_EMBEDDING_MODEL,
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        RagService(
+            search=object(),
+            gateway=generation_gateway,
+            embedding_gateway=DuckTypedEmbeddingGateway(),
+            model=GEMINI_GENERATION_MODEL,
+            embedding_profile=profile,
+        )
+
+
+def test_exact_gemini_embedding_profile_rejects_ollama_embedding_gateway() -> None:
+    generation_gateway = ProfiledFakeModel("{}")
+    profile = ModelProfile(
+        role="embedding",
+        model=GEMINI_EMBEDDING_MODEL,
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        RagService(
+            search=object(),
+            gateway=generation_gateway,
+            embedding_gateway=OllamaGateway(),
+            model=GEMINI_GENERATION_MODEL,
+            embedding_profile=profile,
+        )
 
 
 def test_answer_without_valid_citation_is_rejected() -> None:
