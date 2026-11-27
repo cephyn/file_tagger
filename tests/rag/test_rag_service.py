@@ -8,6 +8,7 @@ import pytest
 from file_tagger.domain.contracts import ModelProfile
 from file_tagger.domain.errors import (
     GenerationContextRejectedError,
+    GeminiUnavailableError,
     StructuredOutputError,
 )
 from file_tagger.rag.planner import SearchPlan
@@ -207,6 +208,50 @@ def test_gemini_rag_routes_planning_embedding_and_generation_gateways() -> None:
     assert [call["model"] for call in generation_gateway.chat_calls] == [
         "gemini-4-hydrogen"
     ]
+
+
+def test_exact_gemini_generation_model_without_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.rag.service as rag_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(rag_service, "OllamaGateway", unexpected_ollama_gateway)
+
+    with pytest.raises(GeminiUnavailableError):
+        answer_question(
+            "Find encounters",
+            _evidence(),
+            model="gemini-4-hydrogen",
+        )
+
+
+def test_exact_gemini_embedding_model_without_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.rag.service as rag_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(rag_service, "OllamaGateway", unexpected_ollama_gateway)
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        RagService(
+            search=object(),
+            model="gemma4:e4b",
+            embedding_profile=profile,
+        )
 
 
 def test_answer_without_valid_citation_is_rejected() -> None:

@@ -6,10 +6,12 @@ import unicodedata
 
 from pydantic import AliasChoices, ConfigDict, Field, ValidationError, field_validator
 
+from ..adapters.gemini.gateway import GEMINI_GENERATION_MODEL
 from ..adapters.ollama.gateway import OllamaGateway
 from ..domain.contracts import DomainRecord, ModelProfile
 from ..domain.errors import (
     GenerationContextRejectedError,
+    GeminiUnavailableError,
     ModelIncompatibleError,
     ModelMissingError,
     StructuredOutputError,
@@ -173,6 +175,19 @@ async def build_search_plan_async(
         model,
         fallback_model,
     )
+    if (
+        gateway is None
+        or isinstance(gateway, OllamaGateway)
+    ) and (
+        checked_model == GEMINI_GENERATION_MODEL
+        or (
+            checked_fallback is not None
+            and checked_fallback == GEMINI_GENERATION_MODEL
+        )
+    ):
+        raise GeminiUnavailableError(
+            "The Gemini generation gateway is unavailable."
+        )
     context = normalize_markdown_context(markdown_context)
     owns_gateway = gateway is None
     selected_gateway: PlannerGateway = gateway or OllamaGateway()

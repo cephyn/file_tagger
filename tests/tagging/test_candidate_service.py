@@ -15,6 +15,7 @@ from file_tagger.domain.contracts import ModelProfile, TagDecision
 from file_tagger.domain.errors import (
     EmbeddingContextRejectedError,
     GenerationContextRejectedError,
+    GeminiUnavailableError,
 )
 from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
 from file_tagger.infrastructure.database import create_session_factory, upgrade_database
@@ -184,6 +185,65 @@ def test_gemini_candidate_and_decision_models_use_injected_gateways() -> None:
         "gemini-decision-1"
     ]
     assert {item.tag for item in result.decisions} == {"flooded ruin"}
+
+
+def test_exact_gemini_candidate_model_without_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.tagging.candidate_service as candidate_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(
+        candidate_service,
+        "OllamaGateway",
+        unexpected_ollama_gateway,
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-no-candidate-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="gemini-4-hydrogen",
+            decision_model="gemini-decision-1",
+        )
+
+
+def test_exact_gemini_embedding_model_without_embedding_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.tagging.candidate_service as candidate_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(
+        candidate_service,
+        "OllamaGateway",
+        unexpected_ollama_gateway,
+    )
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-no-embedding-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+            embedding_profile=profile,
+        )
 
 
 def test_tag_query_embedding_splits_context_rejections() -> None:
@@ -1320,6 +1380,7 @@ def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
     )
     explicit_candidate = object()
     explicit_decision = object()
+    runtime_embedding = object()
     captured: dict[str, Any] = {}
 
     class CapturingCandidateService:
@@ -1337,7 +1398,7 @@ def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
         decision_model="gemini-decision-1",
         candidate_gateway=object(),
         decision_gateway=object(),
-        embedding_gateway=object(),
+        embedding_gateway=runtime_embedding,
     )
 
     TagSuggester(
@@ -1350,7 +1411,57 @@ def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
 
     assert captured["gateway"] is explicit_candidate
     assert captured["decision_gateway"] is explicit_decision
-    assert captured["embedding_gateway"] is explicit_candidate
+    assert captured["embedding_gateway"] is runtime_embedding
+
+
+def test_tag_suggester_explicit_embedding_gateway_overrides_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "explicit-embedding-routing.sqlite")
+    source = tmp_path / "explicit-embedding-routing.txt"
+    source.write_text("explicit embedding routing", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    explicit_embedding = object()
+    runtime_embedding = object()
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=object(),
+        decision_gateway=object(),
+        embedding_gateway=runtime_embedding,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        embedding_gateway=explicit_embedding,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["embedding_gateway"] is explicit_embedding
 
 
 def test_runtime_helpers_do_not_fall_back_to_stale_readiness_report() -> None:

@@ -7,7 +7,7 @@ import pytest
 
 from file_tagger.adapters.ollama.gateway import OllamaGateway
 from file_tagger.domain.contracts import TagDecision
-from file_tagger.domain.errors import ModelIncompatibleError
+from file_tagger.domain.errors import GeminiUnavailableError, ModelIncompatibleError
 from file_tagger.tagging.cache import CachedTagRecommendations
 from file_tagger.tagging.decision_service import decide_tags
 
@@ -85,6 +85,28 @@ def test_gemini_decision_model_uses_injected_gateway() -> None:
 
     assert [decision.tag for decision in result.accepted] == ["dungeon"]
     assert gateway.calls[0]["model"] == "gemini-decision-1"
+
+
+def test_exact_gemini_decision_model_without_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.tagging.decision_service as decision_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(
+        decision_service,
+        "OllamaGateway",
+        unexpected_ollama_gateway,
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        decide_tags(
+            "encounter table",
+            ["dungeon"],
+            model="gemini-decision-1",
+        )
 
 
 @pytest.mark.parametrize("model", ["nimble:9b", "tev1:4b", "tev1:0.8b"])

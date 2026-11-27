@@ -18,10 +18,15 @@ import unicodedata
 
 from pydantic import ValidationError
 
+from ..adapters.gemini.gateway import (
+    GEMINI_EMBEDDING_MODEL,
+    GEMINI_GENERATION_MODEL,
+)
 from ..adapters.ollama.gateway import OllamaGateway
 from ..domain.contracts import ModelProfile
 from ..domain.errors import (
     GenerationContextRejectedError,
+    GeminiUnavailableError,
     ModelIncompatibleError,
     StructuredOutputError,
     UncitedAnswerError,
@@ -151,6 +156,27 @@ class RagService:
             raise ValueError("The per-file evidence limit must be positive.")
         if not isinstance(model, str) or not model.strip():
             raise ValueError("A generation model name is required.")
+        if (
+            model.strip() == GEMINI_GENERATION_MODEL
+            and (gateway is None or isinstance(gateway, OllamaGateway))
+        ):
+            raise GeminiUnavailableError(
+                "The Gemini generation gateway is unavailable."
+            )
+        if (
+            embedding_profile is not None
+            and embedding_profile.model == GEMINI_EMBEDDING_MODEL
+            and (
+                (
+                    embedding_gateway is None
+                    and (gateway is None or isinstance(gateway, OllamaGateway))
+                )
+                or isinstance(embedding_gateway, OllamaGateway)
+            )
+        ):
+            raise GeminiUnavailableError(
+                "The Gemini embedding gateway is unavailable."
+            )
         self._search = search
         self._gateway: GenerationGateway = gateway or OllamaGateway()
         self._planner = planner
@@ -1172,6 +1198,13 @@ async def answer_question_async(
 ) -> CitedAnswer:
     checked_question = _validate_question(question)
     checked_model = _validate_model(model)
+    if (
+        checked_model == GEMINI_GENERATION_MODEL
+        and (gateway is None or isinstance(gateway, OllamaGateway))
+    ):
+        raise GeminiUnavailableError(
+            "The Gemini generation gateway is unavailable."
+        )
     selected = _bounded_evidence(
         _coerce_evidence(evidence),
         limit=DEFAULT_EVIDENCE_LIMIT,

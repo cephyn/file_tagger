@@ -9,11 +9,17 @@ import unicodedata
 
 from pydantic import AliasChoices, ConfigDict, Field, TypeAdapter
 
+from ..adapters.gemini.gateway import (
+    GEMINI_DECISION_MODEL,
+    GEMINI_EMBEDDING_MODEL,
+    GEMINI_GENERATION_MODEL,
+)
 from ..adapters.ollama.gateway import ModelRole, OllamaGateway
 from ..domain.contracts import DomainRecord, ModelProfile, TagDecision
 from ..domain.errors import (
     EmbeddingContextRejectedError,
     GenerationContextRejectedError,
+    GeminiUnavailableError,
 )
 from .cache import CachedTagRecommendations, TagRecommendationCache
 from .decision_service import (
@@ -169,6 +175,34 @@ async def recommend_tags_async(
         semantic_limit=semantic_limit,
         confirmation_threshold=confirmation_threshold,
     )
+    if (
+        candidate_model.strip() == GEMINI_GENERATION_MODEL
+        and (gateway is None or isinstance(gateway, OllamaGateway))
+    ):
+        raise GeminiUnavailableError(
+            "The Gemini candidate gateway is unavailable."
+        )
+    if (
+        decision_model.strip() == GEMINI_DECISION_MODEL
+        and (
+            decision_gateway is None
+            or isinstance(decision_gateway, OllamaGateway)
+        )
+    ):
+        raise GeminiUnavailableError(
+            "The Gemini decision gateway is unavailable."
+        )
+    if (
+        embedding_profile is not None
+        and embedding_profile.model == GEMINI_EMBEDDING_MODEL
+        and (
+            embedding_gateway is None
+            or isinstance(embedding_gateway, OllamaGateway)
+        )
+    ):
+        raise GeminiUnavailableError(
+            "The Gemini embedding gateway is unavailable."
+        )
     owns_gateway = gateway is None
     selected_gateway: CandidateGateway = gateway or OllamaGateway()
     selected_decision_gateway = decision_gateway or selected_gateway

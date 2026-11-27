@@ -9,6 +9,7 @@ from file_tagger.adapters.ollama.gateway import OllamaGateway
 from file_tagger.domain.contracts import ModelProfile
 from file_tagger.domain.errors import (
     GenerationContextRejectedError,
+    GeminiUnavailableError,
     ModelIncompatibleError,
     ModelMissingError,
     OllamaUnavailableError,
@@ -114,6 +115,24 @@ def test_gemini_planning_model_uses_injected_gateway_without_ollama_fallback() -
     assert [call["model"] for call in gateway.chat_calls] == [
         "gemini-4-hydrogen"
     ]
+
+
+def test_exact_gemini_planner_model_without_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.rag.planner as planner
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(planner, "OllamaGateway", unexpected_ollama_gateway)
+
+    with pytest.raises(GeminiUnavailableError):
+        build_search_plan(
+            "Find encounters",
+            model="gemini-4-hydrogen",
+            fallback_model=None,
+        )
 
 
 def test_markdown_sections_and_entities_are_normalized() -> None:

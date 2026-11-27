@@ -25,6 +25,8 @@ from .tagging.cache import (
 )
 from .tagging.candidate_service import CandidateService
 from .extraction.docling_adapter import extract_document
+from .domain.errors import GeminiUnavailableError
+from .adapters.ollama.gateway import OllamaGateway
 
 
 MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
@@ -111,6 +113,7 @@ class TagSuggester:
         cache: TagRecommendationCache | None = None,
         gateway: Any | None = None,
         decision_gateway: Any | None = None,
+        embedding_gateway: Any | None = None,
         modern_runtime: Any | None = None,
     ):
         """
@@ -125,6 +128,7 @@ class TagSuggester:
         self._cache = cache
         self._gateway = gateway
         self._decision_gateway = decision_gateway
+        self._embedding_gateway = embedding_gateway
         self.modern_runtime = modern_runtime
 
     def recommend_tags_for_file(
@@ -180,7 +184,11 @@ class TagSuggester:
                     ),
                     gateway=self._gateway,
                     decision_gateway=self._decision_gateway,
-                    embedding_gateway=self._gateway,
+                    embedding_gateway=(
+                        self._embedding_gateway
+                        if self._embedding_gateway is not None
+                        else self._gateway
+                    ),
                     cache=selected_cache,
                 )
             elif candidate_model is None or decision_model is None:
@@ -214,18 +222,35 @@ class TagSuggester:
                     else runtime_decision_gateway
                 )
                 selected_embedding_gateway = (
-                    self._gateway
-                    if self._gateway is not None
+                    self._embedding_gateway
+                    if self._embedding_gateway is not None
                     else runtime_embedding_gateway
                 )
                 provider = _runtime_provider(self.modern_runtime)
                 if provider == "gemini":
-                    if selected_candidate_gateway is None:
-                        raise ValueError("The Gemini candidate gateway is unavailable.")
-                    if selected_decision_gateway is None:
-                        raise ValueError("The Gemini decision gateway is unavailable.")
-                    if selected_embedding_gateway is None:
-                        raise ValueError("The Gemini embedding gateway is unavailable.")
+                    if (
+                        selected_candidate_gateway is None
+                        or isinstance(selected_candidate_gateway, OllamaGateway)
+                    ):
+                        raise GeminiUnavailableError(
+                            "The Gemini candidate gateway is unavailable."
+                        )
+                    if (
+                        selected_decision_gateway is None
+                        or isinstance(selected_decision_gateway, OllamaGateway)
+                    ):
+                        raise GeminiUnavailableError(
+                            "The Gemini decision gateway is unavailable."
+                        )
+                    if (
+                        selected_embedding_gateway is None
+                        or isinstance(selected_embedding_gateway, OllamaGateway)
+                    ):
+                        raise GeminiUnavailableError(
+                            "The Gemini embedding gateway is unavailable."
+                        )
+                elif selected_embedding_gateway is None:
+                    selected_embedding_gateway = self._gateway
                 service = CandidateService(
                     HybridSearch(
                         search_session,

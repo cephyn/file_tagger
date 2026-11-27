@@ -5,8 +5,10 @@ import json
 import math
 from typing import Any, Literal, Protocol, TypeVar
 
+from ..adapters.gemini.gateway import GEMINI_DECISION_MODEL
 from ..adapters.ollama.gateway import OllamaGateway
 from ..domain.contracts import DomainRecord, TagDecision
+from ..domain.errors import GeminiUnavailableError
 
 
 DEFAULT_DECISION_MODEL = "nimble:9b"
@@ -83,6 +85,13 @@ async def decide_tags_async(
     checked_candidates = _validate_request(document_state, candidates, model)
     questions, question_candidates = _build_questions(checked_candidates)
 
+    if (
+        model.strip() == GEMINI_DECISION_MODEL
+        and (gateway is None or isinstance(gateway, OllamaGateway))
+    ):
+        raise GeminiUnavailableError(
+            "The Gemini decision gateway is unavailable."
+        )
     owns_gateway = gateway is None
     selected_gateway: DecisionGateway = gateway or OllamaGateway()
     try:
