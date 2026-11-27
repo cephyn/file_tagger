@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from google.genai import types
 
 from file_tagger.adapters.gemini.gateway import (
     GEMINI_DECISION_MODEL,
@@ -114,7 +115,7 @@ def test_exact_model_names_and_profiles_are_stable() -> None:
     assert "test-key" not in embedding.digest
 
 
-def test_vertex_express_key_uses_enterprise_client(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ai_studio_auth_key_uses_gemini_api_client(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, object]] = []
 
     class FakeGenaiClient:
@@ -127,11 +128,11 @@ def test_vertex_express_key_uses_enterprise_client(monkeypatch: pytest.MonkeyPat
         FakeGenaiClient,
     )
 
-    GeminiGateway("AQ.test-express-key")
+    GeminiGateway("AQ.test-ai-studio-key")
 
     assert calls == [{
-        "enterprise": True,
-        "api_key": "AQ.test-express-key",
+        "api_key": "AQ.test-ai-studio-key",
+        "http_options": types.HttpOptions(api_version="v1beta"),
     }]
 
 
@@ -158,7 +159,7 @@ def test_readiness_probe_uses_exact_embedding_model_and_768_dimensions() -> None
     call = client.aio.models.embed_calls[0]
     assert call["model"] == "gemini-embedding-2"
     assert call["config"].output_dimensionality == 768
-    assert call["config"].auto_truncate is False
+    assert call["config"].auto_truncate is None
 
 
 def test_readiness_authentication_failure_is_sanitized_and_blocking() -> None:
