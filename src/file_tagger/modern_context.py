@@ -16,8 +16,15 @@ from typing import Any, Protocol, TypeAlias
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .adapters.gemini.gateway import (
+    GEMINI_DECISION_MODEL,
+    GEMINI_EMBEDDING_MODEL,
+    GEMINI_GENERATION_MODEL,
+    GeminiGateway,
+)
 from .adapters.ollama.gateway import OllamaGateway
 from .extraction.docling_adapter import DoclingAdapter
+from .gemini.readiness import GeminiReadinessService
 from .indexing.repository import IndexingRepository
 from .indexing.repository import VectorIndexReadiness
 from .indexing.service import IndexingResult, IndexingService
@@ -83,6 +90,20 @@ class _FreshOllamaEmbeddingGateway:
             await gateway.close()
 
 
+class _FreshGeminiEmbeddingGateway:
+    """Create and close one Gemini gateway per event-loop invocation."""
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+
+    async def embed(self, *args: Any, **kwargs: Any) -> Any:
+        gateway = GeminiGateway(self._api_key)
+        try:
+            return await gateway.embed(*args, **kwargs)
+        finally:
+            await gateway.close()
+
+
 class ModernRuntime:
     """Modern database and local-model services used alongside the legacy UI."""
 
@@ -94,11 +115,33 @@ class ModernRuntime:
         sqlite_migration: LegacyMigrationReport | None = None,
         config_migration: ConfigMigrationReport | None = None,
         unavailable_reason: str | None = None,
+        config: Any | None = None,
+        password: str | None = None,
     ) -> None:
+        del password
         self.paths = paths
         self.session_factory = session_factory
         self.sqlite_migration = sqlite_migration
         self.config_migration = config_migration
+        self._config = config
+        self._active_provider = "ollama"
+        self._gemini_api_key: str | None = None
+        get_provider = getattr(config, "get_ai_provider", None)
+        if callable(get_provider):
+            try:
+                provider = get_provider()
+                if provider in ("ollama", "gemini"):
+                    self._active_provider = provider
+            except Exception:
+                pass
+        get_key = getattr(config, "get_gemini_api_key", None)
+        if callable(get_key):
+            try:
+                key = get_key()
+                if isinstance(key, str) and key.strip():
+                    self._gemini_api_key = key.strip()
+            except Exception:
+                pass
         self._model_readiness: ReadinessReport | None = None
         self.required_models: RequiredModels | None = None
         self._indexing_service: IndexingService | None = None
@@ -108,6 +151,9 @@ class ModernRuntime:
             else None
         )
         self._embedding_gateway: Any | None = None
+        self._candidate_gateway: Any | None = None
+        self._decision_gateway: Any | None = None
+        self._generation_gateway: Any | None = None
         self._readiness_thread: threading.Thread | None = None
         self._index_queue: queue.Queue[_IndexRequest] = queue.Queue()
         self._index_generations: dict[str, int] = {}
@@ -217,6 +263,31 @@ class ModernRuntime:
         return "modern indexing has not been initialized."
 
     @property
+    def active_provider(self) -> str:
+        with self._lock:
+            return self._active_provider
+
+    @property
+    def candidate_gateway(self) -> Any | None:
+        with self._lock:
+            return self._candidate_gateway
+
+    @property
+    def decision_gateway(self) -> Any | None:
+        with self._lock:
+            return self._decision_gateway
+
+    @property
+    def generation_gateway(self) -> Any | None:
+        with self._lock:
+            return self._generation_gateway
+
+    @property
+    def embedding_gateway(self) -> Any | None:
+        with self._lock:
+            return self._embedding_gateway
+
+    @property
     def candidate_model(self) -> str | None:
         profile = self.selected_profile("generation")
         return profile.model if profile is not None else None
@@ -298,6 +369,80 @@ class ModernRuntime:
         thread.start()
         return completion
 
+    def apply_provider(
+        self,
+        provider: str,
+        gemini_api_key: str | None = None,
+    ) -> Future[ReadinessReport | None]:
+        normalized = provider.strip().lower() if isinstance(provider, str) else ""
+        if normalized not in ("ollama", "gemini"):
+            raise ValueError("Provider must be 'ollama' or 'gemini'.")
+
+        set_provider = getattr(self._config, "set_ai_provider", None)
+        if callable(set_provider) and not set_provider(normalized):
+            raise ValueError("Provider must be 'ollama' or 'gemini'.")
+
+        key_to_store: str | None = None
+        if isinstance(gemini_api_key, str) and gemini_api_key.strip():
+            key_to_store = gemini_api_key.strip()
+            set_key = getattr(self._config, "set_gemini_api_key", None)
+            if callable(set_key):
+                set_key(key_to_store)
+        else:
+            get_key = getattr(self._config, "get_gemini_api_key", None)
+            if callable(get_key):
+                try:
+                    stored = get_key()
+                    if isinstance(stored, str) and stored.strip():
+                        key_to_store = stored.strip()
+                except Exception:
+                    pass
+            else:
+                key_to_store = self._gemini_api_key
+
+        old_gateways: list[Any] = []
+        with self._lock:
+            old_gateways.extend(
+                gateway
+                for gateway in (
+                    self._candidate_gateway,
+                    self._decision_gateway,
+                    self._generation_gateway,
+                )
+                if gateway is not None
+            )
+            self._active_provider = normalized
+            self._gemini_api_key = key_to_store
+            self.required_models = None
+            self._indexing_service = None
+            self._indexing_service_generation = 0
+            self._embedding_gateway = None
+            self._candidate_gateway = None
+            self._decision_gateway = None
+            self._generation_gateway = None
+            self._model_readiness = None
+            with self._contextual_rag_condition:
+                self._contextual_rag_services.clear()
+                self._contextual_rag_epochs.clear()
+                self._contextual_rag_active.clear()
+                self._contextual_rag_closed.clear()
+
+        seen: set[int] = set()
+        for old_gateway in old_gateways:
+            identity = id(old_gateway)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            close = getattr(old_gateway, "close", None)
+            if callable(close):
+                try:
+                    result = close()
+                    if hasattr(result, "__await__"):
+                        asyncio.run(result)
+                except Exception:
+                    logger.debug("Closing a retired provider gateway failed.")
+        return self.start_readiness()
+
     def apply_model_selections(
         self,
         selections: Mapping[str, str | None],
@@ -371,32 +516,64 @@ class ModernRuntime:
         on_complete: ReadinessCallback | None,
     ) -> None:
         report: ReadinessReport | None = None
-        gateway = OllamaGateway()
+        gateway: Any | None = None
+        close_gateway = True
+        with self._lock:
+            provider = self._active_provider
+            gemini_api_key = self._gemini_api_key
         try:
-            hardware = profile_hardware()
-            with self._lock:
-                overrides = dict(self._model_overrides)
-            try:
-                recommendation = recommend_models(
-                    hardware,
-                    embedding_override=overrides.get("embedding"),
-                    decision_override=overrides.get("decision"),
-                    generation_override=overrides.get("generation"),
+            if provider == "gemini":
+                required = RequiredModels(
+                    embedding=GEMINI_EMBEDDING_MODEL,
+                    decision=GEMINI_DECISION_MODEL,
+                    generation=GEMINI_GENERATION_MODEL,
                 )
-            except ModelRecommendationError:
-                recommendation = recommend_models(hardware)
-            recommended = _required_models(recommendation).as_mapping()
-            recommended.update(overrides)
-            required = RequiredModels.model_validate(recommended)
-            report = asyncio.run(
-                self._check_readiness(gateway, required)
-            ).model_copy(
-                update={
-                    "hardware": hardware,
-                    "recommendation": recommendation,
-                    "selected_models": required,
-                }
-            )
+                if gemini_api_key:
+                    try:
+                        gateway = GeminiGateway(gemini_api_key)
+                    except Exception:
+                        gateway = None
+                if self.session_factory is not None:
+                    with self.session_factory.begin() as session:
+                        report = asyncio.run(
+                            GeminiReadinessService(
+                                gateway,
+                                gemini_api_key,
+                                session=session,
+                            ).check(required)
+                        )
+                else:
+                    report = asyncio.run(
+                        GeminiReadinessService(gateway, gemini_api_key).check(required)
+                    )
+            else:
+                gateway = OllamaGateway()
+                hardware = profile_hardware()
+                with self._lock:
+                    overrides = dict(self._model_overrides)
+                try:
+                    recommendation = recommend_models(
+                        hardware,
+                        embedding_override=overrides.get("embedding"),
+                        decision_override=overrides.get("decision"),
+                        generation_override=overrides.get("generation"),
+                    )
+                except ModelRecommendationError:
+                    recommendation = recommend_models(hardware)
+                recommended = _required_models(recommendation).as_mapping()
+                recommended.update(overrides)
+                required = RequiredModels.model_validate(recommended)
+                report = asyncio.run(
+                    self._check_readiness(gateway, required)
+                ).model_copy(
+                    update={
+                        "provider": "ollama",
+                        "hardware": hardware,
+                        "recommendation": recommendation,
+                        "selected_models": required,
+                    }
+                )
+
             embedding_profile = report.selected_profile("embedding")
             if (
                 "indexing" in report.blocked_roles
@@ -407,7 +584,12 @@ class ModernRuntime:
             indexing_service = None
             embedding_gateway = None
             if embedding_profile is not None and self.session_factory is not None:
-                embedding_gateway = _FreshOllamaEmbeddingGateway()
+                if provider == "gemini":
+                    embedding_gateway = _FreshGeminiEmbeddingGateway(
+                        gemini_api_key or ""
+                    )
+                else:
+                    embedding_gateway = _FreshOllamaEmbeddingGateway()
                 indexing_service = IndexingService(
                     IndexingRepository(self.session_factory),
                     DoclingAdapter(),
@@ -415,6 +597,30 @@ class ModernRuntime:
                     embedding_profile=embedding_profile,
                     recover_on_startup=False,
                 )
+            candidate_gateway: Any | None = None
+            decision_gateway: Any | None = None
+            generation_gateway: Any | None = None
+            if report.ready:
+                if provider == "gemini":
+                    if gemini_api_key:
+                        try:
+                            candidate_gateway = GeminiGateway(gemini_api_key)
+                            decision_gateway = GeminiGateway(gemini_api_key)
+                            generation_gateway = GeminiGateway(gemini_api_key)
+                        except Exception:
+                            candidate_gateway = None
+                            decision_gateway = None
+                            generation_gateway = None
+                else:
+                    try:
+                        candidate_gateway = OllamaGateway()
+                        decision_gateway = OllamaGateway()
+                        generation_gateway = OllamaGateway()
+                    except Exception:
+                        candidate_gateway = None
+                        decision_gateway = None
+                        generation_gateway = None
+
             published_service = False
             with self._lock:
                 if generation == self._readiness_generation:
@@ -433,6 +639,9 @@ class ModernRuntime:
                     self._indexing_service = indexing_service
                     self._indexing_service_generation = generation
                     self._embedding_gateway = embedding_gateway
+                    self._candidate_gateway = candidate_gateway
+                    self._decision_gateway = decision_gateway
+                    self._generation_gateway = generation_gateway
                     self._unavailable_reason = None
                     published_service = indexing_service is not None
                 else:
@@ -446,7 +655,8 @@ class ModernRuntime:
                 if generation == self._readiness_generation:
                     report = self.readiness
             logger.info(
-                "Modern local-model readiness initialized (ready=%s, profiles=%d).",
+                "Modern %s runtime readiness initialized (ready=%s, profiles=%d).",
+                provider,
                 report.ready if report is not None else False,
                 len(report.profiles) if report is not None else 0,
             )
@@ -462,10 +672,13 @@ class ModernRuntime:
                 exc.__class__.__name__,
             )
         finally:
-            try:
-                asyncio.run(gateway.close())
-            except Exception:
-                logger.debug("Closing the Ollama readiness client failed.")
+            if close_gateway and gateway is not None:
+                try:
+                    close = getattr(gateway, "close", None)
+                    if callable(close):
+                        asyncio.run(close())
+                except Exception:
+                    logger.debug("Closing the provider readiness client failed.")
             if not completion.done():
                 completion.set_result(report)
             self._notify_readiness_complete(on_complete, report)
@@ -840,11 +1053,27 @@ class ModernRuntime:
             index_version=profile.default_index_version,
             embedding_profile=profile,
         )
-        gateway = OllamaGateway()
+        with self._lock:
+            gateway = self._generation_gateway
+            embedding_gateway = self._embedding_gateway
+            provider = self._active_provider
+            gemini_api_key = self._gemini_api_key
+        if gateway is None:
+            gateway = (
+                GeminiGateway(gemini_api_key)
+                if provider == "gemini" and gemini_api_key
+                else OllamaGateway()
+            )
+        if embedding_gateway is None:
+            embedding_gateway = (
+                _FreshGeminiEmbeddingGateway(gemini_api_key)
+                if provider == "gemini" and gemini_api_key
+                else _FreshOllamaEmbeddingGateway()
+            )
         rag = RagService(
             search=search,
             gateway=gateway,
-            embedding_gateway=_FreshOllamaEmbeddingGateway(),
+            embedding_gateway=embedding_gateway,
             model=generation_profile.model,
             model_digest=generation_profile.digest,
             index_version=profile.default_index_version,
@@ -1462,6 +1691,8 @@ def initialize_modern_runtime(
             unavailable_reason=(
                 f"{exc.__class__.__name__}: modern database is unavailable: {exc}"
             ),
+            config=config,
+            password=password,
         )
 
     try:
@@ -1503,6 +1734,8 @@ def initialize_modern_runtime(
         session_factory,
         sqlite_migration=sqlite_report,
         config_migration=config_report,
+        config=config,
+        password=password,
     )
     if start_readiness:
         runtime.start_readiness()

@@ -1,7 +1,9 @@
+import asyncio
 from dataclasses import replace
 from hashlib import sha256
 import logging
 from pathlib import Path
+from concurrent.futures import Future
 import sqlite3
 import sys
 import threading
@@ -24,6 +26,7 @@ from file_tagger.modern_context import (
     ModernIndexingUnavailable,
     ModernSearchUnavailable,
     ModernRuntime,
+    _FreshGeminiEmbeddingGateway,
     initialize_modern_runtime,
 )
 from file_tagger.persistence.models import File, FileTag, Tag
@@ -99,6 +102,172 @@ class ReloadableConfig:
 
     def reload_after_migration(self) -> None:
         self.reloads += 1
+
+
+class ProviderConfig:
+    def __init__(self, paths, *, provider="ollama", api_key=None) -> None:
+        self.paths = paths
+        self.provider = provider
+        self.api_key = api_key
+
+    def reload_after_migration(self) -> None:
+        return None
+
+    def get_ai_provider(self) -> str:
+        return self.provider
+
+    def set_ai_provider(self, provider: str) -> bool:
+        if provider not in ("ollama", "gemini"):
+            return False
+        self.provider = provider
+        return True
+
+    def get_gemini_api_key(self) -> str | None:
+        return self.api_key
+
+    def set_gemini_api_key(self, api_key: str) -> None:
+        self.api_key = api_key.strip()
+
+    def clear_gemini_api_key(self) -> None:
+        self.api_key = None
+
+
+def test_modern_runtime_seeds_active_gemini_provider_and_key(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    config = ProviderConfig(paths, provider="gemini", api_key="stored-key")
+
+    runtime = initialize_modern_runtime(
+        paths,
+        config,
+        "password",
+        start_readiness=False,
+    )
+
+    assert runtime.active_provider == "gemini"
+
+
+def test_apply_provider_persists_provider_and_preserves_blank_key(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    config = ProviderConfig(paths, provider="ollama", api_key="stored-key")
+    runtime = ModernRuntime(paths, None, config=config, password="password")
+    completion = Future()
+    completion.set_result(None)
+    runtime.start_readiness = lambda on_complete=None: completion
+
+    returned = runtime.apply_provider("gemini", gemini_api_key="   ")
+
+    assert returned is completion
+    assert runtime.active_provider == "gemini"
+    assert config.provider == "gemini"
+    assert config.api_key == "stored-key"
+
+
+def test_apply_provider_replaces_gemini_key_and_restarts_readiness(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    config = ProviderConfig(paths, provider="ollama", api_key=None)
+    runtime = ModernRuntime(paths, None, config=config, password="password")
+    completion = Future()
+    completion.set_result(None)
+    runtime.start_readiness = lambda on_complete=None: completion
+
+    returned = runtime.apply_provider("gemini", gemini_api_key="new-key")
+
+    assert returned is completion
+    assert runtime.active_provider == "gemini"
+    assert config.api_key == "new-key"
+
+
+def test_fresh_gemini_embedding_gateway_creates_and_closes_one_gateway(
+    monkeypatch,
+) -> None:
+    created: list[tuple[str, object]] = []
+
+    class FakeGateway:
+        def __init__(self, api_key) -> None:
+            self.closed = False
+            created.append((api_key, self))
+
+        async def embed(self, *args, **kwargs):
+            return ((0.1, 0.2),)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.GeminiGateway",
+        FakeGateway,
+    )
+    wrapper = _FreshGeminiEmbeddingGateway("test-secret")
+
+    async def invoke() -> tuple[tuple[tuple[float, ...], ...], FakeGateway]:
+        result = await wrapper.embed("gemini-embedding-2", "source")
+        gateway = created[0][1]
+        return result, gateway
+
+    result, gateway = asyncio.run(invoke())
+
+    assert result == ((0.1, 0.2),)
+    assert created == [("test-secret", gateway)]
+    assert gateway.closed is True
+
+
+def test_modern_runtime_routes_ready_gemini_role_gateways(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    config = ProviderConfig(paths, provider="gemini", api_key="stored-key")
+
+    class FakeGeminiGateway:
+        def __init__(self, api_key) -> None:
+            assert api_key == "stored-key"
+
+        async def readiness(self, required_models):
+            return OllamaReadiness(
+                available=True,
+                version=None,
+                base_url="https://generativelanguage.googleapis.com",
+            )
+
+        async def model_profile(self, role, model):
+            return ModelProfile(
+                role=role,
+                model=model,
+                digest=f"sha256:gemini-{role}",
+                context_length=128,
+                dimensions=768 if role == "embedding" else None,
+                capabilities=(role,),
+            )
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "file_tagger.modern_context.GeminiGateway",
+        FakeGeminiGateway,
+    )
+    runtime = initialize_modern_runtime(
+        paths,
+        config,
+        "password",
+        start_readiness=False,
+    )
+    completion = runtime.start_readiness()
+    report = completion.result(timeout=5)
+
+    assert report is not None
+    assert report.provider == "gemini"
+    assert report.ready is True
+    assert runtime.active_provider == "gemini"
+    assert isinstance(runtime.candidate_gateway, FakeGeminiGateway)
+    assert isinstance(runtime.decision_gateway, FakeGeminiGateway)
+    assert isinstance(runtime.generation_gateway, FakeGeminiGateway)
+    assert isinstance(runtime.embedding_gateway, _FreshGeminiEmbeddingGateway)
 
 
 def test_modern_database_unavailable_reason_includes_missing_module(

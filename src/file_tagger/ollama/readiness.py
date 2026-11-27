@@ -1,12 +1,17 @@
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .benchmarks import BenchmarkResult, run_model_benchmark
-from ..domain.contracts import HardwareReport, ModelProfile, OllamaReadiness
+from ..domain.contracts import (
+    GeminiReadiness,
+    HardwareReport,
+    ModelProfile,
+    OllamaReadiness,
+)
 from ..domain.errors import (
     ModelIncompatibleError,
     ModelMissingError,
@@ -43,6 +48,7 @@ class ReadinessReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     ready: bool
+    provider: Literal["ollama", "gemini"] = "ollama"
     blocked_roles: tuple[str, ...] = ()
     blocked_model_roles: tuple[str, ...] = ()
     instructions: tuple[str, ...] = ()
@@ -51,6 +57,7 @@ class ReadinessReport(BaseModel):
     profiles: tuple[ModelProfile, ...] = ()
     benchmarks: tuple[BenchmarkResult, ...] = ()
     ollama: OllamaReadiness | None = None
+    gemini: GeminiReadiness | None = None
     hardware: HardwareReport | None = None
     recommendation: ModelRecommendation | None = None
     selected_models: RequiredModels | None = None

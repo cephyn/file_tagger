@@ -36,6 +36,28 @@ class OllamaReadiness(DomainRecord):
         )
 
 
+class GeminiReadiness(DomainRecord):
+    available: bool
+    key_configured: bool = False
+    api_key_configured: bool = False
+    missing_key: bool = False
+    base_url: str = "https://generativelanguage.googleapis.com"
+    missing_models: tuple[str, ...] = ()
+    incompatible_models: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+    @property
+    def ready(self) -> bool:
+        return (
+            self.available
+            and (self.key_configured or self.api_key_configured)
+            and not self.missing_key
+            and not self.missing_models
+            and not self.incompatible_models
+            and not self.errors
+        )
+
+
 class ModelProfile(DomainRecord):
     role: Literal["embedding", "decision", "generation"]
     model: str = Field(min_length=1)
