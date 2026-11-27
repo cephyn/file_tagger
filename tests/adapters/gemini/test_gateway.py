@@ -497,3 +497,23 @@ def test_close_closes_injected_client() -> None:
     asyncio.run(gateway.close())
 
     assert client.closed is True
+
+
+def test_close_failure_is_sanitized() -> None:
+    secret = "api-key-secret-request-header"
+
+    class FailingCloseClient(FakeClient):
+        async def close(self) -> None:
+            raise RuntimeError(
+                f"SDK close failed; api-key={secret}; "
+                f"Authorization: Bearer {secret}; request={secret}"
+            )
+
+    gateway = GeminiGateway("test-key", client=FailingCloseClient())
+
+    with pytest.raises(GeminiUnavailableError) as caught:
+        asyncio.run(gateway.close())
+
+    assert secret not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert secret not in str(caught.value.__cause__)

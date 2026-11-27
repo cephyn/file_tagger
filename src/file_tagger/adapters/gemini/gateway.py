@@ -164,17 +164,26 @@ class GeminiGateway:
 
     async def close(self) -> None:
         aio = getattr(self._client, "aio", None)
+        close_failed = False
         for owner in (aio, self._client):
             if owner is None:
                 continue
             close = getattr(owner, "aclose", None) or getattr(owner, "close", None)
             if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-                elif inspect.iscoroutine(result):
-                    await result
-                return
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                    elif inspect.iscoroutine(result):
+                        await result
+                except Exception:
+                    close_failed = True
+                else:
+                    return
+                break
+
+        if close_failed:
+            raise GeminiUnavailableError("Gemini is unavailable.") from None
 
     async def model_profile(self, role: ModelRole, model: str) -> ModelProfile:
         if role not in ("embedding", "decision", "generation"):
