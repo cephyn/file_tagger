@@ -25,6 +25,10 @@ MIGRATION_LEGACY_ALLOWLIST = {
     },
 }
 
+GEMINI_ADAPTER_ALLOWLIST = {
+    "src/file_tagger/adapters/gemini/gateway.py",
+}
+
 
 def test_legacy_runtime_modules_and_debug_scripts_are_removed() -> None:
     removed_paths = (
@@ -105,4 +109,25 @@ def test_migration_code_has_no_forbidden_runtime_imports_or_calls() -> None:
 def test_project_metadata_has_no_forbidden_runtime_names() -> None:
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8").lower()
     residuals = sorted(name for name in FORBIDDEN_SOURCE_NAMES if name in text)
+    assert residuals == []
+    assert "google-genai==3.6.1" in text
+
+
+def test_gemini_sdk_imports_are_confined_to_the_gemini_adapter() -> None:
+    residuals: list[str] = []
+
+    for path in SOURCE_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            modules: set[str] = set()
+            if isinstance(node, ast.Import):
+                modules.update(alias.name.lower() for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module.lower())
+
+            if any(module == "google" or module.startswith("google.") for module in modules):
+                relative = path.relative_to(ROOT).as_posix()
+                if relative not in GEMINI_ADAPTER_ALLOWLIST:
+                    residuals.append(relative)
+
     assert residuals == []

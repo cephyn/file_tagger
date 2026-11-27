@@ -8,19 +8,23 @@ It is local-first:
 - Text search uses SQLite FTS5.
 - Semantic search uses `sqlite-vec`.
 - Document conversion uses Docling.
-- Chat, decisions, and embeddings use a loopback-only Ollama runtime.
-- Cloud AI providers and direct local model loading are not supported.
+- Ollama is the default for chat, decisions, and embeddings.
+- Gemini is available as an optional cloud provider selected explicitly in Settings.
+- Direct local model loading and other cloud AI providers are not supported.
 
 ## Requirements
 
 - Windows 10 22H2 or Windows 11
 - Python 3.13 or later
-- [Ollama](https://ollama.com/download) installed and running for AI features
+- [Ollama](https://ollama.com/download) installed and running for the default
+  local provider
+- A Google Gemini API key for the optional Gemini provider
 - `uv` for dependency and environment management
 
-AI features remain disabled until the Ollama Readiness dialog confirms that
-Ollama is reachable, compatible, and the required local models are installed.
-The application never downloads or pulls models automatically.
+Ollama remains the default provider and AI features remain disabled until the
+Ollama Readiness dialog confirms that Ollama is reachable, compatible, and the
+required local models are installed. The application never downloads or pulls
+Ollama models automatically.
 
 ## Start from source
 
@@ -63,6 +67,11 @@ If an older `file_tags.db`/`.chroma` installation is detected, the application
 creates a backup and migrates the available file/tag metadata. It inventories
 legacy Chroma paths but does not copy old embeddings; those files must be
 reindexed by the current Ollama embedding profile.
+
+Switching providers or embedding profiles does not reuse vectors from a
+different provider/profile. File Tagger queues the affected files for reindexing
+before the new embeddings are used, preventing Ollama and Gemini vectors from
+being mixed.
 
 ## Password recovery
 
@@ -107,6 +116,31 @@ gemma4:e4b
 The dialog will show the exact compatible tags for the detected hardware and
 installed Ollama catalog. Model names ending in `:cloud` or remote Ollama hosts
 are rejected.
+
+## Configure Gemini
+
+1. Open **Settings > AI Provider**.
+2. Select **Gemini**.
+3. Enter a Gemini API key. The key is not shown after it is saved.
+4. Save and refresh Gemini readiness.
+
+The Gemini API key is stored inside the existing encrypted per-user
+configuration, never in a log or environment file by this application. Leave
+the masked field blank to preserve a configured key, enter a new nonblank value
+to replace it, or use **Clear Gemini Key** to remove it.
+
+Gemini uses these fixed model IDs:
+
+```text
+gemini-4-hydrogen
+gemini-decision-1
+gemini-embedding-2
+```
+
+Gemini is not contacted when the Ollama provider is active. Selecting Gemini,
+changing the Gemini embedding profile, or switching providers queues a reindex
+of the index for that provider/profile before normal semantic search resumes.
+Gemini readiness failure does not silently fall back to Ollama.
 
 ## Per-user data
 
@@ -200,13 +234,14 @@ Remove-Item Env:FILE_TAGGER_RUN_OLLAMA_TESTS
 - Markdown-context planning and cited local RAG answers
 - Resumable, transactionally swapped indexing jobs
 - Ollama readiness, hardware, disk, and benchmark diagnostics
+- Optional Gemini readiness and provider-specific settings
 - Explicit migration backup and legacy Chroma inventory
 
 ## Project layout
 
 ```text
 src/file_tagger/
-  adapters/       Ollama and external adapters
+  adapters/       Ollama and Gemini external adapters
   domain/         Pydantic contracts and application errors
   extraction/     Docling extraction and page/vision quality
   indexing/       Chunking, embedding coverage, and resumable jobs
@@ -225,8 +260,10 @@ src/file_tagger/
 ## Security
 
 - Ollama endpoints must resolve to loopback hosts.
-- Cloud model tags are rejected.
-- API keys and provider credentials are not required.
+- Ollama cloud model tags and remote Ollama hosts are rejected.
+- Gemini is optional; its API key is stored in the encrypted per-user
+  configuration and is never written to logs or status text.
+- Legacy cloud credentials and provider fields are not migrated.
 - Configuration is password-protected and encrypted locally.
 - Recovery keys are displayed once and never written to logs or status text.
 - Reset quarantines encrypted settings while preserving SQLite and index data.

@@ -14,7 +14,7 @@ FORBIDDEN = {
 }
 
 
-def test_runtime_dependencies_are_local_ollama_only() -> None:
+def test_runtime_dependencies_reject_competing_stacks_and_allow_gemini() -> None:
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     names = {
@@ -22,6 +22,20 @@ def test_runtime_dependencies_are_local_ollama_only() -> None:
         for dependency in project["dependencies"]
     }
     assert names.isdisjoint(FORBIDDEN)
+    assert "google-genai" in names
+
+
+def test_readme_documents_ollama_default_and_gemini_provider() -> None:
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8").lower()
+
+    assert "ollama" in readme
+    assert "gemini" in readme
+    assert "gemini-4-hydrogen" in readme
+    assert "gemini-decision-1" in readme
+    assert "gemini-embedding-2" in readme
+    assert "encrypted" in readme
+    assert "reindex" in readme
 
 
 def test_lockfile_has_no_forbidden_runtime_stacks() -> None:

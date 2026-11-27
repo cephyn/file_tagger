@@ -59,3 +59,21 @@ def test_chat_dialog_has_no_legacy_provider_dispatch() -> None:
 
     assert provider_branches == []
     assert provider_methods == set()
+
+
+def test_chat_module_does_not_import_cloud_provider_sdks() -> None:
+    tree = ast.parse(CHAT_MODULE.read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module.split(".", 1)[0].lower()
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    imported_names = {
+        alias.name.split(".", 1)[0].lower()
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+    assert imported_modules.isdisjoint({"openai", "anthropic", "google", "google_generativeai"})
+    assert imported_names.isdisjoint({"openai", "anthropic", "google", "google_generativeai"})
