@@ -133,7 +133,9 @@ class GeminiReadinessService:
                         {"embedding", "decision", "generation"}
                     )
                 if gateway_errors:
-                    errors.append("Gemini readiness returned an error.")
+                    for gateway_error in gateway_errors:
+                        if isinstance(gateway_error, str) and gateway_error.strip():
+                            errors.append(gateway_error)
                     blocked_model_roles.update(
                         {"embedding", "decision", "generation"}
                     )
@@ -172,6 +174,10 @@ class GeminiReadinessService:
 
         for role, model in exact.as_mapping().items():
             if role in blocked_model_roles:
+                continue
+            if self.gateway is None:
+                blocked_model_roles.add(role)
+                errors.append("Gemini gateway is unavailable.")
                 continue
             try:
                 profile = await self.gateway.model_profile(role, model)

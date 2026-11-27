@@ -49,6 +49,20 @@ class FakeModels:
 class FakeAio:
     def __init__(self) -> None:
         self.models = FakeModels()
+        self.decisions = SimpleNamespace(create=self._create_decision)
+
+    async def _create_decision(self, **kwargs):
+        questions = kwargs["questions"]
+        answers = {
+            name: SimpleNamespace(
+                type="choice",
+                choice="accept",
+                probabilities={"accept": 0.8, "reject": 0.1, "review": 0.1},
+                confidence=0.8,
+            )
+            for name in questions
+        }
+        return SimpleNamespace(answers=answers)
 
 
 class FakeClient:
@@ -58,6 +72,10 @@ class FakeClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+def decision_result_from_answers(answers: dict[str, object]) -> SimpleNamespace:
+    return SimpleNamespace(answers=answers)
 
 
 def test_exact_model_names_and_profiles_are_stable() -> None:
@@ -264,6 +282,53 @@ def test_system_one_maps_choice_answers_for_decision_parser() -> None:
     assert answer["answers"]["candidate_000"]["choice"] == "accept"
 
 
+def test_system_one_uses_decisions_api_not_chat_generate_content() -> None:
+    client = FakeClient()
+    calls: list[dict[str, object]] = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            answers={
+                "candidate_000": SimpleNamespace(
+                    type="choice",
+                    choice="accept",
+                    probabilities={
+                        "accept": 0.8,
+                        "reject": 0.1,
+                        "review": 0.1,
+                    },
+                    confidence=0.8,
+                )
+            }
+        )
+
+    client.aio.decisions.create = create
+    gateway = GeminiGateway("test-key", client=client)
+
+    answer = asyncio.run(
+        gateway.system_one(
+            GEMINI_DECISION_MODEL,
+            state="A flooded ruin",
+            questions={
+                "candidate_000": {
+                    "type": "choice",
+                    "instructions": "Apply the candidate tag?",
+                    "criteria": {
+                        "accept": "Clearly relevant.",
+                        "reject": "Not relevant.",
+                        "review": "Needs human review.",
+                    },
+                }
+            },
+        )
+    )
+
+    assert calls
+    assert calls[0]["model"] == GEMINI_DECISION_MODEL
+    assert answer["answers"]["candidate_000"]["choice"] == "accept"
+
+
 def test_malformed_or_empty_chat_json_is_rejected() -> None:
     client = FakeClient()
 
@@ -389,12 +454,20 @@ def test_authentication_is_mapped_by_status_code() -> None:
 def test_system_one_rejects_unknown_choice() -> None:
     client = FakeClient()
 
-    async def generate(**kwargs):
+    async def create(**kwargs):
+        del kwargs
         return SimpleNamespace(
-            text='{"answers":{"candidate_000":{"type":"choice","choice":"maybe","probabilities":{"accept":0.4,"reject":0.3,"review":0.3},"confidence":0.4}}}'
+            answers={
+                "candidate_000": SimpleNamespace(
+                    type="choice",
+                    choice="maybe",
+                    probabilities={"accept": 0.4, "reject": 0.3, "review": 0.3},
+                    confidence=0.4,
+                )
+            }
         )
 
-    client.aio.models.generate_content = generate
+    client.aio.decisions.create = create
     gateway = GeminiGateway("test-key", client=client)
 
     with pytest.raises(GeminiStructuredOutputError):
@@ -410,12 +483,20 @@ def test_system_one_rejects_unknown_choice() -> None:
 def test_system_one_rejects_probability_confidence_mismatch() -> None:
     client = FakeClient()
 
-    async def generate(**kwargs):
+    async def create(**kwargs):
+        del kwargs
         return SimpleNamespace(
-            text='{"answers":{"candidate_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.7,"reject":0.2,"review":0.1},"confidence":0.3}}}'
+            answers={
+                "candidate_000": SimpleNamespace(
+                    type="choice",
+                    choice="accept",
+                    probabilities={"accept": 0.7, "reject": 0.2, "review": 0.1},
+                    confidence=0.3,
+                )
+            }
         )
 
-    client.aio.models.generate_content = generate
+    client.aio.decisions.create = create
     gateway = GeminiGateway("test-key", client=client)
 
     with pytest.raises(GeminiStructuredOutputError):
@@ -431,12 +512,20 @@ def test_system_one_rejects_probability_confidence_mismatch() -> None:
 def test_system_one_rejects_probability_sum_mismatch() -> None:
     client = FakeClient()
 
-    async def generate(**kwargs):
+    async def create(**kwargs):
+        del kwargs
         return SimpleNamespace(
-            text='{"answers":{"candidate_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.6,"reject":0.2,"review":0.1},"confidence":0.6}}}'
+            answers={
+                "candidate_000": SimpleNamespace(
+                    type="choice",
+                    choice="accept",
+                    probabilities={"accept": 0.6, "reject": 0.2, "review": 0.1},
+                    confidence=0.6,
+                )
+            }
         )
 
-    client.aio.models.generate_content = generate
+    client.aio.decisions.create = create
     gateway = GeminiGateway("test-key", client=client)
 
     with pytest.raises(GeminiStructuredOutputError):
@@ -452,10 +541,11 @@ def test_system_one_rejects_probability_sum_mismatch() -> None:
 def test_system_one_rejects_missing_answer() -> None:
     client = FakeClient()
 
-    async def generate(**kwargs):
-        return SimpleNamespace(text='{"answers":{}}')
+    async def create(**kwargs):
+        del kwargs
+        return SimpleNamespace(answers={})
 
-    client.aio.models.generate_content = generate
+    client.aio.decisions.create = create
     gateway = GeminiGateway("test-key", client=client)
 
     with pytest.raises(GeminiStructuredOutputError):
@@ -471,12 +561,20 @@ def test_system_one_rejects_missing_answer() -> None:
 def test_system_one_rejects_unknown_answer_id() -> None:
     client = FakeClient()
 
-    async def generate(**kwargs):
+    async def create(**kwargs):
+        del kwargs
         return SimpleNamespace(
-            text='{"answers":{"unknown_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.8,"reject":0.1,"review":0.1},"confidence":0.8}}}'
+            answers={
+                "unknown_000": SimpleNamespace(
+                    type="choice",
+                    choice="accept",
+                    probabilities={"accept": 0.8, "reject": 0.1, "review": 0.1},
+                    confidence=0.8,
+                )
+            }
         )
 
-    client.aio.models.generate_content = generate
+    client.aio.decisions.create = create
     gateway = GeminiGateway("test-key", client=client)
 
     with pytest.raises(GeminiStructuredOutputError):
@@ -489,15 +587,29 @@ def test_system_one_rejects_unknown_answer_id() -> None:
         )
 
 
-def test_system_one_rejects_duplicate_answer_id() -> None:
+def test_system_one_rejects_extra_answer_id() -> None:
     client = FakeClient()
 
-    async def generate(**kwargs):
+    async def create(**kwargs):
+        del kwargs
         return SimpleNamespace(
-            text='{"answers":{"candidate_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.8,"reject":0.1,"review":0.1},"confidence":0.8},"candidate_000":{"type":"choice","choice":"reject","probabilities":{"accept":0.1,"reject":0.8,"review":0.1},"confidence":0.8}}}'
+            answers={
+                "candidate_000": SimpleNamespace(
+                    type="choice",
+                    choice="accept",
+                    probabilities={"accept": 0.8, "reject": 0.1, "review": 0.1},
+                    confidence=0.8,
+                ),
+                "extra_000": SimpleNamespace(
+                    type="choice",
+                    choice="reject",
+                    probabilities={"accept": 0.1, "reject": 0.8, "review": 0.1},
+                    confidence=0.8,
+                ),
+            }
         )
 
-    client.aio.models.generate_content = generate
+    client.aio.decisions.create = create
     gateway = GeminiGateway("test-key", client=client)
 
     with pytest.raises(GeminiStructuredOutputError):
@@ -539,6 +651,22 @@ def test_transport_failures_are_mapped(exception, error_type) -> None:
             )
         )
     assert "test-key" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("code", "status_message"),
+    [
+        (404, "Gemini API model or operation is unavailable (HTTP 404)."),
+        (400, "Gemini API request was rejected (HTTP 400)."),
+        (429, "Gemini API quota or rate limit was exceeded (HTTP 429)."),
+    ],
+)
+def test_http_status_errors_are_safe_and_specific(code: int, status_message: str) -> None:
+    exception = SimpleNamespace(code=code, message="request contained test-key")
+    translated = GeminiGateway._translate_transport_error(exception)
+
+    assert str(translated) == status_message
+    assert "test-key" not in str(translated)
 
 
 def test_close_closes_injected_client() -> None:

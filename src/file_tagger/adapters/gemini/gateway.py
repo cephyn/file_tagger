@@ -67,7 +67,10 @@ class GeminiGateway:
             self._client = (
                 client
                 if client is not None
-                else genai.Client(api_key=self._api_key)
+                else genai.Client(
+                    api_key=self._api_key,
+                    http_options=types.HttpOptions(api_version="v1beta"),
+                )
             )
         except Exception as exc:
             sanitized: SanitizedTransportError | None = (
@@ -84,6 +87,13 @@ class GeminiGateway:
         if aio_models is not None:
             return aio_models
         return getattr(self._client, "models")
+
+    def _decisions(self) -> Any:
+        aio = getattr(self._client, "aio", None)
+        aio_decisions = getattr(aio, "decisions", None)
+        if aio_decisions is not None:
+            return aio_decisions
+        return getattr(self._client, "decisions")
 
     @staticmethod
     def _status_code(exc: BaseException) -> int | None:
@@ -140,6 +150,18 @@ class GeminiGateway:
 
         if status_code in (408, 504):
             return GeminiTimeoutError("Gemini request timed out.")
+        if status_code == 404:
+            return GeminiUnavailableError(
+                "Gemini API model or operation is unavailable (HTTP 404)."
+            )
+        if status_code == 400:
+            return GeminiUnavailableError(
+                "Gemini API request was rejected (HTTP 400)."
+            )
+        if status_code == 429:
+            return GeminiUnavailableError(
+                "Gemini API quota or rate limit was exceeded (HTTP 429)."
+            )
 
         message = str(exc).casefold()
 
@@ -249,27 +271,93 @@ class GeminiGateway:
         required_models: Mapping[ModelRole, str],
     ) -> OllamaReadiness:
         incompatible: list[str] = []
+        errors: list[str] = []
         for role, model in required_models.items():
             try:
                 await self.model_profile(role, model)
             except ModelIncompatibleError:
                 incompatible.append(model)
+                errors.append(f"Gemini model {model} is incompatible with the {role} role.")
 
         if not incompatible:
-            await self.embed(
-                GEMINI_EMBEDDING_MODEL,
-                "Gemini readiness probe",
-                dimensions=768,
-                truncate=False,
-            )
+            try:
+                await self.chat(
+                    GEMINI_GENERATION_MODEL,
+                    messages=[{"role": "user", "content": "Reply with OK."}],
+                )
+            except GeminiAuthenticationError:
+                raise
+            except (
+                GeminiTimeoutError,
+                GeminiUnavailableError,
+                ModelIncompatibleError,
+                GeminiStructuredOutputError,
+            ) as exc:
+                incompatible.append(GEMINI_GENERATION_MODEL)
+                errors.append(str(exc))
+            except BaseException as exc:
+                translated = self._translate_transport_error(exc)
+                incompatible.append(GEMINI_GENERATION_MODEL)
+                errors.append(str(translated))
+
+            try:
+                await self._invoke_decisions(
+                    model=GEMINI_DECISION_MODEL,
+                    input="Gemini readiness check.",
+                    questions={
+                        "ready": {
+                            "type": "noul",
+                            "instructions": "Is Gemini ready to evaluate decisions?",
+                        }
+                    },
+                )
+            except GeminiAuthenticationError:
+                raise
+            except (
+                GeminiTimeoutError,
+                GeminiUnavailableError,
+                ModelIncompatibleError,
+                GeminiStructuredOutputError,
+            ) as exc:
+                incompatible.append(GEMINI_DECISION_MODEL)
+                errors.append(str(exc))
+            except BaseException as exc:
+                translated = self._translate_transport_error(exc)
+                incompatible.append(GEMINI_DECISION_MODEL)
+                errors.append(str(translated))
+
+            try:
+                await self.embed(
+                    GEMINI_EMBEDDING_MODEL,
+                    "Gemini readiness probe",
+                    dimensions=768,
+                    truncate=False,
+                )
+            except GeminiAuthenticationError:
+                raise
+            except (
+                GeminiTimeoutError,
+                GeminiUnavailableError,
+                EmbeddingContextRejectedError,
+                ModelIncompatibleError,
+            ) as exc:
+                incompatible.append(GEMINI_EMBEDDING_MODEL)
+                errors.append(str(exc))
+            except BaseException as exc:
+                translated = self._translate_transport_error(
+                    exc,
+                    embedding_context=True,
+                )
+                incompatible.append(GEMINI_EMBEDDING_MODEL)
+                errors.append(str(translated))
 
         return OllamaReadiness(
-            available=not incompatible,
+            available=not incompatible and not errors,
             version=None,
             base_url=GEMINI_ENDPOINT,
             missing_models=(),
             incompatible_models=tuple(sorted(set(incompatible))),
-            errors=(),
+            errors=tuple(dict.fromkeys(errors)),
         )
 
     async def _invoke(self, method_name: str, **kwargs: Any) -> Any:
@@ -302,6 +390,33 @@ class GeminiGateway:
                 exc,
                 embedding_context=embedding_context,
             )
+        raise sanitized from None
+
+    async def _invoke_decisions(self, **kwargs: Any) -> Any:
+        method = getattr(self._decisions(), "create")
+        try:
+            if inspect.iscoroutinefunction(method):
+                result = method(**kwargs)
+                return await asyncio.wait_for(
+                    result,
+                    timeout=self.timeout_seconds,
+                )
+            result = await asyncio.wait_for(
+                asyncio.to_thread(method, **kwargs),
+                timeout=self.timeout_seconds,
+            )
+            return result
+        except (
+            GeminiUnavailableError,
+            GeminiAuthenticationError,
+            GeminiStructuredOutputError,
+            ModelIncompatibleError,
+        ):
+            raise
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            sanitized = self._translate_transport_error(exc)
         raise sanitized from None
 
     async def embed(
@@ -595,84 +710,38 @@ class GeminiGateway:
             raise ModelIncompatibleError(
                 "Gemini decision operations require gemini-decision-1."
             )
-
-        prompt_payload = {
-            "state": state,
-            "questions": dict(questions),
-            "output_contract": {
-                "answers": {
-                    question_name: {
-                        "type": "choice",
-                        "choice": "accept",
-                        "probabilities": {
-                            "accept": 0.0,
-                            "reject": 0.0,
-                            "review": 0.0,
-                        },
-                        "confidence": 0.0,
-                    }
-                    for question_name in questions
-                }
-            },
-        }
-        prompt = (
-            "Return only a JSON object for the following tag decisions. "
-            "Every answer must use one of accept, reject, or review, and "
-            "probabilities must sum to 1.0.\n"
-            + json.dumps(prompt_payload, ensure_ascii=False)
+        shared_input = (
+            state
+            if isinstance(state, str)
+            else json.dumps(state, ensure_ascii=False)
         )
-        schema = {
-            "type": "object",
-            "properties": {
-                "answers": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "object",
-                        "properties": {
-                            "type": {"const": "choice"},
-                            "choice": {
-                                "enum": ["accept", "reject", "review"],
-                            },
-                            "probabilities": {
-                                "type": "object",
-                                "properties": {
-                                    "accept": {"type": "number"},
-                                    "reject": {"type": "number"},
-                                    "review": {"type": "number"},
-                                },
-                                "required": ["accept", "reject", "review"],
-                            },
-                            "confidence": {"type": "number"},
-                        },
-                        "required": [
-                            "type",
-                            "choice",
-                            "probabilities",
-                            "confidence",
-                        ],
-                    },
-                }
-            },
-            "required": ["answers"],
-        }
-        text = await self.chat(
-            model,
-            messages=[{"role": "user", "content": prompt}],
-            schema=schema,
-        )
-        parsed = self._parse_structured_json(text)
-        if not isinstance(parsed, Mapping):
-            raise GeminiStructuredOutputError(
-                "Gemini decision response must be a JSON object."
+        try:
+            result = await self._invoke_decisions(
+                model=model,
+                input=shared_input,
+                questions=dict(questions),
             )
-        answers = parsed.get("answers")
-        if not isinstance(answers, Mapping):
+        except GeminiStructuredOutputError:
+            raise
+
+        answers = getattr(result, "answers", None)
+        if answers is None and isinstance(result, Mapping):
+            answers = result.get("answers")
+        raw_answers: Mapping[str, Any] | None
+        if isinstance(answers, Mapping):
+            raw_answers = dict(answers)
+        else:
+            raw_answers = {
+                key: value
+                for key, value in vars(answers).items()
+            } if answers is not None and hasattr(answers, "__dict__") else None
+        if not isinstance(raw_answers, Mapping):
             raise GeminiStructuredOutputError(
                 "Gemini decision response is missing the answers mapping."
             )
 
         requested_ids = set(questions)
-        returned_ids = set(answers)
+        returned_ids = set(raw_answers)
         if not all(isinstance(answer_id, str) for answer_id in returned_ids):
             raise GeminiStructuredOutputError(
                 "Gemini decision response returned an invalid answer ID."
@@ -683,8 +752,25 @@ class GeminiGateway:
             )
 
         choice_names = {"accept", "reject", "review"}
+        normalized_answers: dict[str, dict[str, Any]] = {}
         for question_id in requested_ids:
-            answer = answers[question_id]
+            raw_answer = raw_answers[question_id]
+            if isinstance(raw_answer, Mapping):
+                answer = dict(raw_answer)
+            else:
+                answer = {
+                    key: getattr(raw_answer, key)
+                    for key in (
+                        "type",
+                        "choice",
+                        "probabilities",
+                        "confidence",
+                        "noul",
+                        "score",
+                        "legend",
+                    )
+                    if hasattr(raw_answer, key)
+                }
             if not isinstance(answer, Mapping):
                 raise GeminiStructuredOutputError(
                     "Gemini choice answers must be mappings."
@@ -701,18 +787,24 @@ class GeminiGateway:
                 )
 
             probabilities = answer.get("probabilities")
-            if not isinstance(probabilities, Mapping):
-                raise GeminiStructuredOutputError(
-                    "Gemini choice probabilities must be a mapping."
-                )
-            if set(probabilities) != choice_names:
+            if isinstance(probabilities, Mapping):
+                probability_values = dict(probabilities)
+            elif probabilities is not None:
+                probability_values = {
+                    choice_name: getattr(probabilities, choice_name)
+                    for choice_name in choice_names
+                    if hasattr(probabilities, choice_name)
+                }
+            else:
+                probability_values = {}
+            if set(probability_values) != choice_names:
                 raise GeminiStructuredOutputError(
                     "Gemini choice probabilities must contain exactly accept, reject, and review."
                 )
 
             checked: dict[str, float] = {}
             for choice_name in choice_names:
-                raw_probability = probabilities[choice_name]
+                raw_probability = probability_values[choice_name]
                 if isinstance(raw_probability, bool) or not isinstance(
                     raw_probability,
                     (int, float),
@@ -767,5 +859,11 @@ class GeminiGateway:
                 raise GeminiStructuredOutputError(
                     "Gemini choice confidence must match the selected probability."
                 )
+            normalized_answers[question_id] = {
+                "type": "choice",
+                "choice": choice,
+                "probabilities": checked,
+                "confidence": confidence,
+            }
 
-        return {"answers": dict(answers)}
+        return {"answers": normalized_answers}
