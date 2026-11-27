@@ -99,6 +99,23 @@ def test_rpg_outline_creates_targeted_search_intents() -> None:
     assert "Normalized Markdown context:" in prompt
 
 
+def test_gemini_planning_model_uses_injected_gateway_without_ollama_fallback() -> None:
+    gateway = FakePlannerGateway(VALID_PLAN_JSON)
+
+    plan = build_search_plan(
+        question="Find encounters",
+        markdown_context="Level 3",
+        model="gemini-4-hydrogen",
+        fallback_model=None,
+        gateway=gateway,
+    )
+
+    assert plan.intent_names
+    assert [call["model"] for call in gateway.chat_calls] == [
+        "gemini-4-hydrogen"
+    ]
+
+
 def test_markdown_sections_and_entities_are_normalized() -> None:
     context = normalize_markdown_context(
         """

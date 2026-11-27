@@ -218,7 +218,7 @@ def _validate_request(
     if not isinstance(question, str) or not question.strip():
         raise ValueError("A nonempty search question is required.")
     if not isinstance(model, str) or not model.strip():
-        raise ValueError("A local search planning model is required.")
+        raise ValueError("A search planning model name is required.")
     checked_question = " ".join(unicodedata.normalize("NFKC", question).split())
     if len(checked_question) > MAX_QUESTION_LENGTH:
         raise ValueError(

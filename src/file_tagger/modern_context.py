@@ -1071,17 +1071,23 @@ class ModernRuntime:
             provider = self._active_provider
             gemini_api_key = self._gemini_api_key
         if gateway is None:
-            gateway = (
-                GeminiGateway(gemini_api_key)
-                if provider == "gemini" and gemini_api_key
-                else OllamaGateway()
-            )
+            if provider == "gemini":
+                if not gemini_api_key:
+                    raise ModernSearchUnavailable(
+                        "The Gemini generation gateway is unavailable."
+                    )
+                gateway = GeminiGateway(gemini_api_key)
+            else:
+                gateway = OllamaGateway()
         if embedding_gateway is None:
-            embedding_gateway = (
-                _FreshGeminiEmbeddingGateway(gemini_api_key)
-                if provider == "gemini" and gemini_api_key
-                else _FreshOllamaEmbeddingGateway()
-            )
+            if provider == "gemini":
+                if not gemini_api_key:
+                    raise ModernSearchUnavailable(
+                        "The Gemini embedding gateway is unavailable."
+                    )
+                embedding_gateway = _FreshGeminiEmbeddingGateway(gemini_api_key)
+            else:
+                embedding_gateway = _FreshOllamaEmbeddingGateway()
         rag = RagService(
             search=search,
             gateway=gateway,

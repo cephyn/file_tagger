@@ -127,6 +127,65 @@ class FakeGateway:
         return SimpleNamespace(answers=answers)
 
 
+def test_gemini_candidate_and_decision_models_use_injected_gateways() -> None:
+    candidate_gateway = FakeGateway(["flooded ruin"])
+    decision_gateway = FakeGateway([])
+
+    class DecisionOnlyGateway:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def model_profile(self, role: str, model: str) -> ModelProfile:
+            return ModelProfile(
+                role="decision",
+                model=model,
+                digest="gemini-decision-digest",
+                context_length=32_768,
+                capabilities=("systemone",),
+            )
+
+        async def system_one(
+            self,
+            model: str,
+            *,
+            state: Any,
+            questions: Mapping[str, Any],
+        ) -> SimpleNamespace:
+            self.calls.append(
+                {"model": model, "state": state, "questions": questions}
+            )
+            answer = {
+                "type": "choice",
+                "choice": "accept",
+                "probabilities": {"accept": 0.9, "review": 0.05, "reject": 0.05},
+                "confidence": 0.9,
+            }
+            return SimpleNamespace(
+                answers={name: answer for name in questions}
+            )
+
+    selected_decision_gateway = DecisionOnlyGateway()
+    result = recommend_tags(
+        "A flooded ruin",
+        file_hash="gemini-content",
+        extraction_version="docling-v1",
+        search=FakeSearch([]),
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        gateway=candidate_gateway,
+        decision_gateway=selected_decision_gateway,
+        semantic_limit=12,
+    )
+
+    assert [call["model"] for call in candidate_gateway.chat_calls] == [
+        "gemini-4-hydrogen"
+    ]
+    assert [call["model"] for call in selected_decision_gateway.calls] == [
+        "gemini-decision-1"
+    ]
+    assert {item.tag for item in result.decisions} == {"flooded ruin"}
+
+
 def test_tag_query_embedding_splits_context_rejections() -> None:
     document_state = "left paragraph\n\nright paragraph"
     profile = ModelProfile(
@@ -1185,6 +1244,113 @@ def test_production_tag_suggester_rejects_incomplete_runtime_selection(
             cache=InMemoryTagRecommendationCache(),
             modern_runtime=runtime,
         ).recommend_tags_for_file(str(source))
+
+
+def test_tag_suggester_prefers_modern_gemini_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "gemini-routing.sqlite")
+    source = tmp_path / "gemini-routing.txt"
+    source.write_text("gemini routing", encoding="utf-8")
+
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    candidate_gateway = object()
+    decision_gateway = object()
+    embedding_gateway = object()
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=candidate_gateway,
+        decision_gateway=decision_gateway,
+        embedding_gateway=embedding_gateway,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["gateway"] is candidate_gateway
+    assert captured["decision_gateway"] is decision_gateway
+    assert captured["embedding_gateway"] is embedding_gateway
+
+
+def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "explicit-routing.sqlite")
+    source = tmp_path / "explicit-routing.txt"
+    source.write_text("explicit routing", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    explicit_candidate = object()
+    explicit_decision = object()
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=object(),
+        decision_gateway=object(),
+        embedding_gateway=object(),
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=explicit_candidate,
+        decision_gateway=explicit_decision,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["gateway"] is explicit_candidate
+    assert captured["decision_gateway"] is explicit_decision
+    assert captured["embedding_gateway"] is explicit_candidate
 
 
 def test_runtime_helpers_do_not_fall_back_to_stale_readiness_report() -> None:

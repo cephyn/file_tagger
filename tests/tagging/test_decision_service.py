@@ -73,6 +73,20 @@ def test_tag_decision_uses_one_installed_model_request() -> None:
     assert len(gateway.calls[0]["questions"]) == 3
 
 
+def test_gemini_decision_model_uses_injected_gateway() -> None:
+    gateway = FakeGateway([choice("accept", 0.93)])
+
+    result = decide_tags(
+        document_state="encounter table for a flooded ruin",
+        candidates=["dungeon"],
+        model="gemini-decision-1",
+        gateway=gateway,
+    )
+
+    assert [decision.tag for decision in result.accepted] == ["dungeon"]
+    assert gateway.calls[0]["model"] == "gemini-decision-1"
+
+
 @pytest.mark.parametrize("model", ["nimble:9b", "tev1:4b", "tev1:0.8b"])
 def test_supported_decision_models_share_the_contract(model: str) -> None:
     gateway = FakeGateway([choice("accept", 0.75)])

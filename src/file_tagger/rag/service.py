@@ -150,7 +150,7 @@ class RagService:
         if max_sections_per_file <= 0:
             raise ValueError("The per-file evidence limit must be positive.")
         if not isinstance(model, str) or not model.strip():
-            raise ValueError("A local generation model name is required.")
+            raise ValueError("A generation model name is required.")
         self._search = search
         self._gateway: GenerationGateway = gateway or OllamaGateway()
         self._planner = planner
@@ -369,10 +369,16 @@ class RagService:
                         raise ValueError(
                             "Search evidence or a HybridSearch service is required."
                         )
+                    planner_kwargs: dict[str, Any] = {"gateway": self._gateway}
+                    if self.model == "gemini-4-hydrogen":
+                        planner_kwargs.update(
+                            model=self.model,
+                            fallback_model=None,
+                        )
                     planned = self._planner(
                         original_question,
                         checked_context,
-                        gateway=self._gateway,
+                        **planner_kwargs,
                     )
                     plan = (
                         planned
@@ -526,10 +532,16 @@ class RagService:
                         raise ValueError(
                             "Search evidence or a HybridSearch service is required."
                         )
+                    planner_kwargs: dict[str, Any] = {"gateway": self._gateway}
+                    if self.model == "gemini-4-hydrogen":
+                        planner_kwargs.update(
+                            model=self.model,
+                            fallback_model=None,
+                        )
                     planned = self._planner(
                         original_question,
                         checked_context,
-                        gateway=self._gateway,
+                        **planner_kwargs,
                     )
                     plan = (
                         planned
@@ -1802,7 +1814,7 @@ def _validate_question(question: str) -> str:
 
 def _validate_model(model: str) -> str:
     if not isinstance(model, str) or not model.strip():
-        raise ValueError("A local generation model name is required.")
+        raise ValueError("A generation model name is required.")
     return model.strip()
 
 

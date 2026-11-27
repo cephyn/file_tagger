@@ -108,7 +108,7 @@ def _validate_request(
     if not isinstance(document_state, str) or not document_state.strip():
         raise ValueError("Document state must be a nonempty string.")
     if not isinstance(model, str) or not model.strip():
-        raise ValueError("A local Ollama model name is required.")
+        raise ValueError("A decision model name is required.")
     if isinstance(candidates, str):
         raise ValueError("Candidates must be a sequence of tag names.")
 

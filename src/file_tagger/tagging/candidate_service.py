@@ -94,6 +94,7 @@ def recommend_tags(
     cache: TagRecommendationCache | None = None,
     gateway: CandidateGateway | None = None,
     decision_gateway: Any | None = None,
+    embedding_gateway: Any | None = None,
     max_candidates: int = DEFAULT_MAX_TAG_CANDIDATES,
     semantic_limit: int = DEFAULT_SEMANTIC_RESULT_LIMIT,
     confirmation_threshold: float = DEFAULT_CONFIRMATION_THRESHOLD,
@@ -118,6 +119,7 @@ def recommend_tags(
             cache=cache,
             gateway=gateway,
             decision_gateway=decision_gateway,
+            embedding_gateway=embedding_gateway,
             max_candidates=max_candidates,
             semantic_limit=semantic_limit,
             confirmation_threshold=confirmation_threshold,
@@ -145,6 +147,7 @@ async def recommend_tags_async(
     cache: TagRecommendationCache | None = None,
     gateway: CandidateGateway | None = None,
     decision_gateway: Any | None = None,
+    embedding_gateway: Any | None = None,
     max_candidates: int = DEFAULT_MAX_TAG_CANDIDATES,
     semantic_limit: int = DEFAULT_SEMANTIC_RESULT_LIMIT,
     confirmation_threshold: float = DEFAULT_CONFIRMATION_THRESHOLD,
@@ -169,12 +172,13 @@ async def recommend_tags_async(
     owns_gateway = gateway is None
     selected_gateway: CandidateGateway = gateway or OllamaGateway()
     selected_decision_gateway = decision_gateway or selected_gateway
+    selected_embedding_gateway = embedding_gateway or selected_gateway
     document_state_digest = hashlib.sha256(document_state.encode("utf-8")).hexdigest()
     try:
         resolved_query_embedding = query_embedding
         if resolved_query_embedding is None and embedding_profile is not None:
             resolved_query_embedding = await _embed_document_query(
-                selected_gateway,
+                selected_embedding_gateway,
                 document_state,
                 embedding_profile,
             )
@@ -296,6 +300,7 @@ class CandidateService:
         *,
         gateway: CandidateGateway | None = None,
         decision_gateway: Any | None = None,
+        embedding_gateway: Any | None = None,
         cache: TagRecommendationCache | None = None,
         candidate_model: str = DEFAULT_CANDIDATE_MODEL,
         decision_model: str = DEFAULT_DECISION_MODEL,
@@ -308,6 +313,7 @@ class CandidateService:
         self._search = search
         self._gateway = gateway
         self._decision_gateway = decision_gateway
+        self._embedding_gateway = embedding_gateway
         self._cache = cache
         self._candidate_model = candidate_model
         self._decision_model = decision_model
@@ -329,6 +335,7 @@ class CandidateService:
             "search": self._search,
             "gateway": self._gateway,
             "decision_gateway": self._decision_gateway,
+            "embedding_gateway": self._embedding_gateway,
             "cache": self._cache,
             "candidate_model": self._candidate_model,
             "decision_model": self._decision_model,
@@ -358,6 +365,7 @@ class CandidateService:
             "search": self._search,
             "gateway": self._gateway,
             "decision_gateway": self._decision_gateway,
+            "embedding_gateway": self._embedding_gateway,
             "cache": self._cache,
             "candidate_model": self._candidate_model,
             "decision_model": self._decision_model,

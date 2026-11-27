@@ -180,6 +180,7 @@ class TagSuggester:
                     ),
                     gateway=self._gateway,
                     decision_gateway=self._decision_gateway,
+                    embedding_gateway=self._gateway,
                     cache=selected_cache,
                 )
             elif candidate_model is None or decision_model is None:
@@ -187,13 +188,52 @@ class TagSuggester:
                     "Modern runtime model selection is incomplete."
                 )
             else:
+                runtime_candidate_gateway = getattr(
+                    self.modern_runtime,
+                    "candidate_gateway",
+                    None,
+                )
+                runtime_decision_gateway = getattr(
+                    self.modern_runtime,
+                    "decision_gateway",
+                    None,
+                )
+                runtime_embedding_gateway = getattr(
+                    self.modern_runtime,
+                    "embedding_gateway",
+                    None,
+                )
+                selected_candidate_gateway = (
+                    self._gateway
+                    if self._gateway is not None
+                    else runtime_candidate_gateway
+                )
+                selected_decision_gateway = (
+                    self._decision_gateway
+                    if self._decision_gateway is not None
+                    else runtime_decision_gateway
+                )
+                selected_embedding_gateway = (
+                    self._gateway
+                    if self._gateway is not None
+                    else runtime_embedding_gateway
+                )
+                provider = _runtime_provider(self.modern_runtime)
+                if provider == "gemini":
+                    if selected_candidate_gateway is None:
+                        raise ValueError("The Gemini candidate gateway is unavailable.")
+                    if selected_decision_gateway is None:
+                        raise ValueError("The Gemini decision gateway is unavailable.")
+                    if selected_embedding_gateway is None:
+                        raise ValueError("The Gemini embedding gateway is unavailable.")
                 service = CandidateService(
                     HybridSearch(
                         search_session,
                         embedding_profile=embedding_profile,
                     ),
-                    gateway=self._gateway,
-                    decision_gateway=self._decision_gateway,
+                    gateway=selected_candidate_gateway,
+                    decision_gateway=selected_decision_gateway,
+                    embedding_gateway=selected_embedding_gateway,
                     cache=selected_cache,
                     candidate_model=candidate_model,
                     decision_model=decision_model,
@@ -245,6 +285,21 @@ class TagSuggester:
         except Exception as e:
             print(f"Error suggesting tags for {file_path}: {str(e)}")
             return {}
+
+
+def _runtime_provider(runtime: Any | None) -> str | None:
+    if runtime is None:
+        return None
+    provider = getattr(runtime, "active_provider", None)
+    if isinstance(provider, str) and provider.strip():
+        return provider.strip().casefold()
+    provider = getattr(runtime, "provider", None)
+    if isinstance(provider, str) and provider.strip():
+        return provider.strip().casefold()
+    candidate_model = getattr(runtime, "candidate_model", None)
+    if candidate_model == "gemini-4-hydrogen":
+        return "gemini"
+    return None
 
 
 def _runtime_embedding_profile(runtime: Any | None) -> ModelProfile | None:

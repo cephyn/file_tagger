@@ -90,6 +90,125 @@ def _evidence() -> tuple[SearchResult, ...]:
     )
 
 
+def test_gemini_rag_routes_planning_embedding_and_generation_gateways() -> None:
+    evidence = _evidence()
+    claim = "A dragon guards the flooded temple."
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiSearch:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def search(
+            self,
+            query: str,
+            query_embedding: Sequence[float] | None = None,
+            **kwargs: Any,
+        ) -> tuple[SearchResult, ...]:
+            self.calls.append(
+                {"query": query, "query_embedding": query_embedding, **kwargs}
+            )
+            return evidence
+
+    class GeminiEmbeddingGateway:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+        ) -> tuple[tuple[float, ...], ...]:
+            queries = (text,) if isinstance(text, str) else tuple(text)
+            self.calls.append(
+                {
+                    "model": model,
+                    "queries": queries,
+                    "dimensions": dimensions,
+                    "truncate": truncate,
+                }
+            )
+            return tuple((0.0,) * 768 for _ in queries)
+
+    generation_gateway = ProfiledFakeModel(
+        json.dumps(
+            {
+                "answer": claim,
+                "claims": [
+                    {
+                        "text": claim,
+                        "evidence_quote": claim,
+                        "chunk_ids": [evidence[0].chunk_id],
+                    }
+                ],
+            }
+        )
+    )
+    embedding_gateway = GeminiEmbeddingGateway()
+    search = GeminiSearch()
+    planner_calls: list[dict[str, Any]] = []
+
+    def gemini_planner(
+        question: str,
+        markdown_context: str = "",
+        *,
+        gateway: Any | None = None,
+        model: str | None = None,
+        fallback_model: str | None = None,
+    ) -> SearchPlan:
+        planner_calls.append(
+            {
+                "question": question,
+                "markdown_context": markdown_context,
+                "gateway": gateway,
+                "model": model,
+                "fallback_model": fallback_model,
+            }
+        )
+        return SearchPlan(
+            question=question,
+            intent_names=("encounters",),
+            exact_terms=("flooded temple",),
+            paraphrase_queries=("temple guardians",),
+            evidence_categories=("encounters",),
+        )
+
+    service = RagService(
+        search=search,
+        gateway=generation_gateway,
+        embedding_gateway=embedding_gateway,
+        planner=gemini_planner,
+        model="gemini-4-hydrogen",
+        embedding_profile=profile,
+    )
+
+    answer = service.answer_question(
+        "Find suitable encounters",
+        markdown_context="A flooded ruin",
+    )
+
+    assert answer.text == claim
+    assert planner_calls[0]["gateway"] is generation_gateway
+    assert planner_calls[0]["model"] == "gemini-4-hydrogen"
+    assert planner_calls[0]["fallback_model"] is None
+    assert [call["model"] for call in embedding_gateway.calls] == [
+        "gemini-embedding-2"
+    ]
+    assert [call["model"] for call in generation_gateway.chat_calls] == [
+        "gemini-4-hydrogen"
+    ]
+
+
 def test_answer_without_valid_citation_is_rejected() -> None:
     fake_model = FakeModel(
         "The adventure should include a dragon. [source: invented]"
