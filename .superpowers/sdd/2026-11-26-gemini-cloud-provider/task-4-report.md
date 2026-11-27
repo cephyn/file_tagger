@@ -70,3 +70,28 @@ Implemented and verified.
 - GREEN: focused exact-profile routing suite passed `5 passed, 88 deselected`.
 - The focused `tests/rag/test_rag_service.py` suite passed `93 passed`.
 - Full suite passed `558 passed, 62 skipped, 2 warnings` in `74.37s`.
+
+## Final Candidate and TagSuggester Exact-Profile Fix Evidence
+
+- `CandidateService.recommend_tags_async` now requires exact
+  `gemini-embedding-2` profiles to use an explicit embedding gateway that is
+  distinct from the candidate/generation gateway, is not an `OllamaGateway`,
+  and has `provider == "gemini"`.
+- `TagSuggester` now applies the same exact-profile identity and provider checks
+  before constructing `CandidateService`, including runtime precedence for the
+  runtime embedding gateway.
+- Added focused candidate coverage for:
+  - exact Gemini embedding profile reusing the generation gateway raises;
+  - an unmarked embedding gateway raises;
+  - a distinct provider-marked Gemini embedding gateway is accepted.
+- Added focused runtime `TagSuggester` coverage for:
+  - runtime exact Gemini embedding using the runtime embedding gateway;
+  - runtime candidate-gateway reuse raising;
+  - an unmarked runtime embedding gateway raising.
+- RED: the new exact-profile routing group initially failed `4` tests and passed
+  `2`; generation-gateway reuse and unmarked gateways were accepted in
+  `CandidateService` and `TagSuggester`.
+- GREEN: the focused exact-profile routing group passed `6 passed`.
+- The complete `tests/tagging/test_candidate_service.py` module passed
+  `36 passed`.
+- Full suite passed `564 passed, 62 skipped, 2 warnings` in `72.27s`.

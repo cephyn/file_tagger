@@ -27,6 +27,7 @@ from .tagging.candidate_service import CandidateService
 from .extraction.docling_adapter import extract_document
 from .domain.errors import GeminiUnavailableError
 from .adapters.ollama.gateway import OllamaGateway
+from .adapters.gemini.gateway import GEMINI_EMBEDDING_MODEL
 
 
 MAX_DOCUMENT_STATE_SAMPLE_BYTES = 16 * 1024
@@ -226,6 +227,20 @@ class TagSuggester:
                     if self._embedding_gateway is not None
                     else runtime_embedding_gateway
                 )
+                exact_gemini_embedding_profile = (
+                    embedding_profile is not None
+                    and embedding_profile.model == GEMINI_EMBEDDING_MODEL
+                )
+                if exact_gemini_embedding_profile and (
+                    selected_embedding_gateway is None
+                    or selected_embedding_gateway is selected_candidate_gateway
+                    or isinstance(selected_embedding_gateway, OllamaGateway)
+                    or getattr(selected_embedding_gateway, "provider", None)
+                    != "gemini"
+                ):
+                    raise GeminiUnavailableError(
+                        "The Gemini embedding gateway is unavailable."
+                    )
                 provider = _runtime_provider(self.modern_runtime)
                 if provider == "gemini":
                     if (

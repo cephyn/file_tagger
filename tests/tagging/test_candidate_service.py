@@ -246,6 +246,109 @@ def test_exact_gemini_embedding_model_without_embedding_gateway_raises_unavailab
         )
 
 
+def test_exact_gemini_embedding_profile_rejects_generation_gateway_reuse() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    generation_gateway = FakeGateway(["flooded ruin"])
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-reused-embedding-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+            gateway=generation_gateway,
+            embedding_gateway=generation_gateway,
+            embedding_profile=profile,
+            query_embedding=(0.0,),
+        )
+
+
+def test_exact_gemini_embedding_profile_rejects_gateway_without_gemini_provider() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class DuckTypedEmbeddingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            **kwargs: Any,
+        ) -> tuple[tuple[float, ...], ...]:
+            return ((0.0,),)
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-unmarked-embedding-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+            gateway=FakeGateway(["flooded ruin"]),
+            embedding_gateway=DuckTypedEmbeddingGateway(),
+            embedding_profile=profile,
+            query_embedding=(0.0,),
+        )
+
+
+def test_exact_gemini_embedding_profile_accepts_distinct_gemini_gateway() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiEmbeddingGateway:
+        provider = "gemini"
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            **kwargs: Any,
+        ) -> tuple[tuple[float, ...], ...]:
+            return ((0.0,),)
+
+    result = recommend_tags(
+        "A flooded ruin",
+        file_hash="gemini-distinct-embedding-gateway",
+        extraction_version="docling-v1",
+        search=FakeSearch([]),
+        candidate_model="inkling-2-mini",
+        decision_model="nimble:9b",
+        gateway=FakeGateway(["flooded ruin"]),
+        embedding_gateway=GeminiEmbeddingGateway(),
+        embedding_profile=profile,
+        query_embedding=(0.0,),
+    )
+
+    assert result is not None
+
+
 def test_tag_query_embedding_splits_context_rejections() -> None:
     document_state = "left paragraph\n\nright paragraph"
     profile = ModelProfile(
@@ -1327,7 +1430,7 @@ def test_tag_suggester_prefers_modern_gemini_gateways(
     )
     candidate_gateway = object()
     decision_gateway = object()
-    embedding_gateway = object()
+    embedding_gateway = SimpleNamespace(provider="gemini")
     captured: dict[str, Any] = {}
 
     class CapturingCandidateService:
@@ -1360,6 +1463,165 @@ def test_tag_suggester_prefers_modern_gemini_gateways(
     assert captured["embedding_gateway"] is embedding_gateway
 
 
+def test_tag_suggester_runtime_exact_gemini_uses_runtime_embedding_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "runtime-gemini-embedding.sqlite")
+    source = tmp_path / "runtime-gemini-embedding.txt"
+    source.write_text("runtime gemini embedding", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiGateway:
+        provider = "gemini"
+
+    candidate_gateway = GeminiGateway()
+    decision_gateway = GeminiGateway()
+    embedding_gateway = GeminiGateway()
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=candidate_gateway,
+        decision_gateway=decision_gateway,
+        embedding_gateway=embedding_gateway,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["gateway"] is candidate_gateway
+    assert captured["embedding_gateway"] is embedding_gateway
+
+
+def test_tag_suggester_runtime_exact_gemini_rejects_candidate_gateway_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "runtime-gemini-reuse.sqlite")
+    source = tmp_path / "runtime-gemini-reuse.txt"
+    source.write_text("runtime gemini reuse", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiGateway:
+        provider = "gemini"
+
+    candidate_gateway = GeminiGateway()
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            raise AssertionError("CandidateService must not be constructed")
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=candidate_gateway,
+        decision_gateway=GeminiGateway(),
+        embedding_gateway=candidate_gateway,
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_tag_suggester_runtime_exact_gemini_rejects_unmarked_embedding_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "runtime-gemini-unmarked.sqlite")
+    source = tmp_path / "runtime-gemini-unmarked.txt"
+    source.write_text("runtime gemini unmarked", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiGateway:
+        provider = "gemini"
+
+    class DuckTypedEmbeddingGateway:
+        pass
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            raise AssertionError("CandidateService must not be constructed")
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=GeminiGateway(),
+        decision_gateway=GeminiGateway(),
+        embedding_gateway=DuckTypedEmbeddingGateway(),
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
 def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1380,7 +1642,7 @@ def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
     )
     explicit_candidate = object()
     explicit_decision = object()
-    runtime_embedding = object()
+    runtime_embedding = SimpleNamespace(provider="gemini")
     captured: dict[str, Any] = {}
 
     class CapturingCandidateService:
@@ -1432,8 +1694,8 @@ def test_tag_suggester_explicit_embedding_gateway_overrides_runtime(
         dimensions=768,
         capabilities=("embedding",),
     )
-    explicit_embedding = object()
-    runtime_embedding = object()
+    explicit_embedding = SimpleNamespace(provider="gemini")
+    runtime_embedding = SimpleNamespace(provider="gemini")
     captured: dict[str, Any] = {}
 
     class CapturingCandidateService:

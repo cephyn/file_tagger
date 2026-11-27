@@ -192,13 +192,15 @@ async def recommend_tags_async(
         raise GeminiUnavailableError(
             "The Gemini decision gateway is unavailable."
         )
-    if (
+    exact_gemini_embedding_profile = (
         embedding_profile is not None
         and embedding_profile.model == GEMINI_EMBEDDING_MODEL
-        and (
-            embedding_gateway is None
-            or isinstance(embedding_gateway, OllamaGateway)
-        )
+    )
+    if exact_gemini_embedding_profile and (
+        embedding_gateway is None
+        or embedding_gateway is gateway
+        or isinstance(embedding_gateway, OllamaGateway)
+        or getattr(embedding_gateway, "provider", None) != "gemini"
     ):
         raise GeminiUnavailableError(
             "The Gemini embedding gateway is unavailable."
