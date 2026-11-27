@@ -680,6 +680,39 @@ def test_manager_import_preserves_modern_tag_suggestion() -> None:
     assert module.TagSuggestionDialog is tag_suggestion.TagSuggestionDialog
 
 
+def test_gemini_not_ready_displays_safe_underlying_error(qtbot) -> None:
+    class Config:
+        def get_ai_provider(self) -> str:
+            return "gemini"
+
+        def get_gemini_api_key(self) -> str | None:
+            return "stored-secret"
+
+    report = _report().model_copy(
+        update={
+            "provider": "gemini",
+            "ready": False,
+            "errors": ("Gemini authentication failed.",),
+            "instructions": (
+                "Check Gemini availability and API-key permissions.",
+            ),
+            "gemini": GeminiReadiness(
+                available=False,
+                key_configured=True,
+                api_key_configured=True,
+                missing_key=False,
+                errors=("Gemini authentication failed.",),
+            ),
+        }
+    )
+    dialog = OllamaSettingsDialog(report, config=Config())
+    qtbot.addWidget(dialog)
+
+    assert dialog.gemini_readiness_status.text() == "Not ready"
+    assert "Gemini authentication failed." in dialog.gemini_readiness_detail.text()
+    assert "stored-secret" not in dialog.gemini_readiness_detail.text()
+
+
 def test_gemini_provider_controls_use_exact_models_and_mask_key(qtbot) -> None:
     class Config:
         def get_ai_provider(self) -> str:

@@ -139,6 +139,10 @@ class OllamaSettingsDialog(QDialog):
         gemini_layout.addRow("", self.clear_gemini_key_button)
         self.gemini_readiness_status = QLabel()
         gemini_layout.addRow("Readiness:", self.gemini_readiness_status)
+        self.gemini_readiness_detail = QLabel()
+        self.gemini_readiness_detail.setObjectName("gemini_readiness_detail")
+        self.gemini_readiness_detail.setWordWrap(True)
+        gemini_layout.addRow("Details:", self.gemini_readiness_detail)
         self.gemini_model_labels: dict[str, QLabel] = {}
         for role, model in (
             ("generation", "gemini-4-hydrogen"),
@@ -426,6 +430,32 @@ class OllamaSettingsDialog(QDialog):
             else:
                 status = "Not ready"
             self.gemini_readiness_status.setText(status)
+            details: list[str] = []
+            if gemini is not None:
+                details.extend(
+                    error
+                    for error in getattr(gemini, "errors", ())
+                    if isinstance(error, str) and error.strip()
+                )
+            details.extend(
+                error
+                for error in getattr(report, "errors", ())
+                if isinstance(error, str)
+                and error.strip()
+                and error not in details
+            )
+            details.extend(
+                instruction
+                for instruction in getattr(report, "instructions", ())
+                if isinstance(instruction, str)
+                and instruction.strip()
+                and instruction not in details
+            )
+            self.gemini_readiness_detail.setText(
+                "\n".join(dict.fromkeys(details))
+                if details
+                else "No Gemini readiness details are available."
+            )
             self._refresh_gemini_key_status()
             self.ok_button.setEnabled(True)
             return
@@ -859,15 +889,24 @@ class OllamaSettingsDialog(QDialog):
         elif error is not None:
             if self.provider_selector.currentText().lower() == "gemini":
                 self.gemini_readiness_status.setText("Not ready")
+                detail = f"Refresh failed: {error.__class__.__name__}"
+                self.gemini_readiness_detail.setText(detail)
                 self.ok_button.setEnabled(True)
+                self.instructions.setText(detail)
             else:
                 self.ok_button.setEnabled(False)
-            self.instructions.setText(
-                f"Refresh failed: {error.__class__.__name__}: {error}"
-            )
+                self.instructions.setText(
+                    f"Refresh failed: {error.__class__.__name__}: {error}"
+                )
         else:
             if self.provider_selector.currentText().lower() == "gemini":
                 self.gemini_readiness_status.setText("Not ready")
+                reason = getattr(
+                    self._refresh_provider,
+                    "unavailable_reason",
+                    "The readiness refresh completed without a result.",
+                )
+                self.gemini_readiness_detail.setText(str(reason))
                 self.ok_button.setEnabled(True)
             else:
                 self.ok_button.setEnabled(False)
