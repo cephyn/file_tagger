@@ -73,7 +73,7 @@ def test_exact_model_names_and_profiles_are_stable() -> None:
         gateway.model_profile("embedding", GEMINI_EMBEDDING_MODEL)
     )
 
-    assert generation.model == "gemini-4-neon"
+    assert generation.model == "gemini-4-hydrogen"
     assert decision.model == "gemini-decision-1"
     assert embedding.model == "gemini-embedding-2"
     assert generation.role == "generation"

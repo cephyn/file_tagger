@@ -21,7 +21,7 @@ from ...domain.errors import (
 
 ModelRole = Literal["embedding", "decision", "generation"]
 
-GEMINI_GENERATION_MODEL = "gemini-4-neon"
+GEMINI_GENERATION_MODEL = "gemini-4-hydrogen"
 GEMINI_DECISION_MODEL = "gemini-decision-1"
 GEMINI_EMBEDDING_MODEL = "gemini-embedding-2"
 
@@ -376,7 +376,7 @@ class GeminiGateway:
     ) -> AsyncIterator[str]:
         if model != GEMINI_GENERATION_MODEL:
             raise ModelIncompatibleError(
-                "Gemini streaming chat operations require gemini-4-neon."
+                "Gemini streaming chat operations require gemini-4-hydrogen."
             )
         contents, system_instruction = self._convert_messages(messages)
         config = self._chat_config(schema, system_instruction)
