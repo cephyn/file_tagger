@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 from typing import Any, Literal
 
 import httpx
@@ -61,7 +62,11 @@ class GeminiGateway:
                 else genai.Client(api_key=self._api_key)
             )
         except Exception as exc:
-            raise self._translate_transport_error(exc) from exc
+            sanitized = self._translate_transport_error(exc)
+        else:
+            sanitized = None
+        if sanitized is not None:
+            raise sanitized from None
 
     def _models(self) -> Any:
         aio = getattr(self._client, "aio", None)
@@ -72,20 +77,54 @@ class GeminiGateway:
 
     @staticmethod
     def _status_code(exc: BaseException) -> int | None:
-        for attr in ("status_code", "code"):
-            value = getattr(exc, attr, None)
-            if isinstance(value, int):
-                return value
+        candidates = [exc]
+        response = getattr(exc, "response", None)
+        if response is not None:
+            candidates.append(response)
+        for candidate in candidates:
+            for attr in ("status_code", "status", "code"):
+                value = getattr(candidate, attr, None)
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        return int(value)
+                    except ValueError:
+                        continue
         return None
 
     @classmethod
-    def _translate_transport_error(cls, exc: BaseException) -> GeminiUnavailableError:
-        if isinstance(exc, GeminiUnavailableError):
+    def _translate_transport_error(
+        cls,
+        exc: BaseException,
+        *,
+        embedding_context: bool = False,
+    ) -> (
+        GeminiUnavailableError
+        | GeminiTimeoutError
+        | GeminiAuthenticationError
+        | EmbeddingContextRejectedError
+    ):
+        if isinstance(
+            exc,
+            (
+                GeminiUnavailableError,
+                GeminiTimeoutError,
+                GeminiAuthenticationError,
+                EmbeddingContextRejectedError,
+            ),
+        ):
             return exc
         if isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
             return GeminiTimeoutError("Gemini request timed out.")
 
         status_code = cls._status_code(exc)
+
+        if embedding_context and status_code == 413:
+            return EmbeddingContextRejectedError(
+                "Gemini rejected the embedding input for context limits."
+            )
+
         if isinstance(exc, PermissionError) or status_code in (401, 403):
             return GeminiAuthenticationError("Gemini authentication failed.")
 
@@ -93,6 +132,29 @@ class GeminiGateway:
             return GeminiTimeoutError("Gemini request timed out.")
 
         message = str(exc).casefold()
+
+        if embedding_context and any(
+            marker in message
+            for marker in (
+                "413",
+                "request entity too large",
+                "payload too large",
+                "content too large",
+                "context length",
+                "context window",
+                "maximum context",
+                "too many tokens",
+                "token limit",
+                "input is too long",
+                "input too long",
+                "prompt is too long",
+                "prompt too long",
+            )
+        ):
+            return EmbeddingContextRejectedError(
+                "Gemini rejected the embedding input for context limits."
+            )
+
         if any(marker in message for marker in ("unauthenticated", "api key", "permission denied")):
             return GeminiAuthenticationError("Gemini authentication failed.")
         if any(marker in message for marker in ("timed out", "timeout", "deadline")):
@@ -183,6 +245,7 @@ class GeminiGateway:
         )
 
     async def _invoke(self, method_name: str, **kwargs: Any) -> Any:
+        embedding_context = kwargs.pop("_embedding_context", False)
         method = getattr(self._models(), method_name)
         try:
             if inspect.iscoroutinefunction(method):
@@ -196,10 +259,22 @@ class GeminiGateway:
                 timeout=self.timeout_seconds,
             )
             return result
-        except GeminiUnavailableError:
+        except (
+            GeminiUnavailableError,
+            GeminiAuthenticationError,
+            EmbeddingContextRejectedError,
+            GeminiStructuredOutputError,
+            ModelIncompatibleError,
+        ):
+            raise
+        except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            raise self._translate_transport_error(exc) from exc
+            sanitized = self._translate_transport_error(
+                exc,
+                embedding_context=embedding_context,
+            )
+        raise sanitized from None
 
     async def embed(
         self,
@@ -237,8 +312,14 @@ class GeminiGateway:
                 model=model,
                 contents=text,
                 config=config,
+                _embedding_context=True,
             )
-        except (GeminiUnavailableError, GeminiTimeoutError, GeminiAuthenticationError):
+        except (
+            GeminiUnavailableError,
+            GeminiTimeoutError,
+            GeminiAuthenticationError,
+            EmbeddingContextRejectedError,
+        ):
             raise
 
         raw_embeddings = getattr(response, "embeddings", None)
@@ -264,10 +345,10 @@ class GeminiGateway:
                 )
             try:
                 vectors.append(tuple(float(value) for value in values))
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError):
                 raise EmbeddingContextRejectedError(
                     "Gemini returned a non-numeric embedding vector."
-                ) from exc
+                ) from None
         if not vectors:
             raise EmbeddingContextRejectedError(
                 "Gemini returned no embedding vectors."
@@ -321,15 +402,36 @@ class GeminiGateway:
         return text
 
     @staticmethod
-    def _validate_structured_text(text: str, schema: Mapping[str, Any] | None) -> str:
-        if schema is None:
-            return text
+    def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise GeminiStructuredOutputError(
+                    "Gemini returned duplicate JSON fields."
+                )
+            result[key] = value
+        return result
+
+    @classmethod
+    def _parse_structured_json(cls, text: str) -> Any:
         try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
+            return json.loads(text, object_pairs_hook=cls._reject_duplicate_object_keys)
+        except GeminiStructuredOutputError:
+            raise
+        except json.JSONDecodeError:
             raise GeminiStructuredOutputError(
                 "Gemini returned malformed structured JSON."
-            ) from exc
+            ) from None
+
+    @classmethod
+    def _validate_structured_text(
+        cls,
+        text: str,
+        schema: Mapping[str, Any] | None,
+    ) -> str:
+        if schema is None:
+            return text
+        parsed = cls._parse_structured_json(text)
         expected_type = schema.get("type")
         if expected_type == "object" and not isinstance(parsed, dict):
             raise GeminiStructuredOutputError(
@@ -407,8 +509,22 @@ class GeminiGateway:
                     ),
                     timeout=self.timeout_seconds,
                 )
+        except (
+            GeminiUnavailableError,
+            GeminiAuthenticationError,
+            EmbeddingContextRejectedError,
+            GeminiStructuredOutputError,
+            ModelIncompatibleError,
+        ):
+            raise
+        except asyncio.CancelledError:
+            raise
         except BaseException as exc:
-            raise self._translate_transport_error(exc) from exc
+            sanitized = self._translate_transport_error(exc)
+        else:
+            sanitized = None
+        if sanitized is not None:
+            raise sanitized from None
 
         try:
             if hasattr(stream, "__aiter__"):
@@ -421,8 +537,22 @@ class GeminiGateway:
                     text = getattr(chunk, "text", None)
                     if isinstance(text, str) and text:
                         yield text
+        except (
+            GeminiUnavailableError,
+            GeminiAuthenticationError,
+            EmbeddingContextRejectedError,
+            GeminiStructuredOutputError,
+            ModelIncompatibleError,
+        ):
+            raise
+        except asyncio.CancelledError:
+            raise
         except BaseException as exc:
-            raise self._translate_transport_error(exc) from exc
+            sanitized = self._translate_transport_error(exc)
+        else:
+            sanitized = None
+        if sanitized is not None:
+            raise sanitized from None
 
     async def system_one(
         self,
@@ -500,7 +630,7 @@ class GeminiGateway:
             messages=[{"role": "user", "content": prompt}],
             schema=schema,
         )
-        parsed = json.loads(text)
+        parsed = self._parse_structured_json(text)
         if not isinstance(parsed, Mapping):
             raise GeminiStructuredOutputError(
                 "Gemini decision response must be a JSON object."
@@ -510,4 +640,102 @@ class GeminiGateway:
             raise GeminiStructuredOutputError(
                 "Gemini decision response is missing the answers mapping."
             )
+
+        requested_ids = set(questions)
+        returned_ids = set(answers)
+        if not all(isinstance(answer_id, str) for answer_id in returned_ids):
+            raise GeminiStructuredOutputError(
+                "Gemini decision response returned an invalid answer ID."
+            )
+        if returned_ids != requested_ids:
+            raise GeminiStructuredOutputError(
+                "Gemini decision response must contain exactly the requested question IDs."
+            )
+
+        choice_names = {"accept", "reject", "review"}
+        for question_id in requested_ids:
+            answer = answers[question_id]
+            if not isinstance(answer, Mapping):
+                raise GeminiStructuredOutputError(
+                    "Gemini choice answers must be mappings."
+                )
+            if answer.get("type") != "choice":
+                raise GeminiStructuredOutputError(
+                    "Gemini decision answers must use choice type."
+                )
+
+            choice = answer.get("choice")
+            if not isinstance(choice, str) or choice not in choice_names:
+                raise GeminiStructuredOutputError(
+                    "Gemini decision response contains an unknown choice."
+                )
+
+            probabilities = answer.get("probabilities")
+            if not isinstance(probabilities, Mapping):
+                raise GeminiStructuredOutputError(
+                    "Gemini choice probabilities must be a mapping."
+                )
+            if set(probabilities) != choice_names:
+                raise GeminiStructuredOutputError(
+                    "Gemini choice probabilities must contain exactly accept, reject, and review."
+                )
+
+            checked: dict[str, float] = {}
+            for choice_name in choice_names:
+                raw_probability = probabilities[choice_name]
+                if isinstance(raw_probability, bool) or not isinstance(
+                    raw_probability,
+                    (int, float),
+                ):
+                    raise GeminiStructuredOutputError(
+                        "Gemini choice probabilities must be numeric."
+                    )
+                probability = float(raw_probability)
+                if (
+                    not math.isfinite(probability)
+                    or probability < 0.0
+                    or probability > 1.0
+                ):
+                    raise GeminiStructuredOutputError(
+                        "Gemini choice probabilities must be valid probabilities."
+                    )
+                checked[choice_name] = probability
+
+            if not math.isclose(
+                math.fsum(checked.values()),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise GeminiStructuredOutputError(
+                    "Gemini choice probabilities must sum to one."
+                )
+
+            raw_confidence = answer.get("confidence")
+            if isinstance(raw_confidence, bool) or not isinstance(
+                raw_confidence,
+                (int, float),
+            ):
+                raise GeminiStructuredOutputError(
+                    "Gemini choice confidence must be numeric."
+                )
+            confidence = float(raw_confidence)
+            if (
+                not math.isfinite(confidence)
+                or confidence < 0.0
+                or confidence > 1.0
+            ):
+                raise GeminiStructuredOutputError(
+                    "Gemini choice confidence must be a valid probability."
+                )
+            if not math.isclose(
+                confidence,
+                checked[choice],
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise GeminiStructuredOutputError(
+                    "Gemini choice confidence must match the selected probability."
+                )
+
         return {"answers": dict(answers)}

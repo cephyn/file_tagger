@@ -217,7 +217,7 @@ def test_malformed_or_empty_chat_json_is_rejected() -> None:
     client = FakeClient()
 
     async def malformed(**kwargs):
-        return SimpleNamespace(text="")
+        return SimpleNamespace(text="{")
 
     client.aio.models.generate_content = malformed
     gateway = GeminiGateway("test-key", client=client)
@@ -228,6 +228,233 @@ def test_malformed_or_empty_chat_json_is_rejected() -> None:
                 GEMINI_GENERATION_MODEL,
                 messages=[{"role": "user", "content": "Find"}],
                 schema={"type": "object"},
+            )
+        )
+
+
+def test_empty_chat_json_is_rejected() -> None:
+    client = FakeClient()
+
+    async def empty(**kwargs):
+        return SimpleNamespace(text="")
+
+    client.aio.models.generate_content = empty
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.chat(
+                GEMINI_GENERATION_MODEL,
+                messages=[{"role": "user", "content": "Find"}],
+                schema={"type": "object"},
+            )
+        )
+
+
+def test_embed_maps_http_413_to_context_rejection() -> None:
+    client = FakeClient()
+
+    async def reject(**kwargs):
+        error = RuntimeError("SDK request failed")
+        error.status_code = 413
+        raise error
+
+    client.aio.models.embed_content = reject
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(EmbeddingContextRejectedError) as caught:
+        asyncio.run(gateway.embed(GEMINI_EMBEDDING_MODEL, "source text"))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    assert caught.value.__context__ is None
+    assert "test-key" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "context window exceeded",
+        "maximum context length was exceeded",
+        "too many tokens in the request",
+    ],
+)
+def test_embed_maps_context_text_to_context_rejection(message: str) -> None:
+    client = FakeClient()
+
+    async def reject(**kwargs):
+        raise RuntimeError(message)
+
+    client.aio.models.embed_content = reject
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(EmbeddingContextRejectedError):
+        asyncio.run(gateway.embed(GEMINI_EMBEDDING_MODEL, "source text"))
+
+
+def test_embed_rejects_returned_vector_length_mismatch() -> None:
+    client = FakeClient()
+
+    async def wrong_length(**kwargs):
+        return SimpleNamespace(
+            embeddings=[SimpleNamespace(values=[0.1] * 767)]
+        )
+
+    client.aio.models.embed_content = wrong_length
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(EmbeddingContextRejectedError):
+        asyncio.run(gateway.embed(GEMINI_EMBEDDING_MODEL, "source text"))
+
+
+def test_authentication_is_mapped_by_status_code() -> None:
+    client = FakeClient()
+
+    async def unauthorized(**kwargs):
+        error = RuntimeError(
+            "headers={'authorization': 'Bearer test-key'}; request failed"
+        )
+        error.status_code = 401
+        raise error
+
+    client.aio.models.generate_content = unauthorized
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiAuthenticationError) as caught:
+        asyncio.run(
+            gateway.chat(
+                GEMINI_GENERATION_MODEL,
+                messages=[{"role": "user", "content": "Find"}],
+            )
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    assert caught.value.__context__ is None
+    assert "test-key" not in str(caught.value)
+    assert "headers" not in str(caught.value)
+
+
+def test_system_one_rejects_unknown_choice() -> None:
+    client = FakeClient()
+
+    async def generate(**kwargs):
+        return SimpleNamespace(
+            text='{"answers":{"candidate_000":{"type":"choice","choice":"maybe","probabilities":{"accept":0.4,"reject":0.3,"review":0.3},"confidence":0.4}}}'
+        )
+
+    client.aio.models.generate_content = generate
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.system_one(
+                GEMINI_DECISION_MODEL,
+                state={"title": "Guide"},
+                questions={"candidate_000": {"instructions": "Apply?"}},
+            )
+        )
+
+
+def test_system_one_rejects_probability_confidence_mismatch() -> None:
+    client = FakeClient()
+
+    async def generate(**kwargs):
+        return SimpleNamespace(
+            text='{"answers":{"candidate_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.7,"reject":0.2,"review":0.1},"confidence":0.3}}}'
+        )
+
+    client.aio.models.generate_content = generate
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.system_one(
+                GEMINI_DECISION_MODEL,
+                state={"title": "Guide"},
+                questions={"candidate_000": {"instructions": "Apply?"}},
+            )
+        )
+
+
+def test_system_one_rejects_probability_sum_mismatch() -> None:
+    client = FakeClient()
+
+    async def generate(**kwargs):
+        return SimpleNamespace(
+            text='{"answers":{"candidate_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.6,"reject":0.2,"review":0.1},"confidence":0.6}}}'
+        )
+
+    client.aio.models.generate_content = generate
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.system_one(
+                GEMINI_DECISION_MODEL,
+                state={"title": "Guide"},
+                questions={"candidate_000": {"instructions": "Apply?"}},
+            )
+        )
+
+
+def test_system_one_rejects_missing_answer() -> None:
+    client = FakeClient()
+
+    async def generate(**kwargs):
+        return SimpleNamespace(text='{"answers":{}}')
+
+    client.aio.models.generate_content = generate
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.system_one(
+                GEMINI_DECISION_MODEL,
+                state={"title": "Guide"},
+                questions={"candidate_000": {"instructions": "Apply?"}},
+            )
+        )
+
+
+def test_system_one_rejects_unknown_answer_id() -> None:
+    client = FakeClient()
+
+    async def generate(**kwargs):
+        return SimpleNamespace(
+            text='{"answers":{"unknown_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.8,"reject":0.1,"review":0.1},"confidence":0.8}}}'
+        )
+
+    client.aio.models.generate_content = generate
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.system_one(
+                GEMINI_DECISION_MODEL,
+                state={"title": "Guide"},
+                questions={"candidate_000": {"instructions": "Apply?"}},
+            )
+        )
+
+
+def test_system_one_rejects_duplicate_answer_id() -> None:
+    client = FakeClient()
+
+    async def generate(**kwargs):
+        return SimpleNamespace(
+            text='{"answers":{"candidate_000":{"type":"choice","choice":"accept","probabilities":{"accept":0.8,"reject":0.1,"review":0.1},"confidence":0.8},"candidate_000":{"type":"choice","choice":"reject","probabilities":{"accept":0.1,"reject":0.8,"review":0.1},"confidence":0.8}}}'
+        )
+
+    client.aio.models.generate_content = generate
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiStructuredOutputError):
+        asyncio.run(
+            gateway.system_one(
+                GEMINI_DECISION_MODEL,
+                state={"title": "Guide"},
+                questions={"candidate_000": {"instructions": "Apply?"}},
             )
         )
 
