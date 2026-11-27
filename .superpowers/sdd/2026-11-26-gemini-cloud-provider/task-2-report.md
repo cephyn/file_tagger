@@ -157,3 +157,42 @@ All checks passed!
 
 - No live Gemini API credentials or network calls were used.
 - Ollama opt-in tests remained skipped because `FILE_TAGGER_RUN_OLLAMA_TESTS=1` was not set.
+
+## Remaining Close-Failure Finding Fix
+
+### Fix
+
+- `GeminiGateway.close()` now catches SDK close exceptions from both the SDK async owner and
+  fallback client close method.
+- A close failure raises a generic `GeminiUnavailableError("Gemini is unavailable.")` with
+  `from None`, so SDK/HTTP API-key, authorization-header, and request text is not exposed as
+  the public exception or traceback cause.
+- Added `test_close_failure_is_sanitized`, covering an SDK-style close exception containing
+  API-key, Authorization, and request secret text.
+
+### RED/GREEN Evidence
+
+RED focused close-failure test before implementation:
+
+```text
+1 failed, 27 deselected
+```
+
+The test reproduced the raw `RuntimeError` escaping from `GeminiGateway.close()`.
+
+GREEN focused gateway run after implementation:
+
+```text
+28 passed in 0.97s
+```
+
+Full suite:
+
+```text
+531 passed, 62 skipped, 2 warnings
+```
+
+### Concerns
+
+- No live Gemini API credentials or network calls were used.
+- Ollama opt-in tests remained skipped because `FILE_TAGGER_RUN_OLLAMA_TESTS=1` was not set.
