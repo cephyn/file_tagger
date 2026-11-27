@@ -183,6 +183,62 @@ def test_apply_provider_replaces_gemini_key_and_restarts_readiness(
     assert config.api_key == "new-key"
 
 
+def test_apply_provider_retires_cached_contextual_rag_session(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    config = ProviderConfig(paths, provider="ollama", api_key=None)
+    runtime = ModernRuntime(paths, None, config=config, password="password")
+    completion = Future()
+    completion.set_result(None)
+    runtime.start_readiness = lambda on_complete=None: completion
+
+    rag_close_calls = []
+    session_close_calls = []
+
+    class FakeRag:
+        def close_session(self, session_id: str) -> None:
+            rag_close_calls.append(session_id)
+
+    class FakeSession:
+        def close(self) -> None:
+            session_close_calls.append(self)
+
+    fake_rag = FakeRag()
+    fake_session = FakeSession()
+    session_id = "conversation-provider-switch"
+    with runtime._contextual_rag_condition:
+        runtime._contextual_rag_services[session_id] = (
+            "old-provider-key",
+            fake_rag,
+            fake_session,
+        )
+        runtime._contextual_rag_epochs[session_id] = 3
+        runtime._contextual_rag_active[session_id] = 0
+
+    retired_at_close = []
+    close_retired = runtime._close_retired_contextual_rag
+
+    def capture_retired(session_id_to_close: str) -> None:
+        with runtime._contextual_rag_condition:
+            retired_at_close.extend(
+                runtime._retired_contextual_rag.get(session_id_to_close, [])
+            )
+        close_retired(session_id_to_close)
+
+    runtime._close_retired_contextual_rag = capture_retired
+
+    runtime.apply_provider("gemini", gemini_api_key="new-key")
+
+    assert session_id not in runtime._contextual_rag_services
+    assert session_id in runtime._contextual_rag_closed
+    assert runtime._contextual_rag_epochs[session_id] == 4
+    assert retired_at_close == [(3, fake_rag, fake_session)]
+    assert session_id not in runtime._retired_contextual_rag
+    assert rag_close_calls == [session_id]
+    assert session_close_calls == [fake_session]
+
+
 def test_fresh_gemini_embedding_gateway_creates_and_closes_one_gateway(
     monkeypatch,
 ) -> None:

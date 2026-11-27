@@ -422,10 +422,22 @@ class ModernRuntime:
             self._generation_gateway = None
             self._model_readiness = None
             with self._contextual_rag_condition:
-                self._contextual_rag_services.clear()
-                self._contextual_rag_epochs.clear()
-                self._contextual_rag_active.clear()
-                self._contextual_rag_closed.clear()
+                retired_session_ids: list[str] = []
+                for session_id, (_key, rag, session) in list(
+                    self._contextual_rag_services.items()
+                ):
+                    old_epoch = self._contextual_rag_epochs.get(session_id, 0)
+                    self._contextual_rag_epochs[session_id] = old_epoch + 1
+                    self._contextual_rag_closed.add(session_id)
+                    del self._contextual_rag_services[session_id]
+                    self._retired_contextual_rag.setdefault(session_id, []).append(
+                        (old_epoch, rag, session)
+                    )
+                    retired_session_ids.append(session_id)
+                self._contextual_rag_condition.notify_all()
+
+        for session_id in retired_session_ids:
+            self._close_retired_contextual_rag(session_id)
 
         seen: set[int] = set()
         for old_gateway in old_gateways:
