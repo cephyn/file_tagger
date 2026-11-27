@@ -5,6 +5,10 @@ from typing import Any
 
 import pytest
 
+from file_tagger.adapters.gemini.gateway import (
+    GEMINI_EMBEDDING_MODEL,
+    GEMINI_GENERATION_MODEL,
+)
 from file_tagger.domain.contracts import ModelProfile
 from file_tagger.domain.errors import (
     GenerationContextRejectedError,
@@ -252,6 +256,66 @@ def test_exact_gemini_embedding_model_without_gateway_raises_unavailable(
             model="gemma4:e4b",
             embedding_profile=profile,
         )
+
+
+def test_exact_gemini_embedding_profile_rejects_generation_gateway_as_embedding_gateway() -> None:
+    generation_gateway = ProfiledFakeModel("{}")
+    profile = ModelProfile(
+        role="embedding",
+        model=GEMINI_EMBEDDING_MODEL,
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        RagService(
+            search=object(),
+            gateway=generation_gateway,
+            embedding_gateway=None,
+            model=GEMINI_GENERATION_MODEL,
+            embedding_profile=profile,
+        )
+
+
+def test_exact_gemini_embedding_profile_accepts_distinct_embedding_gateway() -> None:
+    generation_gateway = ProfiledFakeModel("{}")
+
+    class DistinctEmbeddingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            return ((0.0,),)
+
+    embedding_gateway = DistinctEmbeddingGateway()
+    profile = ModelProfile(
+        role="embedding",
+        model=GEMINI_EMBEDDING_MODEL,
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    service = RagService(
+        search=object(),
+        gateway=generation_gateway,
+        embedding_gateway=embedding_gateway,
+        model=GEMINI_GENERATION_MODEL,
+        embedding_profile=profile,
+    )
+
+    assert service._embedding_gateway is embedding_gateway
 
 
 def test_answer_without_valid_citation_is_rejected() -> None:

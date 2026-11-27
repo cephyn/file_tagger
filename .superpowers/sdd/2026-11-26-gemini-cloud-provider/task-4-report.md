@@ -39,3 +39,19 @@ Implemented and verified.
   exact Gemini candidate, exact Gemini decision, exact Gemini planner, exact Gemini generation, and runtime candidate-vs-runtime-embedding precedence.
 - GREEN: focused suite passed `186` tests.
 - Full suite passed `553` tests, with `62` skipped and `2` Docling deprecation warnings.
+
+## Re-review Fix Evidence
+
+- `RagService` now rejects an exact `gemini-embedding-2` profile whenever no explicit
+  embedding gateway is supplied, even when `gateway` is a valid Gemini generation
+  gateway. It also rejects an explicitly supplied Ollama embedding gateway.
+- RED: focused constructor regression test:
+  `1 failed, 1 passed, 88 deselected`; the generation-gateway reuse case did not raise
+  `GeminiUnavailableError`.
+- GREEN: focused constructor pair passed `2 passed, 88 deselected`.
+- Focused `tests/rag/test_rag_service.py` passed `90` tests.
+- Full suite passed `555 passed, 62 skipped, 2 warnings` in `75.47s`.
+- Added coverage for both required boundaries:
+  exact Gemini generation gateway plus exact Gemini embedding profile with
+  `embedding_gateway=None` raises `GeminiUnavailableError`; a distinct explicit
+  embedding gateway is accepted and preserved.

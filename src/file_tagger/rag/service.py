@@ -167,10 +167,7 @@ class RagService:
             embedding_profile is not None
             and embedding_profile.model == GEMINI_EMBEDDING_MODEL
             and (
-                (
-                    embedding_gateway is None
-                    and (gateway is None or isinstance(gateway, OllamaGateway))
-                )
+                embedding_gateway is None
                 or isinstance(embedding_gateway, OllamaGateway)
             )
         ):
