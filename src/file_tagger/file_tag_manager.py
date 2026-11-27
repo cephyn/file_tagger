@@ -669,8 +669,10 @@ class FileTagManager(QMainWindow):
         # Add settings menu actions
         contextual_search_action = search_menu.addAction("Contextual Markdown Chat")
         contextual_search_action.triggered.connect(self.open_contextual_search)
-        ollama_settings_action = settings_menu.addAction("Ollama Readiness")
-        ollama_settings_action.triggered.connect(self.show_ollama_settings)
+        ai_provider_settings_action = settings_menu.addAction(
+            "AI Provider & Readiness"
+        )
+        ai_provider_settings_action.triggered.connect(self.show_ollama_settings)
 
         home_dir_action = settings_menu.addAction("Set Home Directory")
         home_dir_action.triggered.connect(self.set_home_directory)
@@ -2007,7 +2009,7 @@ class FileTagManager(QMainWindow):
         return removed
 
     def show_ollama_settings(self) -> None:
-        """Show the local Ollama readiness and installed-model dialog."""
+        """Show the provider-aware AI readiness and settings dialog."""
         runtime = getattr(self, "modern_runtime", None)
         report = getattr(runtime, "readiness", None)
         if not isinstance(report, ReadinessReport):
@@ -2026,6 +2028,13 @@ class FileTagManager(QMainWindow):
             report,
             runtime_refresh_provider=runtime,
             parent=self,
+            config=getattr(self, "config", None),
+            provider_applier=(
+                runtime.apply_provider
+                if runtime is not None
+                and callable(getattr(runtime, "apply_provider", None))
+                else None
+            ),
             model_selection_applier=(
                 runtime.apply_model_selections
                 if runtime is not None

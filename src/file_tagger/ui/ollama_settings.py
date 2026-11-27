@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -56,7 +57,7 @@ def _is_loopback_host(host: str) -> bool:
 
 
 class OllamaSettingsDialog(QDialog):
-    """Read-only readiness status and installed-model selection."""
+    """Provider-aware settings for Ollama and Gemini readiness."""
 
     def __init__(
         self,
@@ -69,16 +70,26 @@ class OllamaSettingsDialog(QDialog):
         *,
         hardware_report: HardwareReport | None = None,
         refresh_provider: Any | None = None,
+        config: Any | None = None,
+        provider_applier: Callable[..., Any] | None = None,
     ) -> None:
         super().__init__(parent)
         self._report = report
         self._hardware = hardware_report or hardware or report.hardware
         self._recommendation = recommendation or report.recommendation
         self._model_selection_applier = model_selection_applier
+        self._config = config
+        self._provider_applier = provider_applier
         self._selections_dirty = False
         self._refresh_provider = (
             runtime_refresh_provider or refresh_provider
         )
+        if self._provider_applier is None and self._refresh_provider is not None:
+            self._provider_applier = getattr(
+                self._refresh_provider,
+                "apply_provider",
+                None,
+            )
         self._completion_queue: queue.Queue[
             tuple[int, ReadinessReport | None]
         ] = queue.Queue()
@@ -94,7 +105,7 @@ class OllamaSettingsDialog(QDialog):
         self.set_report(report)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("Ollama Readiness")
+        self.setWindowTitle("AI Provider & Readiness")
         self.setModal(True)
         self.resize(760, 700)
 
@@ -106,7 +117,43 @@ class OllamaSettingsDialog(QDialog):
         scroll.setWidget(content)
         root_layout.addWidget(scroll)
 
+        provider_group = QGroupBox("AI Provider")
+        provider_layout = QFormLayout(provider_group)
+        self.provider_selector = QComboBox()
+        self.provider_selector.setObjectName("provider_selector")
+        self.provider_selector.addItems(("Ollama", "Gemini"))
+        provider_layout.addRow("Provider:", self.provider_selector)
+        self.gemini_group = QGroupBox("Gemini")
+        gemini_layout = QFormLayout(self.gemini_group)
+        self.gemini_api_key = QLineEdit()
+        self.gemini_api_key.setObjectName("gemini_api_key")
+        self.gemini_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_api_key.setPlaceholderText("Leave blank to keep the existing key")
+        gemini_layout.addRow("API key:", self.gemini_api_key)
+        self.gemini_key_status = QLabel()
+        self.gemini_key_status.setObjectName("gemini_key_status")
+        gemini_layout.addRow("Key status:", self.gemini_key_status)
+        self.clear_gemini_key_button = QPushButton("Clear Gemini Key")
+        self.clear_gemini_key_button.setObjectName("clear_gemini_key")
+        self.clear_key_button = self.clear_gemini_key_button
+        gemini_layout.addRow("", self.clear_gemini_key_button)
+        self.gemini_readiness_status = QLabel()
+        gemini_layout.addRow("Readiness:", self.gemini_readiness_status)
+        self.gemini_model_labels: dict[str, QLabel] = {}
+        for role, model in (
+            ("generation", "gemini-4-hydrogen"),
+            ("decision", "gemini-decision-1"),
+            ("embedding", "gemini-embedding-2"),
+        ):
+            label = QLabel(model)
+            label.setObjectName(f"{role}_gemini_model")
+            gemini_layout.addRow(f"{role.title()} model:", label)
+            self.gemini_model_labels[role] = label
+        provider_layout.addRow(self.gemini_group)
+        content_layout.addWidget(provider_group)
+
         ollama_group = QGroupBox("Ollama")
+        self.ollama_group = ollama_group
         ollama_layout = QFormLayout(ollama_group)
         self.host_label = QLabel()
         self.version_label = QLabel()
@@ -150,10 +197,37 @@ class OllamaSettingsDialog(QDialog):
         self.manual_pull_commands = self.instructions
         content_layout.addStretch()
 
+        self._ollama_widgets = (
+            ollama_group,
+            self.hardware_summary.parentWidget(),
+            self.recommendations.parentWidget(),
+            self.disk_fit.parentWidget(),
+            self.installed_models.parentWidget(),
+            self.benchmark_results.parentWidget(),
+            selection_group,
+            self.instructions.parentWidget(),
+        )
+        initial_provider = self._get_initial_provider()
+        index = self.provider_selector.findText(
+            "Gemini" if initial_provider == "gemini" else "Ollama"
+        )
+        if index >= 0:
+            self.provider_selector.setCurrentIndex(index)
+        self.provider_selector.currentTextChanged.connect(
+            self._on_provider_changed
+        )
+        self.gemini_api_key.textChanged.connect(
+            self._on_gemini_key_text_changed
+        )
+        self.clear_gemini_key_button.clicked.connect(
+            self._clear_gemini_key
+        )
+        self._refresh_gemini_key_status()
+
         button_layout = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setToolTip(
-            "Recheck the current local Ollama runtime. No models are downloaded."
+            "Recheck readiness for the selected AI provider."
         )
         self.refresh_button.setEnabled(self._refresh_provider is not None)
         self.refresh_button.clicked.connect(self.refresh)
@@ -166,6 +240,7 @@ class OllamaSettingsDialog(QDialog):
         button_layout.addWidget(cancel_button)
         button_layout.addWidget(self.ok_button)
         root_layout.addLayout(button_layout)
+        self._apply_provider_visibility()
 
     @staticmethod
     def _summary_label(parent_layout: QVBoxLayout, title: str) -> QLabel:
@@ -178,6 +253,146 @@ class OllamaSettingsDialog(QDialog):
         parent_layout.addWidget(group)
         return label
 
+    def _get_initial_provider(self) -> str:
+        if self._config is not None:
+            get_provider = getattr(self._config, "get_ai_provider", None)
+            if callable(get_provider):
+                try:
+                    provider = get_provider()
+                    if provider in ("ollama", "gemini"):
+                        return provider
+                except Exception:
+                    pass
+        provider = getattr(self._report, "provider", "ollama")
+        return provider if provider in ("ollama", "gemini") else "ollama"
+
+    def _gemini_key_is_configured(self) -> bool:
+        if self._config is not None:
+            get_key = getattr(self._config, "get_gemini_api_key", None)
+            if callable(get_key):
+                try:
+                    key = get_key()
+                    if isinstance(key, str) and bool(key.strip()):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _refresh_gemini_key_status(self) -> None:
+        if self.gemini_api_key.text().strip():
+            status = "Replacement key entered"
+        elif self._gemini_key_is_configured():
+            status = "Configured"
+        else:
+            status = "Not configured"
+        self.gemini_key_status.setText(status)
+
+    def _on_gemini_key_text_changed(self, _text: str) -> None:
+        self._refresh_gemini_key_status()
+
+    def _apply_provider_visibility(self) -> None:
+        provider = self.provider_selector.currentText().lower()
+        for widget in self._ollama_widgets:
+            widget.setVisible(provider == "ollama")
+        self.gemini_group.setVisible(provider == "gemini")
+        if provider == "gemini":
+            if self.gemini_api_key.text().strip():
+                self.gemini_readiness_status.setText(
+                    "Save to replace the key and refresh Gemini readiness."
+                )
+            elif self._gemini_key_is_configured():
+                self.gemini_readiness_status.setText(
+                    "Key configured. Save to refresh Gemini readiness."
+                )
+            else:
+                self.gemini_readiness_status.setText(
+                    "Not configured. Enter a key, then save to refresh Gemini readiness."
+                )
+            self.ok_button.setEnabled(False)
+        else:
+            self.gemini_readiness_status.setText("")
+            self.set_report(self._report)
+
+    def _on_provider_changed(self, _text: str) -> None:
+        self._apply_provider_visibility()
+
+    def _clear_gemini_key(self) -> None:
+        if self._config is not None:
+            clear_key = getattr(self._config, "clear_gemini_api_key", None)
+            if callable(clear_key):
+                try:
+                    clear_key()
+                except Exception:
+                    QMessageBox.warning(
+                        self,
+                        "Gemini Key",
+                        "Could not clear the Gemini API key.",
+                    )
+                    return
+        self.gemini_api_key.clear()
+        self.provider_selector.setCurrentText("Gemini")
+        self._refresh_gemini_key_status()
+        self._apply_provider_visibility()
+        if callable(self._provider_applier):
+            try:
+                self._provider_applier("gemini", gemini_api_key=None)
+            except Exception:
+                QMessageBox.warning(
+                    self,
+                    "Gemini Key",
+                    "The key was cleared, but Gemini readiness could not be refreshed.",
+                )
+
+    def _apply_provider_changes(self) -> bool:
+        provider = self.provider_selector.currentText().lower()
+        key_text = self.gemini_api_key.text().strip()
+        key_to_store = key_text or None
+
+        if self._config is not None:
+            set_provider = getattr(self._config, "set_ai_provider", None)
+            if callable(set_provider):
+                try:
+                    if not set_provider(provider):
+                        raise ValueError("Unsupported provider")
+                except Exception:
+                    QMessageBox.warning(
+                        self,
+                        "AI Provider",
+                        "Could not save the selected provider.",
+                    )
+                    return False
+            if key_to_store is not None:
+                set_key = getattr(self._config, "set_gemini_api_key", None)
+                if callable(set_key):
+                    try:
+                        set_key(key_to_store)
+                    except Exception:
+                        QMessageBox.warning(
+                            self,
+                            "Gemini Key",
+                            "Could not save the Gemini API key.",
+                        )
+                        return False
+
+        if callable(self._provider_applier):
+            try:
+                self._provider_applier(
+                    provider,
+                    gemini_api_key=key_to_store,
+                )
+            except Exception:
+                QMessageBox.warning(
+                    self,
+                    "AI Provider",
+                    "The provider was saved, but runtime readiness could not be refreshed.",
+                )
+                return False
+        elif provider == "gemini" and self._refresh_provider is not None:
+            self.refresh()
+        elif provider == "ollama" and self._refresh_provider is not None:
+            self.refresh()
+        return True
+
     def set_report(self, report: ReadinessReport) -> None:
         self._report = report
         pending_selections = (
@@ -185,6 +400,28 @@ class OllamaSettingsDialog(QDialog):
             if self._selections_dirty
             else None
         )
+        if self.provider_selector.currentText().lower() == "gemini":
+            gemini_ready = (
+                getattr(report, "provider", "ollama") == "gemini"
+                and bool(report.ready)
+                and (
+                    self._gemini_key_is_configured()
+                    or bool(self.gemini_api_key.text().strip())
+                )
+            )
+            gemini = getattr(report, "gemini", None)
+            if getattr(report, "provider", "ollama") != "gemini":
+                status = "Not checked"
+            elif gemini_ready:
+                status = "Ready"
+            elif gemini is not None and getattr(gemini, "missing_key", False):
+                status = "Key required"
+            else:
+                status = "Not ready"
+            self.gemini_readiness_status.setText(status)
+            self._refresh_gemini_key_status()
+            self.ok_button.setEnabled(gemini_ready)
+            return
         if report.hardware is not None:
             self._hardware = report.hardware
         if report.recommendation is not None:
@@ -426,6 +663,8 @@ class OllamaSettingsDialog(QDialog):
         return True
 
     def accept(self) -> None:
+        if not self._apply_provider_changes():
+            return
         if not self._apply_selection_changes():
             return
         super().accept()
@@ -435,6 +674,9 @@ class OllamaSettingsDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event: Any) -> None:
+        if not self._apply_provider_changes():
+            event.ignore()
+            return
         if not self._apply_selection_changes():
             event.ignore()
             return
@@ -624,6 +866,11 @@ class OllamaSettingsDialog(QDialog):
         for selector in self.model_selectors.values():
             selector.setEnabled(selector.isEnabled() and not refreshing)
         if refreshing:
-            self.instructions.setText(
-                "Refreshing local Ollama readiness… No models are downloaded."
-            )
+            if self.provider_selector.currentText().lower() == "gemini":
+                self.gemini_readiness_status.setText(
+                    "Refreshing Gemini readiness…"
+                )
+            else:
+                self.instructions.setText(
+                    "Refreshing local Ollama readiness… No models are downloaded."
+                )

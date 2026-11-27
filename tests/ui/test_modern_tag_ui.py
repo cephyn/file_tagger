@@ -1,5 +1,7 @@
 import random
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from PySide6.QtWidgets import QListWidget, QMainWindow
 from PySide6.QtGui import QColor
@@ -309,3 +311,20 @@ def test_edit_tag_uses_shared_dialog_and_persists_choice(
     ]
     assert refresh_calls == [True]
     assert file_refresh_calls == [True]
+
+
+def test_settings_menu_is_provider_aware_and_keeps_legacy_method(qtbot) -> None:
+    from file_tagger.file_tag_manager import FileTagManager
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.logger = logging.getLogger("provider-menu-test")
+    manager.config = SimpleNamespace(get_pdf_extractor=lambda: "accurate")
+
+    manager.setup_menus()
+
+    labels = [action.text() for action in manager.settings_menu.actions()]
+    assert "AI Provider & Readiness" in labels
+    assert "Ollama Readiness" not in labels
+    assert callable(manager.show_ollama_settings)

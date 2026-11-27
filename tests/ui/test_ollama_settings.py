@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMainWindow, QPushButton
+from PySide6.QtWidgets import QLineEdit, QMainWindow, QPushButton
 
 from file_tagger.domain.contracts import HardwareReport, ModelProfile, OllamaReadiness
 from file_tagger.infrastructure.app_paths import AppPaths
@@ -447,7 +447,8 @@ def test_manager_settings_menu_opens_ollama_readiness(qtbot) -> None:
     manager.setup_menus()
 
     settings_actions = manager.settings_menu.actions()
-    assert "Ollama Readiness" in [action.text() for action in settings_actions]
+    assert "AI Provider & Readiness" in [action.text() for action in settings_actions]
+    assert "Ollama Readiness" not in [action.text() for action in settings_actions]
     assert "API Settings" not in [action.text() for action in settings_actions]
 
 
@@ -674,3 +675,140 @@ def test_manager_import_preserves_modern_tag_suggestion() -> None:
     from file_tagger import tag_suggestion
 
     assert module.TagSuggestionDialog is tag_suggestion.TagSuggestionDialog
+
+
+def test_gemini_provider_controls_use_exact_models_and_mask_key(qtbot) -> None:
+    class Config:
+        def get_ai_provider(self) -> str:
+            return "gemini"
+
+        def get_gemini_api_key(self) -> str | None:
+            return "stored-secret"
+
+    dialog = OllamaSettingsDialog(_report(), config=Config())
+    qtbot.addWidget(dialog)
+
+    assert dialog.provider_selector.count() == 2
+    assert [
+        dialog.provider_selector.itemText(index)
+        for index in range(dialog.provider_selector.count())
+    ] == ["Ollama", "Gemini"]
+    assert dialog.provider_selector.currentText() == "Gemini"
+    assert dialog.gemini_api_key.echoMode() == QLineEdit.EchoMode.Password
+    assert dialog.gemini_api_key.text() == ""
+    assert dialog.gemini_key_status.text() == "Configured"
+    assert {label.text() for label in dialog.gemini_model_labels.values()} == {
+        "gemini-4-hydrogen",
+        "gemini-decision-1",
+        "gemini-embedding-2",
+    }
+
+
+def test_blank_gemini_key_preserves_configured_key_and_refreshes(qtbot) -> None:
+    class Config:
+        def __init__(self) -> None:
+            self.provider = "ollama"
+            self.key = "stored-secret"
+
+        def get_ai_provider(self) -> str:
+            return self.provider
+
+        def get_gemini_api_key(self) -> str | None:
+            return self.key
+
+        def set_ai_provider(self, provider: str) -> bool:
+            self.provider = provider
+            return True
+
+        def set_gemini_api_key(self, api_key: str) -> None:
+            self.key = api_key
+
+    config = Config()
+    applied: list[tuple[str, str | None]] = []
+
+    class Runtime:
+        def apply_provider(self, provider: str, gemini_api_key: str | None = None):
+            applied.append((provider, gemini_api_key))
+            return None
+
+    runtime = Runtime()
+    dialog = OllamaSettingsDialog(
+        _report(),
+        config=config,
+        provider_applier=runtime.apply_provider,
+        runtime_refresh_provider=runtime,
+    )
+    qtbot.addWidget(dialog)
+    dialog.provider_selector.setCurrentText("Gemini")
+    dialog.gemini_api_key.setText("")
+
+    dialog.accept()
+
+    assert config.provider == "gemini"
+    assert config.key == "stored-secret"
+    assert applied == [("gemini", None)]
+
+
+def test_clear_gemini_key_is_separate_and_blocks_gemini_key_status(qtbot) -> None:
+    class Config:
+        def __init__(self) -> None:
+            self.provider = "gemini"
+            self.key = "stored-secret"
+
+        def get_ai_provider(self) -> str:
+            return self.provider
+
+        def get_gemini_api_key(self) -> str | None:
+            return self.key
+
+        def set_ai_provider(self, provider: str) -> bool:
+            self.provider = provider
+            return True
+
+        def clear_gemini_api_key(self) -> None:
+            self.key = None
+
+    config = Config()
+    applied: list[tuple[str, str | None]] = []
+
+    class Runtime:
+        active_provider = "gemini"
+
+        def apply_provider(self, provider: str, gemini_api_key: str | None = None):
+            self.active_provider = provider
+            applied.append((provider, gemini_api_key))
+            return None
+
+    runtime = Runtime()
+    dialog = OllamaSettingsDialog(
+        _report(),
+        config=config,
+        provider_applier=runtime.apply_provider,
+        runtime_refresh_provider=runtime,
+    )
+    qtbot.addWidget(dialog)
+
+    qtbot.mouseClick(dialog.clear_gemini_key_button, Qt.MouseButton.LeftButton)
+
+    assert config.key is None
+    assert runtime.active_provider == "gemini"
+    assert dialog.gemini_key_status.text() == "Not configured"
+    assert applied == [("gemini", None)]
+
+
+def test_switching_providers_restores_provider_sections(qtbot) -> None:
+    dialog = OllamaSettingsDialog(_report(ready=True))
+    qtbot.addWidget(dialog)
+
+    assert not dialog.ollama_group.isHidden()
+    assert dialog.gemini_group.isHidden()
+
+    dialog.provider_selector.setCurrentText("Gemini")
+
+    assert dialog.ollama_group.isHidden()
+    assert not dialog.gemini_group.isHidden()
+
+    dialog.provider_selector.setCurrentText("Ollama")
+
+    assert not dialog.ollama_group.isHidden()
+    assert dialog.gemini_group.isHidden()
