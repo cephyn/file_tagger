@@ -253,7 +253,7 @@ class GeminiGateway:
                     GEMINI_PROFILE_VERSION,
                 ),
                 context_length=GEMINI_DECISION_CONTEXT_LENGTH,
-                capabilities=("decision", "choice", "structured-output"),
+                capabilities=("decision", "choice", "structured-output", "vision"),
             )
         return ModelProfile(
             role="generation",
@@ -263,7 +263,7 @@ class GeminiGateway:
                 GEMINI_PROFILE_VERSION,
             ),
             context_length=GEMINI_GENERATION_CONTEXT_LENGTH,
-            capabilities=("completion", "streaming", "structured-output"),
+            capabilities=("completion", "streaming", "structured-output", "vision"),
         )
 
     async def readiness(
@@ -512,10 +512,28 @@ class GeminiGateway:
                 system_parts.append(content)
                 continue
             sdk_role = "model" if role == "assistant" else "user"
+            parts: list[Any] = []
+            if content:
+                parts.append(types.Part(text=content))
+            images = message.get("images")
+            mime_type = message.get("image_mime_type")
+            if not isinstance(mime_type, str) or not mime_type.strip():
+                mime_type = "application/octet-stream"
+            if isinstance(images, (list, tuple)):
+                for image in images:
+                    if isinstance(image, bytes):
+                        parts.append(
+                            types.Part.from_bytes(
+                                data=image,
+                                mime_type=mime_type,
+                            )
+                        )
+            if not parts:
+                parts.append(types.Part(text=""))
             contents.append(
                 types.Content(
                     role=sdk_role,
-                    parts=[types.Part(text=content)],
+                    parts=parts,
                 )
             )
         system_instruction = "\n\n".join(system_parts) if system_parts else None

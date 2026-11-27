@@ -75,6 +75,60 @@ def test_empty_pdf_text_retries_with_ocr(tmp_path: Path) -> None:
     assert "Recognized text" in document.full_markdown
 
 
+def test_standalone_image_uses_vision_description(tmp_path: Path) -> None:
+    source = tmp_path / "item.png"
+    source.write_bytes(b"\x89PNG\r\nsample-image")
+
+    class VisionGateway:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def chat(self, model, *, messages, schema=None):
+            self.calls.append(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "schema": schema,
+                }
+            )
+            return "A red potion bottle with a cork stopper."
+
+    gateway = VisionGateway()
+
+    document = extract_document(
+        source,
+        vision_gateway=gateway,
+        vision_profile=SimpleNamespace(
+            model="gemini-4-hydrogen",
+            capabilities=("completion", "vision"),
+        ),
+    )
+
+    assert document.status == "complete"
+    assert document.parser == "vision"
+    assert document.pages[0].quality == "good"
+    assert "red potion bottle" in document.full_markdown
+    assert gateway.calls[0]["model"] == "gemini-4-hydrogen"
+    assert gateway.calls[0]["messages"][1]["images"][0] == source.read_bytes()
+
+
+def test_standalone_image_without_vision_model_is_metadata_indexable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "diagram.webp"
+    source.write_bytes(b"sample-image")
+
+    document = extract_document(source)
+
+    assert document.status == "warnings"
+    assert document.parser == "metadata"
+    assert document.full_markdown.startswith("# diagram.webp")
+    assert any(
+        diagnostic.code == "vision_description_unavailable"
+        for diagnostic in document.diagnostics
+    )
+
+
 def test_partial_conversion_returns_visible_warnings(tmp_path: Path) -> None:
     source = _write_source(tmp_path, ".docx")
     converter = FakeConverter(

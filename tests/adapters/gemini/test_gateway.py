@@ -103,6 +103,8 @@ def test_exact_model_names_and_profiles_are_stable() -> None:
     assert embedding.context_length > 0
     assert generation.capabilities
     assert decision.capabilities
+    assert "vision" in generation.capabilities
+    assert "vision" in decision.capabilities
     assert embedding.dimensions == 768
     assert generation.digest == asyncio.run(
         gateway.model_profile("generation", GEMINI_GENERATION_MODEL)
@@ -260,6 +262,31 @@ def test_chat_structured_output_returns_text() -> None:
     call = client.aio.models.chat_calls[0]
     assert call["config"].response_mime_type == "application/json"
     assert call["config"].response_json_schema == schema
+
+
+def test_chat_sends_inline_image_parts() -> None:
+    client = FakeClient()
+    gateway = GeminiGateway("test-key", client=client)
+
+    asyncio.run(
+        gateway.chat(
+            GEMINI_GENERATION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Describe this image.",
+                    "images": [b"\x89PNG\r\nsample-image"],
+                    "image_mime_type": "image/png",
+                }
+            ],
+        )
+    )
+
+    call = client.aio.models.chat_calls[0]
+    parts = call["contents"][0].parts
+    assert parts[0].text == "Describe this image."
+    assert parts[1].inline_data.mime_type == "image/png"
+    assert parts[1].inline_data.data == b"\x89PNG\r\nsample-image"
 
 
 def test_chat_streams_fragments() -> None:

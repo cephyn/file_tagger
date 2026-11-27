@@ -396,6 +396,11 @@ def test_modern_runtime_routes_ready_gemini_role_gateways(
     assert isinstance(runtime.decision_gateway, FakeGeminiGateway)
     assert isinstance(runtime.generation_gateway, FakeGeminiGateway)
     assert isinstance(runtime.embedding_gateway, _FreshGeminiEmbeddingGateway)
+    assert runtime._indexing_service is not None
+    assert (
+        runtime._indexing_service._extractor.vision_gateway
+        is runtime.generation_gateway
+    )
 
 
 def test_modern_database_unavailable_reason_includes_missing_module(

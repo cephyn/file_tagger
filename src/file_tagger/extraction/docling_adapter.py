@@ -1,6 +1,8 @@
+import asyncio
 from collections.abc import Callable
 from hashlib import sha256
 from importlib.metadata import version
+import mimetypes
 from pathlib import Path
 from typing import Any, Literal
 
@@ -38,6 +40,10 @@ FailureKind = Literal[
 ]
 PageQuality = Literal["good", "degraded", "ocr"]
 MINIMUM_PAGE_TEXT_CHARS = 10
+STANDALONE_IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+)
+VISION_CAPABILITIES = frozenset({"image", "multimodal", "vision"})
 
 
 class ExtractedPage(BaseModel):
@@ -482,12 +488,19 @@ class DoclingAdapter:
     def __init__(
         self,
         converter_factory: ConverterFactory | None = None,
+        *,
+        vision_gateway: Any | None = None,
+        vision_profile: object | None = None,
     ) -> None:
         self.converter_factory = converter_factory or _default_converter
+        self.vision_gateway = vision_gateway
+        self.vision_profile = vision_profile
 
     def extract(self, file_path: str | Path) -> ExtractedDocument:
         path = Path(file_path).expanduser().resolve()
         file_hash = _file_hash(path)
+        if path.suffix.casefold() in STANDALONE_IMAGE_SUFFIXES:
+            return self._extract_standalone_image(path, file_hash)
         try:
             result = self.converter_factory(False).convert(
                 path,
@@ -528,10 +541,153 @@ class DoclingAdapter:
             document = _from_result(path, file_hash, result, used_ocr=True)
         return document
 
+    @staticmethod
+    def _vision_profile_supports_images(profile: object | None) -> bool:
+        if profile is None:
+            return False
+        model = getattr(profile, "model", None)
+        if not isinstance(model, str) or not model.strip():
+            return False
+        capabilities = getattr(profile, "capabilities", ())
+        if not isinstance(capabilities, (list, tuple, set, frozenset)):
+            return False
+        return any(
+            isinstance(capability, str)
+            and capability.strip().casefold() in VISION_CAPABILITIES
+            for capability in capabilities
+        )
+
+    @staticmethod
+    def _resolve_vision_description(awaitable: Any) -> str:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            async def resolve() -> str:
+                return str(await awaitable)
+
+            return asyncio.run(resolve())
+        raise RuntimeError(
+            "Vision description cannot be requested inside an active asyncio loop."
+        )
+
+    def _extract_standalone_image(
+        self,
+        path: Path,
+        file_hash: str,
+    ) -> ExtractedDocument:
+        mime_type, _ = mimetypes.guess_type(str(path), strict=False)
+        mime_type = mime_type or "application/octet-stream"
+        stat = path.stat()
+        profile_supported = self._vision_profile_supports_images(
+            self.vision_profile
+        )
+
+        if profile_supported and self.vision_gateway is not None:
+            model = getattr(self.vision_profile, "model")
+            try:
+                image_bytes = path.read_bytes()
+                result = self.vision_gateway.chat(
+                    model,
+                    messages=(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Describe the supplied image as searchable document text. "
+                                "Report visible text, subjects, objects, layout, and "
+                                "other factual details. Do not guess hidden context."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Describe {path.name}.",
+                            "images": (image_bytes,),
+                            "image_mime_type": mime_type,
+                        },
+                    ),
+                )
+                if hasattr(result, "__await__"):
+                    result = self._resolve_vision_description(result)
+                description = str(result).strip()
+            except Exception as exc:
+                description = ""
+                vision_error = str(exc).strip()
+            else:
+                vision_error = ""
+
+            if description:
+                markdown = (
+                    f"# {path.name}\n\n"
+                    f"{description}\n\n"
+                    f"Image type: {mime_type}\n"
+                    f"Size: {stat.st_size} bytes"
+                )
+                text_chars = useful_text_length(markdown)
+                page = ExtractedPage(
+                    number=1,
+                    ordinal=0,
+                    text=description,
+                    markdown=markdown,
+                    headings=(path.name,),
+                    quality="good",
+                    text_chars=text_chars,
+                    image_area=1.0,
+                )
+                return ExtractedDocument(
+                    file_path=str(path),
+                    file_hash=file_hash,
+                    parser="vision",
+                    parser_version=_parser_version(),
+                    status="complete",
+                    pages=(page,),
+                    full_markdown=markdown,
+                )
+        else:
+            vision_error = "No vision-capable generation model is available."
+
+        markdown = (
+            f"# {path.name}\n\n"
+            f"Image type: {mime_type}\n"
+            f"Size: {stat.st_size} bytes"
+        )
+        diagnostic_message = vision_error or (
+            "The image could not be described by the configured vision model."
+        )
+        page = ExtractedPage(
+            number=1,
+            ordinal=0,
+            text=markdown,
+            markdown=markdown,
+            headings=(path.name,),
+            quality="degraded",
+            text_chars=useful_text_length(markdown),
+            image_area=1.0,
+        )
+        return ExtractedDocument(
+            file_path=str(path),
+            file_hash=file_hash,
+            parser="metadata",
+            parser_version=_parser_version(),
+            status="warnings",
+            pages=(page,),
+            full_markdown=markdown,
+            diagnostics=(
+                ExtractionDiagnostic(
+                    code="vision_description_unavailable",
+                    message=diagnostic_message,
+                ),
+            ),
+        )
+
 
 def extract_document(
     file_path: str | Path,
     *,
     converter_factory: ConverterFactory | None = None,
+    vision_gateway: Any | None = None,
+    vision_profile: object | None = None,
 ) -> ExtractedDocument:
-    return DoclingAdapter(converter_factory).extract(file_path)
+    return DoclingAdapter(
+        converter_factory,
+        vision_gateway=vision_gateway,
+        vision_profile=vision_profile,
+    ).extract(file_path)

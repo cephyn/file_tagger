@@ -632,6 +632,20 @@ class ModernRuntime:
                 embedding_profile = None
             indexing_service = None
             embedding_gateway: Any | None = None
+            generation_profile = report.selected_profile("generation")
+            generation_gateway: Any | None = None
+            if report.ready:
+                if provider == "gemini":
+                    if gemini_api_key:
+                        try:
+                            generation_gateway = GeminiGateway(gemini_api_key)
+                        except Exception:
+                            generation_gateway = None
+                else:
+                    try:
+                        generation_gateway = OllamaGateway()
+                    except Exception:
+                        generation_gateway = None
             if embedding_profile is not None and self.session_factory is not None:
                 if provider == "gemini":
                     embedding_gateway = _FreshGeminiEmbeddingGateway(
@@ -641,34 +655,32 @@ class ModernRuntime:
                     embedding_gateway = _FreshOllamaEmbeddingGateway()
                 indexing_service = IndexingService(
                     IndexingRepository(self.session_factory),
-                    DoclingAdapter(),
+                    DoclingAdapter(
+                        vision_gateway=generation_gateway,
+                        vision_profile=generation_profile,
+                    ),
                     embedding_gateway=embedding_gateway,
                     embedding_profile=embedding_profile,
                     recover_on_startup=False,
                 )
             candidate_gateway: Any | None = None
             decision_gateway: Any | None = None
-            generation_gateway: Any | None = None
             if report.ready:
                 if provider == "gemini":
                     if gemini_api_key:
                         try:
                             candidate_gateway = GeminiGateway(gemini_api_key)
                             decision_gateway = GeminiGateway(gemini_api_key)
-                            generation_gateway = GeminiGateway(gemini_api_key)
                         except Exception:
                             candidate_gateway = None
                             decision_gateway = None
-                            generation_gateway = None
                 else:
                     try:
                         candidate_gateway = OllamaGateway()
                         decision_gateway = OllamaGateway()
-                        generation_gateway = OllamaGateway()
                     except Exception:
                         candidate_gateway = None
                         decision_gateway = None
-                        generation_gateway = None
 
             published_service = False
             with self._lock:
