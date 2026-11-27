@@ -183,6 +183,58 @@ def test_apply_provider_replaces_gemini_key_and_restarts_readiness(
     assert config.api_key == "new-key"
 
 
+def test_provider_switch_cancels_old_index_request(
+    tmp_path, monkeypatch
+) -> None:
+    paths = _paths(tmp_path, monkeypatch)
+    config = ProviderConfig(paths, provider="ollama", api_key="stored-key")
+    runtime = initialize_modern_runtime(
+        paths,
+        config,
+        "password",
+        start_readiness=False,
+    )
+    source = tmp_path / "provider-race.txt"
+    source.write_text("provider race", encoding="utf-8")
+    runtime.sync_file(str(source), ())
+    started = Event()
+    release = Event()
+    active_cancellation_check = None
+
+    class BlockingService:
+        def queue(self, path: str) -> int:
+            del path
+            return 1
+
+        def reindex(
+            self,
+            path: str,
+            *,
+            cancellation_check: Any = None,
+            job_id: int | None = None,
+        ) -> SimpleNamespace:
+            del path, job_id
+            nonlocal active_cancellation_check
+            active_cancellation_check = cancellation_check
+            started.set()
+            assert release.wait(5)
+            return SimpleNamespace(status="completed")
+
+    runtime._indexing_service = BlockingService()
+    runtime.index_file_async(source)
+    assert started.wait(5)
+
+    completion = Future()
+    completion.set_result(None)
+    runtime.start_readiness = lambda on_complete=None: completion
+    runtime.apply_provider("gemini", gemini_api_key="new-key")
+
+    assert active_cancellation_check is not None
+    assert active_cancellation_check() is True
+    release.set()
+    runtime._index_queue.join()
+
+
 def test_apply_provider_retires_cached_contextual_rag_session(
     tmp_path, monkeypatch
 ) -> None:

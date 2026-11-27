@@ -293,7 +293,8 @@ class OllamaSettingsDialog(QDialog):
     def _apply_provider_visibility(self) -> None:
         provider = self.provider_selector.currentText().lower()
         for widget in self._ollama_widgets:
-            widget.setVisible(provider == "ollama")
+            if widget is not None:
+                widget.setVisible(provider == "ollama")
         self.gemini_group.setVisible(provider == "gemini")
         if provider == "gemini":
             if self.gemini_api_key.text().strip():
@@ -344,6 +345,10 @@ class OllamaSettingsDialog(QDialog):
                 )
 
     def _apply_provider_changes(self) -> bool:
+        applied, _applier_result = self._save_and_apply_provider_changes()
+        return applied
+
+    def _save_and_apply_provider_changes(self) -> tuple[bool, Any]:
         provider = self.provider_selector.currentText().lower()
         key_text = self.gemini_api_key.text().strip()
         key_to_store = key_text or None
@@ -360,7 +365,7 @@ class OllamaSettingsDialog(QDialog):
                         "AI Provider",
                         "Could not save the selected provider.",
                     )
-                    return False
+                    return False, None
             if key_to_store is not None:
                 set_key = getattr(self._config, "set_gemini_api_key", None)
                 if callable(set_key):
@@ -372,11 +377,11 @@ class OllamaSettingsDialog(QDialog):
                             "Gemini Key",
                             "Could not save the Gemini API key.",
                         )
-                        return False
+                        return False, None
 
         if callable(self._provider_applier):
             try:
-                self._provider_applier(
+                result = self._provider_applier(
                     provider,
                     gemini_api_key=key_to_store,
                 )
@@ -386,12 +391,14 @@ class OllamaSettingsDialog(QDialog):
                     "AI Provider",
                     "The provider was saved, but runtime readiness could not be refreshed.",
                 )
-                return False
+                return False, None
         elif provider == "gemini" and self._refresh_provider is not None:
-            self.refresh()
+            result = None
         elif provider == "ollama" and self._refresh_provider is not None:
-            self.refresh()
-        return True
+            result = None
+        else:
+            result = None
+        return True, result
 
     def set_report(self, report: ReadinessReport) -> None:
         self._report = report
@@ -691,6 +698,20 @@ class OllamaSettingsDialog(QDialog):
             self._completion_queue.put((generation, report))
 
         try:
+            applied, applier_result = self._save_and_apply_provider_changes()
+            if not applied:
+                self._complete_refresh(error=RuntimeError(
+                    "The unsaved provider settings could not be applied."
+                ))
+                return
+            if isinstance(applier_result, Future):
+                self._refresh_future = applier_result
+                self._refresh_timer.start()
+                return
+            if isinstance(applier_result, ReadinessReport):
+                self._complete_refresh(applier_result)
+                return
+
             operation = provider
             if not callable(operation):
                 operation = (

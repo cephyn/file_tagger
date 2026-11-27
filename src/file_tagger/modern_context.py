@@ -58,6 +58,9 @@ _CONTEXTUAL_RAG_CACHE_LIMIT = 8
 class _IndexRequest:
     file_path: str
     generation: int
+    provider: str
+    provider_generation: int
+    indexing_service_generation: int
 
 
 class ModernIndexingUnavailable(RuntimeError):
@@ -162,6 +165,7 @@ class ModernRuntime:
         self._index_worker: threading.Thread | None = None
         self._index_recovery_thread: threading.Thread | None = None
         self._indexing_service_generation = 0
+        self._provider_generation = 0
         self._lock = threading.Lock()
         self._contextual_rag_lock = threading.Lock()
         self._contextual_rag_condition = threading.Condition(
@@ -360,9 +364,10 @@ class ModernRuntime:
         with self._lock:
             self._readiness_generation += 1
             generation = self._readiness_generation
+            provider_generation = self._provider_generation
         thread = threading.Thread(
             target=self._initialize_readiness,
-            args=(generation, completion, on_complete),
+            args=(generation, provider_generation, completion, on_complete),
             name="file-tagger-ollama-readiness",
             daemon=True,
         )
@@ -404,6 +409,7 @@ class ModernRuntime:
 
         old_gateways: list[Any] = []
         with self._lock:
+            self._provider_generation += 1
             old_gateways.extend(
                 gateway
                 for gateway in (
@@ -513,6 +519,7 @@ class ModernRuntime:
         )
         self._save_model_overrides(updated)
         with self._lock:
+            self._provider_generation += 1
             self._model_overrides = updated
             self.required_models = selected
             if selected is not None and self._model_readiness is not None:
@@ -520,12 +527,14 @@ class ModernRuntime:
                     update={"selected_models": selected}
                 )
             self._indexing_service = None
+            self._indexing_service_generation = 0
             self._embedding_gateway = None
         return self.start_readiness()
 
     def _initialize_readiness(
         self,
         generation: int,
+        provider_generation: int,
         completion: Future[ReadinessReport | None],
         on_complete: ReadinessCallback | None,
     ) -> None:
@@ -596,7 +605,7 @@ class ModernRuntime:
             ):
                 embedding_profile = None
             indexing_service = None
-            embedding_gateway = None
+            embedding_gateway: Any | None = None
             if embedding_profile is not None and self.session_factory is not None:
                 if provider == "gemini":
                     embedding_gateway = _FreshGeminiEmbeddingGateway(
@@ -637,7 +646,11 @@ class ModernRuntime:
 
             published_service = False
             with self._lock:
-                if generation == self._readiness_generation:
+                if (
+                    generation == self._readiness_generation
+                    and provider_generation == self._provider_generation
+                    and provider == self._active_provider
+                ):
                     if (
                         embedding_profile is not None
                         and self._indexing_repository is not None
@@ -664,6 +677,7 @@ class ModernRuntime:
                 self._recover_published_indexing_service(
                     generation,
                     indexing_service,
+                    provider_generation,
                 )
             with self._lock:
                 if generation == self._readiness_generation:
@@ -713,11 +727,16 @@ class ModernRuntime:
         self,
         generation: int,
         service: IndexingService,
+        provider_generation: int | None = None,
     ) -> None:
         def current() -> bool:
             with self._lock:
                 return (
                     generation == self._readiness_generation
+                    and (
+                        provider_generation is None
+                        or provider_generation == self._provider_generation
+                    )
                     and self._indexing_service is service
                     and self._indexing_service_generation == generation
                 )
@@ -762,6 +781,7 @@ class ModernRuntime:
                 service = self._indexing_service
                 generation = self._readiness_generation
                 published_generation = self._indexing_service_generation
+                provider_generation = self._provider_generation
             if service is None:
                 threading.Event().wait(_INDEX_RECOVERY_MAX_WAIT_SECONDS)
                 continue
@@ -786,6 +806,7 @@ class ModernRuntime:
                 with self._lock:
                     return (
                         generation == self._readiness_generation
+                        and provider_generation == self._provider_generation
                         and self._indexing_service is service
                         and published_generation == self._indexing_service_generation
                         and generation == published_generation
@@ -1068,8 +1089,8 @@ class ModernRuntime:
             embedding_profile=profile,
         )
         with self._lock:
-            gateway = self._generation_gateway
-            embedding_gateway = self._embedding_gateway
+            gateway: Any = self._generation_gateway
+            embedding_gateway: Any = self._embedding_gateway
             provider = self._active_provider
             gemini_api_key = self._gemini_api_key
         if gateway is None:
@@ -1407,6 +1428,9 @@ class ModernRuntime:
             request = _IndexRequest(
                 canonical_path,
                 self._index_generations.get(canonical_path, 0),
+                self._active_provider,
+                self._provider_generation,
+                self._indexing_service_generation,
             )
             self._index_queue.put(request)
             if self._index_worker is None or not self._index_worker.is_alive():
@@ -1442,6 +1466,10 @@ class ModernRuntime:
             if (
                 self._index_generations.get(request.file_path, 0)
                 != request.generation
+                or self._active_provider != request.provider
+                or self._provider_generation != request.provider_generation
+                or self._indexing_service_generation
+                != request.indexing_service_generation
                 or self.session_factory is None
             ):
                 return None
@@ -1461,6 +1489,10 @@ class ModernRuntime:
             if (
                 self._index_generations.get(request.file_path, 0)
                 != request.generation
+                or self._active_provider != request.provider
+                or self._provider_generation != request.provider_generation
+                or self._indexing_service_generation
+                != request.indexing_service_generation
                 or self.session_factory is None
             ):
                 return None
@@ -1483,6 +1515,10 @@ class ModernRuntime:
             if (
                 self._index_generations.get(request.file_path, 0)
                 != request.generation
+                or self._active_provider != request.provider
+                or self._provider_generation != request.provider_generation
+                or self._indexing_service_generation
+                != request.indexing_service_generation
                 or self.session_factory is None
             ):
                 return True

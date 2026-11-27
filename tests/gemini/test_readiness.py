@@ -7,6 +7,7 @@ from file_tagger.adapters.gemini.gateway import (
 )
 from file_tagger.domain.contracts import ModelProfile, OllamaReadiness
 from file_tagger.domain.errors import GeminiUnavailableError
+from file_tagger.domain.errors import GeminiAuthenticationError
 from file_tagger.gemini.readiness import GeminiReadinessService
 from file_tagger.ollama.readiness import RequiredModels
 
@@ -112,3 +113,34 @@ def test_gemini_sdk_readiness_failure_blocks_all_roles() -> None:
     )
     assert report.gemini is not None
     assert report.gemini.available is False
+
+
+def test_gemini_sdk_authentication_probe_blocks_all_roles() -> None:
+    class AuthenticationGateway(FakeGeminiGateway):
+        async def readiness(self, required_models):
+            del required_models
+            raise GeminiAuthenticationError("Gemini authentication failed.")
+
+    selected = RequiredModels(
+        embedding=GEMINI_EMBEDDING_MODEL,
+        decision=GEMINI_DECISION_MODEL,
+        generation=GEMINI_GENERATION_MODEL,
+    )
+
+    report = asyncio.run(
+        GeminiReadinessService(AuthenticationGateway(), "test-secret").check(
+            selected
+        )
+    )
+
+    assert report.provider == "gemini"
+    assert report.ready is False
+    assert report.blocked_model_roles == (
+        "decision",
+        "embedding",
+        "generation",
+    )
+    assert report.gemini is not None
+    assert report.gemini.available is False
+    assert "authentication" in " ".join(report.errors).lower()
+    assert all("test-secret" not in item for item in report.errors)

@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from concurrent.futures import Future
 import logging
 from types import SimpleNamespace
 
@@ -749,6 +750,68 @@ def test_blank_gemini_key_preserves_configured_key_and_refreshes(qtbot) -> None:
     assert config.provider == "gemini"
     assert config.key == "stored-secret"
     assert applied == [("gemini", None)]
+
+
+def test_refresh_applies_unsaved_provider_key_before_readiness(qtbot) -> None:
+    events: list[str] = []
+
+    class Config:
+        def __init__(self) -> None:
+            self.provider = "ollama"
+            self.key = "stored-secret"
+
+        def get_ai_provider(self) -> str:
+            return self.provider
+
+        def get_gemini_api_key(self) -> str | None:
+            return self.key
+
+        def set_ai_provider(self, provider: str) -> bool:
+            events.append(f"save-provider:{provider}")
+            self.provider = provider
+            return True
+
+        def set_gemini_api_key(self, api_key: str) -> None:
+            events.append(f"save-key:{api_key}")
+            self.key = api_key
+
+    config = Config()
+    completion: Future[ReadinessReport | None] = Future()
+
+    class Runtime:
+        readiness = _report()
+
+        def apply_provider(
+            self,
+            provider: str,
+            gemini_api_key: str | None = None,
+        ) -> Future[ReadinessReport | None]:
+            events.append(f"apply-provider:{provider}:{gemini_api_key}")
+            return completion
+
+        def start_readiness(self) -> Future[ReadinessReport | None]:
+            events.append("start-readiness")
+            return completion
+
+    runtime = Runtime()
+    dialog = OllamaSettingsDialog(
+        _report(),
+        config=config,
+        provider_applier=runtime.apply_provider,
+        runtime_refresh_provider=runtime,
+    )
+    qtbot.addWidget(dialog)
+    dialog.provider_selector.setCurrentText("Gemini")
+    dialog.gemini_api_key.setText("unsaved-secret")
+
+    dialog.refresh()
+
+    assert events == [
+        "save-provider:gemini",
+        "save-key:unsaved-secret",
+        "apply-provider:gemini:unsaved-secret",
+    ]
+    assert dialog._refresh_future is completion
 
 
 def test_clear_gemini_key_is_separate_and_blocks_gemini_key_status(qtbot) -> None:

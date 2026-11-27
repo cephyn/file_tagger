@@ -101,6 +101,57 @@ def test_missing_key_is_rejected_without_exposure() -> None:
         GeminiGateway("   ")
 
 
+def test_readiness_probe_uses_exact_embedding_model_and_768_dimensions() -> None:
+    client = FakeClient()
+    gateway = GeminiGateway("test-key", client=client)
+
+    report = asyncio.run(
+        gateway.readiness(
+            {
+                "embedding": GEMINI_EMBEDDING_MODEL,
+                "decision": GEMINI_DECISION_MODEL,
+                "generation": GEMINI_GENERATION_MODEL,
+            }
+        )
+    )
+
+    assert report.available is True
+    call = client.aio.models.embed_calls[0]
+    assert call["model"] == "gemini-embedding-2"
+    assert call["config"].output_dimensionality == 768
+    assert call["config"].auto_truncate is False
+
+
+def test_readiness_authentication_failure_is_sanitized_and_blocking() -> None:
+    client = FakeClient()
+
+    async def unauthorized(**kwargs):
+        del kwargs
+        error = RuntimeError(
+            "headers={'authorization': 'Bearer test-key'}; unauthorized"
+        )
+        error.status_code = 401
+        raise error
+
+    client.aio.models.embed_content = unauthorized
+    gateway = GeminiGateway("test-key", client=client)
+
+    with pytest.raises(GeminiAuthenticationError) as caught:
+        asyncio.run(
+            gateway.readiness(
+                {
+                    "embedding": GEMINI_EMBEDDING_MODEL,
+                    "decision": GEMINI_DECISION_MODEL,
+                    "generation": GEMINI_GENERATION_MODEL,
+                }
+            )
+        )
+
+    assert "test-key" not in str(caught.value)
+    assert "authorization" not in str(caught.value).lower()
+    assert caught.value.__cause__ is None
+
+
 @pytest.mark.parametrize("text", ["source text", ["one", "two"]])
 def test_embed_converts_single_and_batch_vectors(text) -> None:
     client = FakeClient()
@@ -517,3 +568,26 @@ def test_close_failure_is_sanitized() -> None:
     assert secret not in str(caught.value)
     assert caught.value.__cause__ is None
     assert secret not in str(caught.value.__cause__)
+
+
+def test_close_async_failure_still_tries_fallback_client_close() -> None:
+    class FailingAio:
+        models = FakeModels()
+
+        async def close(self) -> None:
+            raise RuntimeError("aio close failed")
+
+    class FallbackClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.aio = FailingAio()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    client = FallbackClient()
+    gateway = GeminiGateway("test-key", client=client)
+
+    asyncio.run(gateway.close())
+
+    assert client.closed is True

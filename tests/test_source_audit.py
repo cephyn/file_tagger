@@ -25,9 +25,7 @@ MIGRATION_LEGACY_ALLOWLIST = {
     },
 }
 
-GEMINI_ADAPTER_ALLOWLIST = {
-    "src/file_tagger/adapters/gemini/gateway.py",
-}
+GEMINI_ADAPTER_PREFIX = "src/file_tagger/adapters/gemini/"
 
 
 def test_legacy_runtime_modules_and_debug_scripts_are_removed() -> None:
@@ -127,7 +125,13 @@ def test_gemini_sdk_imports_are_confined_to_the_gemini_adapter() -> None:
 
             if any(module == "google" or module.startswith("google.") for module in modules):
                 relative = path.relative_to(ROOT).as_posix()
-                if relative not in GEMINI_ADAPTER_ALLOWLIST:
+                if not relative.startswith(GEMINI_ADAPTER_PREFIX):
                     residuals.append(relative)
 
     assert residuals == []
+
+
+def test_gemini_adapter_sibling_module_is_allowed() -> None:
+    sibling = "src/file_tagger/adapters/gemini/sibling.py"
+
+    assert sibling.startswith(GEMINI_ADAPTER_PREFIX)

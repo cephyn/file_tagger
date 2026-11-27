@@ -33,6 +33,12 @@ GEMINI_DECISION_CONTEXT_LENGTH = 128_000
 GEMINI_EMBEDDING_CONTEXT_LENGTH = 2_048
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com"
+SanitizedTransportError = (
+    GeminiUnavailableError
+    | GeminiTimeoutError
+    | GeminiAuthenticationError
+    | EmbeddingContextRejectedError
+)
 
 
 def _profile_digest(model: str, canonical_profile: str) -> str:
@@ -64,7 +70,9 @@ class GeminiGateway:
                 else genai.Client(api_key=self._api_key)
             )
         except Exception as exc:
-            sanitized = self._translate_transport_error(exc)
+            sanitized: SanitizedTransportError | None = (
+                self._translate_transport_error(exc)
+            )
         else:
             sanitized = None
         if sanitized is not None:
@@ -166,12 +174,14 @@ class GeminiGateway:
 
     async def close(self) -> None:
         aio = getattr(self._client, "aio", None)
+        attempted_close = False
         close_failed = False
         for owner in (aio, self._client):
             if owner is None:
                 continue
             close = getattr(owner, "aclose", None) or getattr(owner, "close", None)
             if close is not None:
+                attempted_close = True
                 try:
                     result = close()
                     if inspect.isawaitable(result):
@@ -180,11 +190,10 @@ class GeminiGateway:
                         await result
                 except Exception:
                     close_failed = True
-                else:
-                    return
-                break
+                    continue
+                return
 
-        if close_failed:
+        if attempted_close and close_failed:
             raise GeminiUnavailableError("Gemini is unavailable.") from None
 
     async def model_profile(self, role: ModelRole, model: str) -> ModelProfile:
@@ -246,8 +255,16 @@ class GeminiGateway:
             except ModelIncompatibleError:
                 incompatible.append(model)
 
+        if not incompatible:
+            await self.embed(
+                GEMINI_EMBEDDING_MODEL,
+                "Gemini readiness probe",
+                dimensions=768,
+                truncate=False,
+            )
+
         return OllamaReadiness(
-            available=True,
+            available=not incompatible,
             version=None,
             base_url=GEMINI_ENDPOINT,
             missing_models=(),
@@ -531,7 +548,9 @@ class GeminiGateway:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            sanitized = self._translate_transport_error(exc)
+            sanitized: SanitizedTransportError | None = (
+                self._translate_transport_error(exc)
+            )
         else:
             sanitized = None
         if sanitized is not None:
