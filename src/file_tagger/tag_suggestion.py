@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                             QTextEdit)
 from PySide6.QtCore import Qt, QSize, Signal, QEvent
 from PySide6.QtGui import QColor
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 from hashlib import sha256
 import mimetypes
@@ -14,7 +15,11 @@ from pathlib import Path
 
 from .domain.contracts import ModelProfile
 from .infrastructure.app_paths import AppPaths
-from .infrastructure.database import create_session_factory, upgrade_database
+from .infrastructure.database import (
+    create_session_factory,
+    normalize_tag_key,
+    upgrade_database,
+)
 from .models import TagSuggestionCache as LegacySuggestionCache
 from .persistence.models import File, FileTag, Tag
 from .search.hybrid import HybridSearch
@@ -37,6 +42,56 @@ _STRUCTURED_TEXT_SUBTYPES = frozenset(
     {"calendar", "csv", "html", "rtf", "sgml", "xml"}
 )
 TAG_SUGGESTION_EXTRACTION_VERSION = "tag-suggestion-state-v1"
+
+
+def _existing_tag_names(db_session: Any) -> tuple[str, ...]:
+    get_bind = getattr(db_session, "get_bind", None)
+    if callable(get_bind):
+        bind = get_bind()
+        if bind is not None and not inspect(bind).has_table(Tag.__tablename__):
+            return ()
+    query = getattr(db_session, "query", None)
+    if not callable(query):
+        return ()
+    tag_query = query(Tag)
+    all_tags = getattr(tag_query, "all", None)
+    if not callable(all_tags):
+        return ()
+    return tuple(
+        tag.name
+        for tag in all_tags()
+        if isinstance(getattr(tag, "name", None), str)
+        and getattr(tag, "name", "").strip()
+    )
+
+
+def _resolve_existing_tag(db_session: Any, tag_name: str) -> Tag | None:
+    key = normalize_tag_key(tag_name)
+    if key is None:
+        return None
+    get_bind = getattr(db_session, "get_bind", None)
+    if callable(get_bind):
+        bind = get_bind()
+        if bind is not None and not inspect(bind).has_table(Tag.__tablename__):
+            return None
+    query = getattr(db_session, "query", None)
+    if not callable(query):
+        return None
+    tag_query = query(Tag)
+    all_tags = getattr(tag_query, "all", None)
+    if callable(all_tags):
+        for tag in all_tags():
+            if normalize_tag_key(getattr(tag, "name", None)) == key:
+                return tag
+    filter_by = getattr(tag_query, "filter_by", None)
+    if callable(filter_by):
+        exact_query = filter_by(name=tag_name)
+        first = getattr(exact_query, "first", None)
+        if callable(first):
+            exact = first()
+            if isinstance(exact, Tag):
+                return exact
+    return None
 
 
 class TagSuggestionConfig(Protocol):
@@ -143,12 +198,19 @@ class TagSuggester:
         canonical_path = os.path.abspath(os.path.normpath(file_path))
         file_hash = _file_hash(file_path)
         if self._candidate_service is not None:
+            recommend_kwargs: dict[str, Any] = {
+                "file_hash": file_hash,
+                "extraction_version": TAG_SUGGESTION_EXTRACTION_VERSION,
+                "file_path": canonical_path,
+                "force_refresh": force_refresh,
+            }
+            if isinstance(self._candidate_service, CandidateService):
+                recommend_kwargs["existing_tags"] = _existing_tag_names(
+                    self.db_session
+                )
             return self._candidate_service.recommend(
                 document_state,
-                file_hash=file_hash,
-                extraction_version=TAG_SUGGESTION_EXTRACTION_VERSION,
-                file_path=canonical_path,
-                force_refresh=force_refresh,
+                **recommend_kwargs,
             )
 
         modern_factory = getattr(
@@ -291,6 +353,9 @@ class TagSuggester:
                 file_path=canonical_path,
                 force_refresh=force_refresh,
                 embedding_profile=embedding_profile,
+                existing_tags=_existing_tag_names(
+                    self.db_session if self.db_session is not None else search_session
+                ),
             )
             if cache_session is not None:
                 cache_session.commit()
@@ -776,14 +841,23 @@ class TagSuggestionDialog(QDialog):
             self.existing_list.clear()
             self.new_list.clear()
             for decision in result.accepted + result.review:
-                target = self.new_list if decision.is_new else self.existing_list
-                self._add_tag_item(
+                existing_tag = _resolve_existing_tag(
+                    self.db_session,
                     decision.tag,
+                )
+                if existing_tag is not None:
+                    tag_name = existing_tag.name
+                    target = self.existing_list
+                else:
+                    tag_name = decision.tag
+                    target = self.new_list if decision.is_new else self.existing_list
+                self._add_tag_item(
+                    tag_name,
                     decision.confidence,
                     target,
                 )
                 if decision.rationale:
-                    self.tag_explanations[decision.tag] = decision.rationale
+                    self.tag_explanations[tag_name] = decision.rationale
             self.cache_label.setText(
                 "Refreshed local recommendations"
                 if force_refresh
@@ -829,7 +903,7 @@ class TagSuggestionDialog(QDialog):
             # Add existing tags
             existing_tag_names = {tag.name for tag in _modern_file_tags(file_obj)}
             for tag_name in selected_existing:
-                tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
+                tag = _resolve_existing_tag(self.db_session, tag_name)
                 if tag and tag.name not in existing_tag_names:
                     if hasattr(tag, "id") and getattr(tag, "id", None) is not None:
                         file_obj.tags.append(FileTag(file=file_obj, tag=tag))
@@ -839,7 +913,7 @@ class TagSuggestionDialog(QDialog):
             
             # Create and add new tags with random colors
             for tag_name in selected_new:
-                tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
+                tag = _resolve_existing_tag(self.db_session, tag_name)
                 if not tag:
                     # Generate random color with good saturation and brightness
                     hue = random.randint(0, 359)

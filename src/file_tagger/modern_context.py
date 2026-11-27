@@ -29,7 +29,11 @@ from .indexing.repository import IndexingRepository
 from .indexing.repository import VectorIndexReadiness
 from .indexing.service import IndexingResult, IndexingService
 from .infrastructure.app_paths import AppPaths
-from .infrastructure.database import create_session_factory, upgrade_database
+from .infrastructure.database import (
+    create_session_factory,
+    normalize_tag_key,
+    upgrade_database,
+)
 from .migration.config_migration import ConfigMigrationReport, migrate_legacy_config
 from .migration.sqlite_migration import LegacyMigrationReport, migrate_legacy_sqlite
 from .ollama.hardware import profile_hardware
@@ -80,6 +84,16 @@ class StartupConfig(Protocol):
 def _canonical_path(file_path: str | Path) -> str:
     path = Path(file_path).expanduser().resolve()
     return os.path.normpath(str(path))
+
+
+def _resolve_tag(session: Session, name: str) -> Tag | None:
+    key = normalize_tag_key(name)
+    if key is None:
+        return None
+    for tag in session.scalars(select(Tag).order_by(Tag.id)).all():
+        if normalize_tag_key(tag.name) == key:
+            return tag
+    return None
 
 
 class _FreshOllamaEmbeddingGateway:
@@ -1566,7 +1580,7 @@ class ModernRuntime:
         if self.session_factory is None:
             return
         with self.session_factory.begin() as session:
-            tag = session.scalar(select(Tag).where(Tag.name == name))
+            tag = _resolve_tag(session, name)
             if tag is None:
                 tag = Tag(name=name, color=color or "#808080")
                 session.add(tag)
@@ -1577,7 +1591,7 @@ class ModernRuntime:
         if self.session_factory is None:
             return
         with self.session_factory.begin() as session:
-            tag = session.scalar(select(Tag).where(Tag.name == name))
+            tag = _resolve_tag(session, name)
             if tag is not None:
                 session.delete(tag)
 
@@ -1600,14 +1614,16 @@ class ModernRuntime:
 
             selected: dict[str, Tag] = {}
             for name, color in normalized_tags:
-                tag = session.scalar(select(Tag).where(Tag.name == name))
+                tag = _resolve_tag(session, name)
                 if tag is None:
                     tag = Tag(name=name, color=color or "#808080")
                     session.add(tag)
                     session.flush()
                 else:
                     tag.color = color or "#808080"
-                selected[name] = tag
+                key = normalize_tag_key(tag.name)
+                if key is not None:
+                    selected[key] = tag
 
             associations = {
                 association.tag_id: association
@@ -1671,11 +1687,11 @@ class ModernRuntime:
                 for file in files_to_delete.values():
                     session.delete(file)
                 for name in deleted_tags:
-                    tag = session.scalar(select(Tag).where(Tag.name == name))
+                    tag = _resolve_tag(session, name)
                     if tag is not None:
                         session.delete(tag)
                 for name, color in updated_tags:
-                    tag = session.scalar(select(Tag).where(Tag.name == name))
+                    tag = _resolve_tag(session, name)
                     if tag is None:
                         tag = Tag(name=name, color=color or "#808080")
                         session.add(tag)
@@ -1698,14 +1714,16 @@ class ModernRuntime:
 
                     selected: dict[str, Tag] = {}
                     for name, color in tags:
-                        tag = session.scalar(select(Tag).where(Tag.name == name))
+                        tag = _resolve_tag(session, name)
                         if tag is None:
                             tag = Tag(name=name, color=color or "#808080")
                             session.add(tag)
                             session.flush()
                         else:
                             tag.color = color or "#808080"
-                        selected[name] = tag
+                        key = normalize_tag_key(tag.name)
+                        if key is not None:
+                            selected[key] = tag
 
                     associations = {
                         association.tag_id: association

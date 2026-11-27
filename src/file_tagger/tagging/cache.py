@@ -1,5 +1,7 @@
 from collections.abc import Mapping
 from datetime import UTC, datetime
+import mimetypes
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import AliasChoices, Field, model_validator
@@ -281,8 +283,43 @@ class DatabaseTagRecommendationCache:
             exact = self._session.scalar(
                 select(File).where(File.canonical_path == stored.file_path)
             )
-            if exact is not None and exact.content_hash == stored.file_hash:
+            if exact is not None:
+                if exact.content_hash is None:
+                    exact.content_hash = stored.file_hash
+                    try:
+                        source = Path(stored.file_path)
+                        stat = source.stat()
+                        exact.size_bytes = stat.st_size
+                        exact.mtime_ns = stat.st_mtime_ns
+                        exact.mime_type = mimetypes.guess_type(
+                            stored.file_path,
+                            strict=False,
+                        )[0]
+                    except (OSError, ValueError):
+                        pass
                 return exact.id
+            file = File(
+                canonical_path=stored.file_path,
+                content_hash=stored.file_hash,
+                indexing_state="not_indexed",
+            )
+            try:
+                source = Path(stored.file_path)
+                stat = source.stat()
+                file.size_bytes = stat.st_size
+                file.mtime_ns = stat.st_mtime_ns
+                file.mime_type = mimetypes.guess_type(
+                    stored.file_path,
+                    strict=False,
+                )[0]
+            except (OSError, ValueError):
+                file.mime_type = mimetypes.guess_type(
+                    stored.file_path,
+                    strict=False,
+                )[0]
+            self._session.add(file)
+            self._session.flush()
+            return file.id
         matches = self._session.scalars(
             select(File).where(File.content_hash == stored.file_hash)
         ).all()

@@ -53,9 +53,34 @@ from .ui.ollama_settings import OllamaSettingsDialog
 from .migration.legacy_chroma import cleanup_legacy_chroma, inspect_legacy_chroma
 from .utils import is_dark_color, get_score_color, iter_visible_files, open_file, open_containing_folder
 from .infrastructure.app_paths import AppPaths
+from .infrastructure.database import normalize_tag_key
 from .modern_context import ModernIndexingUnavailable, ModernSearchUnavailable
 
 _ACTIVE_CONTENT_SEARCH_WORKERS: set[ContentSearchWorker] = set()
+
+
+def _resolve_existing_tag(db_session: Any, tag_name: str) -> Tag | None:
+    key = normalize_tag_key(tag_name)
+    if key is None:
+        return None
+    tag_query = db_session.query(Tag)
+    all_tags = getattr(tag_query, "all", None)
+    if callable(all_tags):
+        tags = all_tags()
+    else:
+        tags = ()
+    for tag in tags:
+        if normalize_tag_key(getattr(tag, "name", None)) == key:
+            return tag
+    filter_by = getattr(tag_query, "filter_by", None)
+    if callable(filter_by):
+        exact_query = filter_by(name=tag_name)
+        first = getattr(exact_query, "first", None)
+        if callable(first):
+            exact = first()
+            if isinstance(exact, Tag):
+                return exact
+    return None
 
 
 def hide_scan_progress(progress: QProgressDialog) -> None:
@@ -1282,7 +1307,7 @@ class FileTagManager(QMainWindow):
         if not selected_color.isValid():
             return
 
-        existing = self.db_session.query(Tag).filter_by(name=tag_name).first()
+        existing = _resolve_existing_tag(self.db_session, tag_name)
         if existing:
             QMessageBox.warning(
                 self,
@@ -1332,8 +1357,8 @@ class FileTagManager(QMainWindow):
             return
 
         if new_name != old_name:
-            existing = self.db_session.query(Tag).filter_by(name=new_name).first()
-            if existing:
+            existing = _resolve_existing_tag(self.db_session, new_name)
+            if existing is not None and existing.id != tag.id:
                 QMessageBox.warning(
                     self, "Error", "A tag with this name already exists!"
                 )
@@ -2491,7 +2516,7 @@ class FileTagManager(QMainWindow):
         # Add tags (create them if they don't exist)
         existing_tag_ids = {tag.id for tag in self._file_tags(file_obj)}
         for tag_name in tag_names:
-            tag = self.db_session.query(Tag).filter_by(name=tag_name).first()
+            tag = _resolve_existing_tag(self.db_session, tag_name)
             if not tag:
                 # Create a new tag with a random color
                 import random

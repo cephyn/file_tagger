@@ -260,3 +260,61 @@ def test_index_availability_migration_preserves_committed_documents(
         committed_id: "indexed",
         missing_id: "not_indexed",
     }
+
+
+def test_tag_name_migration_merges_case_variants(tmp_path: Path) -> None:
+    database_path = tmp_path / "duplicate-tags.sqlite3"
+    config_path = Path(__file__).resolve().parents[2] / "alembic.ini"
+    config = Config(str(config_path))
+    config.attributes["database_path"] = database_path
+    command.upgrade(config, "0010_index_availability")
+
+    with sqlite3.connect(database_path) as connection:
+        file_id = connection.execute(
+            "INSERT INTO files "
+            "(canonical_path, indexing_state, created_at, updated_at) "
+            "VALUES (?, 'indexed', ?, ?)",
+            (
+                r"C:\docs\guide.md",
+                "2026-11-24 11:00:00",
+                "2026-11-24 11:00:00",
+            ),
+        ).lastrowid
+        canonical_id = connection.execute(
+            "INSERT INTO tags (name, color, created_at) "
+            "VALUES ('Adventure', '#123456', ?)",
+            ("2026-11-24 11:00:00",),
+        ).lastrowid
+        duplicate_id = connection.execute(
+            "INSERT INTO tags (name, color, created_at) "
+            "VALUES ('adventure', '#654321', ?)",
+            ("2026-11-24 11:00:00",),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO file_tags (file_id, tag_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (file_id, canonical_id, "2026-11-24 11:00:00"),
+        )
+        connection.execute(
+            "INSERT INTO file_tags (file_id, tag_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (file_id, duplicate_id, "2026-11-24 11:00:00"),
+        )
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(database_path) as connection:
+        tags = connection.execute(
+            "SELECT id, name FROM tags ORDER BY id"
+        ).fetchall()
+        associations = connection.execute(
+            "SELECT file_id, tag_id FROM file_tags"
+        ).fetchall()
+        index_names = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(tags)")
+        }
+
+    assert tags == [(canonical_id, "Adventure")]
+    assert associations == [(file_id, canonical_id)]
+    assert "uq_tags_normalized_name" in index_names

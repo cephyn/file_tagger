@@ -22,6 +22,12 @@ def normalize_unicode_key(value: str | None) -> str | None:
     return unicodedata.normalize("NFKC", value).casefold()
 
 
+def normalize_tag_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
 def configure_sqlite_engine(engine: Engine) -> Engine:
     event.listen(engine, "connect", configure_sqlite_connection)
     return engine
@@ -46,6 +52,12 @@ def configure_sqlite_connection(
             "unicode_normalize",
             1,
             normalize_unicode_key,
+            deterministic=True,
+        )
+        dbapi_connection.create_function(
+            "unicode_normalize_tag",
+            1,
+            normalize_tag_key,
             deterministic=True,
         )
     except sqlite3.Error as exc:

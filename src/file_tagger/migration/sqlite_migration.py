@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..domain.errors import IndexTransactionError
+from ..infrastructure.database import normalize_tag_key
 from ..persistence.models import File, FileTag, Tag, TagSuggestionCache
 from ..persistence.vector_cleanup import delete_file_embeddings
 
@@ -190,8 +191,19 @@ def migrate_legacy_sqlite(
 
             current_tags = list(target_session.scalars(select(Tag)))
             target_tags = {tag.name: tag for tag in current_tags}
+            target_tags_by_key = {
+                key: tag
+                for tag in current_tags
+                if (key := normalize_tag_key(tag.name)) is not None
+            }
+            source_tag_keys = {
+                key
+                for name in source_tags
+                if (key := normalize_tag_key(name)) is not None
+            }
             for tag in current_tags:
-                if tag.name not in source_tags:
+                tag_key = normalize_tag_key(tag.name)
+                if tag_key not in source_tag_keys:
                     target_session.delete(tag)
 
             for path in sorted(source_files):
@@ -205,11 +217,18 @@ def migrate_legacy_sqlite(
                     migrated_files += 1
 
             for name, color in sorted(source_tag_colors.items()):
-                target_tag = target_tags.get(name)
+                name_key = normalize_tag_key(name)
+                target_tag = (
+                    target_tags_by_key.get(name_key)
+                    if name_key is not None
+                    else None
+                )
                 if target_tag is None:
                     target_tag = Tag(name=name, color=color)
                     target_session.add(target_tag)
                     target_tags[name] = target_tag
+                    if name_key is not None:
+                        target_tags_by_key[name_key] = target_tag
                     migrated_tags += 1
                 else:
                     target_tag.color = color
@@ -220,7 +239,8 @@ def migrate_legacy_sqlite(
                 int(file.id): path for path, file in target_files.items()
             }
             tag_names_by_id = {
-                int(tag.id): name for name, tag in target_tags.items()
+                int(tag.id): tag.name
+                for tag in target_session.scalars(select(Tag)).all()
             }
             current_associations = {
                 (
@@ -229,15 +249,34 @@ def migrate_legacy_sqlite(
                 ): association
                 for association in target_session.scalars(select(FileTag))
             }
-            for association_key, association in current_associations.items():
-                if association_key not in source_associations:
-                    target_session.delete(association)
+            canonical_source_associations: set[tuple[str, str]] = set()
             for path, name in source_associations:
+                name_key = normalize_tag_key(name)
+                target_tag = (
+                    target_tags_by_key.get(name_key)
+                    if name_key is not None
+                    else None
+                )
+                canonical_source_associations.add(
+                    (path, target_tag.name if target_tag is not None else name)
+                )
+            for association_key, association in current_associations.items():
+                if association_key not in canonical_source_associations:
+                    target_session.delete(association)
+            for path, name in canonical_source_associations:
+                name_key = normalize_tag_key(name)
+                target_tag = (
+                    target_tags_by_key.get(name_key)
+                    if name_key is not None
+                    else None
+                )
+                if target_tag is None:
+                    continue
                 if (path, name) not in current_associations:
                     target_session.add(
                         FileTag(
                             file_id=int(target_files[path].id),
-                            tag_id=int(target_tags[name].id),
+                            tag_id=int(target_tag.id),
                         )
                     )
                     migrated_associations += 1

@@ -82,6 +82,81 @@ def test_add_tag_to_file_creates_modern_association(tmp_path: Path, qtbot) -> No
         assert association.file.canonical_path == r"E:\Google Drive"
 
 
+def test_apply_tags_to_file_uses_existing_tag_spelling_case_insensitively(
+    tmp_path: Path,
+    qtbot,
+) -> None:
+    from file_tagger.file_tag_manager import FileTagManager
+
+    database_path = tmp_path / "file-tagger.sqlite3"
+    upgrade_database(database_path)
+    engine = create_database_engine(database_path)
+    session_factory = sessionmaker(bind=engine)
+
+    file_path = str(tmp_path / "guide.md")
+    canonical_path = str(Path(file_path).resolve())
+    with session_factory.begin() as session:
+        session.add_all(
+            [
+                File(
+                    canonical_path=canonical_path,
+                    indexing_state="not_indexed",
+                ),
+                Tag(name="Adventure", color="#123456"),
+            ]
+        )
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.db_session = session_factory()
+
+    manager.apply_tags_to_file(file_path, {"adventure"})
+    manager.db_session.commit()
+
+    with session_factory() as session:
+        tags = session.scalars(select(Tag)).all()
+        association_tag_name = session.scalar(
+            select(Tag.name).join(FileTag, FileTag.tag_id == Tag.id)
+        )
+
+    assert [tag.name for tag in tags] == ["Adventure"]
+    assert association_tag_name == "Adventure"
+
+
+def test_modern_runtime_sync_file_does_not_create_case_variant_duplicates(
+    tmp_path: Path,
+) -> None:
+    from file_tagger.modern_context import ModernRuntime
+
+    database_path = tmp_path / "file-tagger.sqlite3"
+    upgrade_database(database_path)
+    engine = create_database_engine(database_path)
+    session_factory = sessionmaker(bind=engine)
+
+    with session_factory.begin() as session:
+        session.add(Tag(name="Adventure", color="#123456"))
+
+    runtime = ModernRuntime.__new__(ModernRuntime)
+    runtime.session_factory = session_factory
+
+    file_path = str(tmp_path / "guide.md")
+    runtime.sync_file(
+        file_path,
+        [
+            ("adventure", "#123456"),
+            ("Adventure", "#123456"),
+        ],
+    )
+
+    with session_factory() as session:
+        tags = session.scalars(select(Tag)).all()
+        associations = session.scalars(select(FileTag)).all()
+
+    assert [tag.name for tag in tags] == ["Adventure"]
+    assert len(associations) == 1
+
+
 def test_remove_tag_from_file_removes_modern_association(tmp_path: Path, qtbot) -> None:
     from file_tagger.file_tag_manager import FileTagManager
 
@@ -231,6 +306,62 @@ def test_add_tag_uses_shared_dialog_and_persists_choice(
 
     assert commit_calls == [{"tag_upserts": [("contracts", "#123456")]}]
     assert refresh_calls == [True]
+
+
+def test_add_tag_rejects_case_insensitive_duplicate(
+    tmp_path: Path,
+    qtbot,
+    monkeypatch,
+) -> None:
+    from file_tagger import file_tag_manager
+    from file_tagger.file_tag_manager import FileTagManager
+
+    database_path = tmp_path / "file-tagger.sqlite3"
+    upgrade_database(database_path)
+    engine = create_database_engine(database_path)
+    session_factory = sessionmaker(bind=engine)
+
+    with session_factory.begin() as session:
+        session.add(Tag(name="Adventure", color="#123456"))
+
+    manager = FileTagManager.__new__(FileTagManager)
+    QMainWindow.__init__(manager)
+    qtbot.addWidget(manager)
+    manager.db_session = session_factory()
+    manager.tag_list = QListWidget()
+    commit_calls = []
+    manager._commit_legacy_changes = lambda **kwargs: commit_calls.append(kwargs)
+    manager.refresh_tags = lambda: None
+
+    class AcceptedDialog:
+        def __init__(self, parent, *, tag_name, existing_colors):
+            del parent, tag_name, existing_colors
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def get_tag_name(self):
+            return "adventure"
+
+        def get_selected_color(self):
+            return QColor("#654321")
+
+    warnings = []
+    monkeypatch.setattr(file_tag_manager, "TagEditDialog", AcceptedDialog)
+    monkeypatch.setattr(
+        file_tag_manager.QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    manager.add_tag()
+
+    with session_factory() as session:
+        tags = session.scalars(select(Tag)).all()
+
+    assert [tag.name for tag in tags] == ["Adventure"]
+    assert commit_calls == []
+    assert warnings
 
 
 def test_edit_tag_uses_shared_dialog_and_persists_choice(

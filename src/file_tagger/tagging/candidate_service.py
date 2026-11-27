@@ -111,6 +111,7 @@ def recommend_tags(
     file_id: int | None = None,
     file_path: str | None = None,
     force_refresh: bool = False,
+    existing_tags: Sequence[str] = (),
 ) -> CachedTagRecommendations:
     return _run_sync(
         recommend_tags_async(
@@ -136,6 +137,7 @@ def recommend_tags(
             file_id=file_id,
             file_path=file_path,
             force_refresh=force_refresh,
+            existing_tags=existing_tags,
         )
     )
 
@@ -164,6 +166,7 @@ async def recommend_tags_async(
     file_id: int | None = None,
     file_path: str | None = None,
     force_refresh: bool = False,
+    existing_tags: Sequence[str] = (),
 ) -> CachedTagRecommendations:
     _validate_request(
         document_state=document_state,
@@ -229,6 +232,9 @@ async def recommend_tags_async(
         )
         existing_limit = min(max_candidates, semantic_limit)
         bounded_existing = existing[:existing_limit]
+        existing_spelling = _existing_tag_spelling(
+            (*bounded_existing, *existing_tags)
+        )
         reserved_generation_limit = max_candidates - existing_limit
         generation_limit = (
             min(DEFAULT_GENERATION_CANDIDATE_QUOTA, reserved_generation_limit)
@@ -262,7 +268,11 @@ async def recommend_tags_async(
                 confirmation_threshold=confirmation_threshold,
             )
             if cached is not None:
-                refreshed = _refresh_cached_spelling(cached, bounded_existing)
+                refreshed = _refresh_cached_spelling(
+                    cached,
+                    bounded_existing,
+                    existing_spelling,
+                )
                 if refreshed != cached:
                     cache.store(refreshed)
                 return refreshed
@@ -285,6 +295,7 @@ async def recommend_tags_async(
             bounded_existing,
             generated,
             max_candidates=max_candidates,
+            existing_spelling=existing_spelling,
         )
         decisions: tuple[TagDecision, ...] = ()
         if candidates:
@@ -345,6 +356,7 @@ class CandidateService:
         max_candidates: int = DEFAULT_MAX_TAG_CANDIDATES,
         semantic_limit: int = DEFAULT_SEMANTIC_RESULT_LIMIT,
         confirmation_threshold: float = DEFAULT_CONFIRMATION_THRESHOLD,
+        existing_tags: Sequence[str] = (),
     ) -> None:
         self._search = search
         self._gateway = gateway
@@ -358,6 +370,7 @@ class CandidateService:
         self._max_candidates = max_candidates
         self._semantic_limit = semantic_limit
         self._confirmation_threshold = confirmation_threshold
+        self._existing_tags = tuple(existing_tags)
 
     def recommend(
         self,
@@ -380,6 +393,7 @@ class CandidateService:
             "max_candidates": self._max_candidates,
             "semantic_limit": self._semantic_limit,
             "confirmation_threshold": self._confirmation_threshold,
+            "existing_tags": self._existing_tags,
         }
         defaults.update(kwargs)
         return recommend_tags(
@@ -410,6 +424,7 @@ class CandidateService:
             "max_candidates": self._max_candidates,
             "semantic_limit": self._semantic_limit,
             "confirmation_threshold": self._confirmation_threshold,
+            "existing_tags": self._existing_tags,
         }
         defaults.update(kwargs)
         return recommend_tags_async(
@@ -635,15 +650,28 @@ def _candidate_set_digest(tags: Sequence[str]) -> str:
 def _refresh_cached_spelling(
     cached: CachedTagRecommendations,
     existing: Sequence[str],
+    existing_spelling: Mapping[str, str] | None = None,
 ) -> CachedTagRecommendations:
-    current_spelling = {_tag_key(tag): tag for tag in existing}
+    current_spelling = (
+        dict(existing_spelling)
+        if existing_spelling is not None
+        else {_tag_key(tag): tag for tag in existing}
+    )
+    for tag in existing:
+        current_spelling.setdefault(_tag_key(tag), tag)
     changed = False
     decisions: list[TagDecision] = []
     for decision in cached.decisions:
         current = current_spelling.get(_tag_key(decision.tag))
-        if not decision.is_new and current is not None and current != decision.tag:
-            decision = decision.model_copy(update={"tag": current})
-            changed = True
+        if current is not None:
+            updates: dict[str, object] = {}
+            if decision.tag != current:
+                updates["tag"] = current
+            if decision.is_new:
+                updates["is_new"] = False
+            if updates:
+                decision = decision.model_copy(update=updates)
+                changed = True
         decisions.append(decision)
     if not changed:
         return cached
@@ -744,21 +772,28 @@ def _merge_candidates(
     generated: Sequence[str],
     *,
     max_candidates: int,
+    existing_spelling: Mapping[str, str] | None = None,
 ) -> tuple[tuple[str, ...], frozenset[str]]:
     selected: list[str] = []
     keys: set[str] = set()
     generated_keys: set[str] = set()
+    spelling = dict(existing_spelling or {})
+    for value in existing:
+        spelling.setdefault(_tag_key(value), _display_tag(value) or value)
     for source, values in (("existing", existing), ("generated", generated)):
         for value in values:
             normalized = _display_tag(value)
             if normalized is None:
                 continue
             key = _tag_key(normalized)
+            is_generated = source == "generated" and key not in spelling
+            if source == "generated":
+                normalized = spelling.get(key, normalized)
             if key in keys:
                 continue
             keys.add(key)
             selected.append(normalized)
-            if source == "generated":
+            if is_generated:
                 generated_keys.add(key)
             if len(selected) >= max_candidates:
                 return tuple(selected), frozenset(generated_keys)
@@ -794,6 +829,15 @@ def _display_tag(value: object) -> str | None:
 
 def _tag_key(value: str) -> str:
     return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def _existing_tag_spelling(values: Sequence[str]) -> dict[str, str]:
+    spelling: dict[str, str] = {}
+    for value in values:
+        normalized = _display_tag(value)
+        if normalized is not None:
+            spelling.setdefault(_tag_key(normalized), normalized)
+    return spelling
 
 
 def _validate_request(

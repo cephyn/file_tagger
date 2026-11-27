@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import event, inspect, text
+from sqlalchemy import event, inspect, select, text
 
 from file_tagger.domain.contracts import GeminiReadiness, ModelProfile, TagDecision
 from file_tagger.domain.errors import (
@@ -608,6 +608,30 @@ def test_recommendations_prefer_existing_tags_and_require_low_confidence_review(
     assert "reference" in gateway.chat_calls[0]["messages"][1]["content"]
 
 
+def test_recommendations_use_existing_tag_spelling_case_insensitively() -> None:
+    search = FakeSearch([])
+    gateway = FakeGateway(["adventure", "Adventure", "new tag"])
+    cache = InMemoryTagRecommendationCache()
+
+    result = recommend_tags(
+        "A fantasy adventure.",
+        file_hash="case-insensitive-existing",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        existing_tags=("Adventure", "Shadowdark"),
+        max_candidates=4,
+        confirmation_threshold=0.7,
+    )
+
+    assert [item.tag for item in result.decisions] == ["Adventure", "new tag"]
+    assert result.decisions[0].decision == "accept"
+    assert result.decisions[0].is_new is False
+    assert result.decisions[1].decision == "review"
+    assert result.decisions[1].is_new is True
+
+
 def test_recommendations_are_cache_hits_without_repeating_model_requests() -> None:
     search = FakeSearch(["Research"])
     gateway = FakeGateway(["invoice"])
@@ -881,6 +905,46 @@ def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> Non
         "confirmation_threshold",
         "document_state_digest",
     } <= columns
+
+
+def test_database_cache_creates_identity_for_unindexed_file(tmp_path: Path) -> None:
+    database_path = tmp_path / "unindexed-tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    canonical_path = str((tmp_path / "new-document.pdf").resolve())
+
+    with session_factory.begin() as session:
+        DatabaseTagRecommendationCache(session).store(
+            CachedTagRecommendations(
+                file_path=canonical_path,
+                file_hash="new-document-hash",
+                document_state_digest="document-state-v1",
+                extraction_version="docling-v1",
+                candidate_model_digest="candidate-v1",
+                decision_model_digest="decision-v1",
+                candidate_set_digest="catalog-v1",
+                max_candidates=4,
+                confirmation_threshold=0.7,
+                decisions=(),
+            )
+        )
+
+    with session_factory() as session:
+        file = session.scalar(
+            select(File).where(File.canonical_path == canonical_path)
+        )
+        cached = DatabaseTagRecommendationCache(session).lookup(
+            "new-document-hash",
+            file_path=canonical_path,
+            document_state_digest="document-state-v1",
+            extraction_version="docling-v1",
+        )
+
+    assert file is not None
+    assert file.content_hash == "new-document-hash"
+    assert file.indexing_state == "not_indexed"
+    assert cached is not None
+    assert cached.file_id == file.id
 
 
 def test_database_cache_lookup_is_scoped_to_the_target_file(tmp_path: Path) -> None:
