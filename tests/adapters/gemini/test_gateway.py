@@ -114,6 +114,27 @@ def test_exact_model_names_and_profiles_are_stable() -> None:
     assert "test-key" not in embedding.digest
 
 
+def test_vertex_express_key_uses_enterprise_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeGenaiClient:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.aio = FakeAio()
+
+    monkeypatch.setattr(
+        "file_tagger.adapters.gemini.gateway.genai.Client",
+        FakeGenaiClient,
+    )
+
+    GeminiGateway("AQ.test-express-key")
+
+    assert calls == [{
+        "enterprise": True,
+        "api_key": "AQ.test-express-key",
+    }]
+
+
 def test_missing_key_is_rejected_without_exposure() -> None:
     with pytest.raises(GeminiAuthenticationError):
         GeminiGateway("   ")

@@ -67,9 +67,16 @@ class GeminiGateway:
             self._client = (
                 client
                 if client is not None
-                else genai.Client(
-                    api_key=self._api_key,
-                    http_options=types.HttpOptions(api_version="v1beta"),
+                else (
+                    genai.Client(
+                        enterprise=True,
+                        api_key=self._api_key,
+                    )
+                    if self._api_key.startswith("AQ.")
+                    else genai.Client(
+                        api_key=self._api_key,
+                        http_options=types.HttpOptions(api_version="v1beta"),
+                    )
                 )
             )
         except Exception as exc:
