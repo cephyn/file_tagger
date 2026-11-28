@@ -13,7 +13,8 @@ and intentional test fixtures.
 - Distribution and build output.
 - Test and coverage output.
 - Logs and OS/editor metadata.
-- Runtime SQLite databases and SQLite sidecar files.
+- Runtime SQLite databases and SQLite sidecar files, including `*.sqlite-journal`,
+  `*.sqlite-shm`, and `*.sqlite-wal`.
 - Legacy and encrypted runtime configuration.
 - Local vector stores and downloaded model artifacts.
 
