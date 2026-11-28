@@ -1,0 +1,134 @@
+from PySide6.QtGui import QColor
+import os
+import stat
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+
+def is_hidden_path(path: str | os.PathLike[str]) -> bool:
+    path_obj = Path(path)
+    if path_obj.name.startswith("."):
+        return True
+    if os.name != "nt":
+        return False
+
+    try:
+        attributes = getattr(
+            os.stat(path_obj),
+            "st_file_attributes",
+            0,
+        )
+    except OSError:
+        return False
+
+    hidden_attribute = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
+    return bool(attributes & hidden_attribute)
+
+
+def _is_link_or_junction(path: str | os.PathLike[str]) -> bool:
+    if os.path.islink(path):
+        return True
+
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction is not None and isjunction(path))
+
+
+def iter_visible_files(
+    directory: str | os.PathLike[str],
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> Iterator[str]:
+    root = os.fspath(directory)
+    if should_stop is not None and should_stop():
+        return
+    if is_hidden_path(root) or _is_link_or_junction(root):
+        return
+
+    def raise_walk_error(error: OSError) -> None:
+        if should_stop is not None and should_stop():
+            return
+        raise error
+
+    for current_root, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        onerror=raise_walk_error,
+        followlinks=False,
+    ):
+        if should_stop is not None and should_stop():
+            return
+
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not _is_link_or_junction(os.path.join(current_root, name))
+            and not is_hidden_path(os.path.join(current_root, name))
+        ]
+
+        for name in file_names:
+            if should_stop is not None and should_stop():
+                return
+
+            file_path = os.path.join(current_root, name)
+            if (
+                _is_link_or_junction(file_path)
+                or not os.path.isfile(file_path)
+                or is_hidden_path(file_path)
+            ):
+                continue
+            yield file_path
+
+def is_dark_color(color):
+    """
+    Determines if a color is dark (needs white text) or light (needs dark text).
+    Uses the luminance formula: 0.299*R + 0.587*G + 0.114*B
+    """
+    if isinstance(color, str):
+        color = QColor(color)
+        
+    # Calculate luminance (perceived brightness)
+    luminance = (0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()) / 255
+    
+    # If luminance is less than 0.5, color is dark
+    return luminance < 0.5
+
+def get_score_color(score: float) -> QColor:
+    """Get a color representing the match score (red to green)."""
+    if score >= 0.8:
+        return QColor(200, 255, 200)  # Light green
+    elif score >= 0.6:
+        return QColor(255, 255, 200)  # Light yellow
+    elif score >= 0.4:
+        return QColor(255, 230, 200)  # Light orange
+    else:
+        return QColor(255, 200, 200)  # Light red
+
+def open_file(file_path: str):
+    """Open a file with the system's default application."""
+    if os.path.isfile(file_path):
+        try:
+            if sys.platform == 'win32':
+                os.startfile(file_path)
+            else:
+                subprocess.call(('open' if sys.platform == 'darwin' else 'xdg-open', file_path))
+        except Exception as e:
+            raise Exception(f"Could not open file: {str(e)}")
+
+def open_containing_folder(file_path: str):
+    """Open the folder containing the file and select it."""
+    if os.path.exists(file_path):
+        dir_path = os.path.dirname(file_path) if os.path.isfile(file_path) else file_path
+        try:
+            if sys.platform == 'win32':
+                # On Windows, open Explorer and select the file
+                subprocess.Popen(f'explorer /select,"{file_path}"')
+            elif sys.platform == 'darwin':
+                # On macOS, open Finder and select the file
+                subprocess.call(['open', '-R', file_path])
+            else:
+                # On Linux, just open the containing directory
+                subprocess.call(['xdg-open', dir_path])
+        except Exception as e:
+            raise Exception(f"Could not open containing folder: {str(e)}")

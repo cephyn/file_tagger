@@ -1,0 +1,88 @@
+import sys
+import logging
+import traceback
+from datetime import datetime
+from PySide6.QtWidgets import QApplication
+from sqlalchemy import text
+from .infrastructure.app_paths import AppPaths
+
+# Set up error logging to file
+def setup_logging():
+    log_dir = AppPaths.discover().logs_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = log_dir / f'file_tagger_{datetime.now().strftime("%Y%m%d")}.log'
+    
+    # Configure logging
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.ERROR,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Also log uncaught exceptions
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            # Don't log keyboard interrupt
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        
+        logging.error("Uncaught exception", 
+                     exc_info=(exc_type, exc_value, exc_traceback))
+        
+    # Install exception handler
+    sys.excepthook = handle_exception
+    
+    return log_file
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--print-paths" in arguments:
+        paths = AppPaths.discover()
+        print(f"data_dir={paths.data_dir}")
+        print(f"config_dir={paths.config_dir}")
+        print(f"logs_dir={paths.logs_dir}")
+        print(f"modern_database={paths.database}")
+        print(f"legacy_database={paths.legacy_database}")
+        print(f"legacy_chroma={paths.legacy_chroma}")
+        print(f"config_file={paths.config_file}")
+        return
+    if "--print-modern-database" in arguments:
+        from .infrastructure.database import create_session_factory, upgrade_database
+
+        paths = AppPaths.discover()
+        paths.ensure_directories()
+        try:
+            upgrade_database(paths.database)
+            session_factory = create_session_factory(paths.database)
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+            print("modern_database=ok")
+        except Exception as exc:
+            print(f"modern_database=error: {exc.__class__.__name__}: {exc}")
+            return
+        return
+
+    # Initialize logging first
+    log_file = setup_logging()
+    
+    try:
+        from .login import LoginScreen
+
+        app = QApplication(sys.argv)
+        app.setStyle('Fusion')
+        
+        # Create and show the login screen
+        login_screen = LoginScreen()
+        login_screen.show()
+        
+        logging.info(f"Application started successfully. Logs will be written to {log_file}")
+        
+        sys.exit(app.exec())
+    except Exception as e:
+        logging.error(f"Error in main application: {str(e)}")
+        logging.error(traceback.format_exc())
+        raise  # Re-raise the exception after logging
+
+if __name__ == '__main__':
+    main()

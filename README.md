@@ -1,251 +1,275 @@
 # File Tagger
 
-A Windows file management application that allows users to add custom tags to files and search using boolean logic. The application also supports integration with various AI providers and customizable workspace settings.
+File Tagger is a Windows desktop application for browsing files, managing tags,
+searching document content, and asking questions against locally indexed files.
+It is local-first:
 
-## Features
+- Document and vector data are stored in one per-user SQLite database.
+- Text search uses SQLite FTS5.
+- Semantic search uses `sqlite-vec`.
+- Document conversion uses Docling.
+- Ollama is the default for chat, decisions, and embeddings.
+- Gemini is available as an optional cloud provider selected explicitly in Settings.
+- Direct local model loading and other cloud AI providers are not supported.
 
-### File Management
-- Browse files across all drives with proper sorting and column resizing
-- Customizable home directory for quick access to your workspace
-- Navigate through directory structure with up/home buttons
-- Double-click search results to locate files
-- Sort files by name, size, type, and date modified
-- Quick navigation with drive selection dropdown
-- Right-click context menu for file operations
-- Open files directly from the application
-- Open containing folder for quick access to file locations
+## Requirements
 
-### Tag Management
-- Add, edit, and delete custom tags with colors
-- Apply multiple tags to files
-- Search files using AND/OR boolean logic
-- Organize files with a flexible tagging system
-- Batch tag multiple files at once
-- Remove tags from files
-- Auto-generate random colors for new tags
-- Visual tag indicators with appropriate text contrast
-- Create new tags directly from the tag suggestion interface
+- Windows 10 22H2 or Windows 11
+- Python 3.13 or later
+- [Ollama](https://ollama.com/download) installed and running for the default
+  local provider
+- A Google Gemini API key for the optional Gemini provider
+- `uv` for dependency and environment management
 
-### Vector Search
-- Semantic search through file contents
-- Find files based on meaning, not just keywords
-- Document chunking for improved search of large files
-- Relevant text snippets in search results with highlighted matches
-- Query expansion to find related terms
-- Semantic ranking of search results with color-coded confidence scores
-- Content-based file searching across multiple formats
-- Tag filtering with semantic search (AND/OR logic)
-- Interactive chat with search results
-- Force reindex specific files when needed
-- Remove files from search index
-- Automatic metadata updates when tags change
-- Document summaries for quick content overview
-- Automatic indexing of newly tagged files
-- Bulk reindexing operation for all files
+Ollama remains the default provider and AI features remain disabled until the
+Ollama Readiness dialog confirms that Ollama is reachable, compatible, and the
+required local models are installed. The application never downloads or pulls
+Ollama models automatically.
 
-### AI Integration
-- AI-powered automatic tag suggestions:
-  - Analyzes files using selected AI provider
-  - Analyzes file content for text files (up to 10MB)
-  - Full text extraction from PDF files
-  - Shows confidence scores with visual indicators
-  - Suggests matching existing tags
-  - Proposes relevant new tags
-  - Caches suggestions for 7 days
-  - Interactive selection of suggested tags
-  - Force refresh option to re-analyze files
-- Chat with search results (RAG functionality)
-- Batch processing of untagged files
-- Automatic suggestions for newly discovered files
+## Start from source
 
-### Supported AI Providers
-- OpenAI (GPT-3.5/4)
-- Google Gemini
-- Anthropic Claude (Claude-3 Sonnet)
-- Local Models
-  - LlamaCPP compatible models
-  - CTransformers compatible models
+From the repository root:
 
-### Security
-- Password-protected configuration
-- Secure encrypted storage of API keys
-- Recovery key system for password reset
-- Automatic file content cleanup after analysis
-
-## Installation
-
-1. Ensure you have Python 3.11 or higher installed
-2. Clone this repository
-3. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-4. Optional: For local AI model support
-   ```
-   # For LlamaCPP models
-   pip install llama-cpp-python
-   
-   # For CTransformers models
-   pip install ctransformers
-   ```
-
-5. Optional: For vector search functionality
-   ```
-   # For semantic search capabilities
-   pip install chromadb sentence-transformers
-   ```
-
-## Running the Application
-
-```
-python main.py
+```powershell
+uv sync --locked --all-extras
+uv run file-tagger
 ```
 
-## Configuration
+You can also start the module directly:
 
-### Initial Setup
-On first run, you'll be prompted to set a password for encrypting your settings. This password will be required each time you start the application.
-
-### API Configuration
-1. Click on "Settings" in the menu bar
-2. Select "API Settings"
-3. Choose your AI provider:
-   - For cloud providers (OpenAI, Gemini, Claude): Enter your API key
-   - For local models: Select model type (LlamaCPP/CTransformers) and choose model file
-4. Optionally customize the AI system message
-5. Click Save
-
-### Home Directory Setup
-1. Click on "Settings" in the menu bar
-2. Select "Set Home Directory"
-3. Choose your preferred starting directory
-4. The selected directory will be your new starting location on next launch
-
-### Using AI Tag Suggestions
-1. Select a file in the file browser
-2. Click "Suggest Tags (AI)" button
-3. Wait for the AI to analyze the file
-4. View suggested tags with confidence scores:
-   - Progress bars show confidence level
-   - Color gradient from red to green
-   - Numeric score from 0 to 1
-5. Select desired tags from both existing and new suggestions
-6. Click "Apply Selected Tags"
-7. View suggested explanations by clicking "Show Explanation"
-
-Note: Tag suggestions are cached for 7 days to improve performance. Use the "Force Refresh" button to re-analyze a file.
-
-### Using Vector Search
-1. Navigate to the search tab
-2. Enter your search query in the semantic search field
-3. Optionally filter by tags using the tag selector
-4. Click "Search" to find files based on their content
-5. View results with relevant text snippets highlighting matches
-6. Double-click results to open files
-
-Note: Files are automatically indexed when first accessed. You can reindex all files from the settings menu.
-
-### Batch Processing Untagged Files
-1. Click "Scan Directory" in the menu bar
-2. Wait for the scan to complete
-3. View untagged files and their AI-suggested tags
-4. Choose one of the options:
-   - Select specific tags for specific files
-   - Apply high-confidence suggestions to selected files
-5. Click "Apply Selected Tags to Selected Files" or "Apply All Suggestions to Selected Files"
-
-### Chat with Search Results
-1. Perform a vector search
-2. Select up to 3 files from the results (checkboxes)
-3. Click "Chat with Results"
-4. Ask questions about the selected documents
-5. The AI will respond based on the content of the selected files
-
-### Password Management
-- Change password: Settings > Password Management > Change Password
-- Reset password: Use recovery key if you forget your password
-- View/Reset recovery key: Settings > Password Management > Recovery
-
-## Project Structure
-
-```
-file_tagger/
-├── main.py              # Main application entry point
-├── api_settings.py      # API configuration dialog
-├── config.py            # Configuration and encryption utilities
-├── models.py            # Database models
-├── ai_service.py        # AI provider integration
-├── login.py             # Password verification interface
-├── file_tag_manager.py  # Main application interface
-├── tag_suggestion.py    # AI tag suggestion dialog
-├── search.py            # RAG/Chat interface for search results
-├── password_management.py # Security settings interface
-├── vector_search/       # Semantic search functionality
-│   ├── __init__.py
-│   ├── content_extractor.py
-│   ├── document_chunker.py
-│   ├── search_utils.py
-│   └── vector_search.py
-├── utils.py             # Utility functions
-├── requirements.txt     # Python dependencies
-├── .gitignore           # Git ignore rules
-└── README.md            # This file
+```powershell
+uv run python -m file_tagger
 ```
 
-## Dependencies
+If PowerShell reports that `uv` is not recognized, use the repository launcher,
+which creates or updates `.venv` and bootstraps `uv` when needed:
 
-Main Dependencies:
-- PySide6 - GUI framework
-- SQLAlchemy - Database ORM
-- cryptography - Secure storage of API keys
-- openai - OpenAI API client
-- google-generativeai - Google Gemini API client
-- anthropic - Claude API client
-- pypdf - PDF text extraction
-- chromadb - Vector database for semantic search
-- sentence-transformers - Text embedding models for semantic search
+```powershell
+.\scripts\start.ps1
+```
 
-Optional Dependencies:
-- llama-cpp-python - Local LlamaCPP model support
-- ctransformers - Local CTransformers model support
+For a permanent `uv` command on Windows, install it and reopen PowerShell:
 
-## Security Features
+```powershell
+py -3.13 -m pip install --user uv
+```
 
-- API keys are encrypted using Fernet (symmetric encryption)
-- Keys are encrypted using a password-derived key with PBKDF2
-- Configuration files are automatically excluded from version control
-- Password is required on application startup
-- File content is only analyzed temporarily, never stored
-- Tag suggestions are cached securely in the local database
-- Recovery key system for password reset
+Or use the installed UV package through the virtual environment without adding
+it to `PATH`:
 
-## Customization
+```powershell
+.\.venv\Scripts\uv.exe sync --locked --all-extras
+.\.venv\Scripts\uv.exe run file-tagger
+```
 
-### AI System Message
-You can customize the system message used for AI interactions:
-1. Go to Settings > API Settings
-2. Edit the system message in the provided text area
-3. Click Save to apply changes
-4. Use "Reset to Default" to restore the original message
+On first launch, create a password for the encrypted local configuration.
+If an older `file_tags.db`/`.chroma` installation is detected, the application
+creates a backup and migrates the available file/tag metadata. It inventories
+legacy Chroma paths but does not copy old embeddings; those files must be
+reindexed by the current Ollama embedding profile.
 
-### Right-Click Actions
-Right-clicking on search results provides useful options:
-- Open File - Opens the selected file in its default application
-- Open Containing Folder - Shows the file in File Explorer
-- Force Reindex - Updates the vector search index for this file
-- Remove from Search Index - Removes the file from vector search
+Switching providers or embedding profiles does not reuse vectors from a
+different provider/profile. File Tagger queues the affected files for reindexing
+before the new embeddings are used, preventing Ollama and Gemini vectors from
+being mixed.
 
-## Version History
+## Password recovery
 
-- 0.0.1 (Development) - Current development version
+Use **Forgot password** on the login screen to recover access with the recovery
+key shown during first setup or after a key rotation. Recovery keys are shown
+only once, are not stored in plaintext, and should be saved outside File
+Tagger. A successful recovery resets the login password without re-encrypting
+the existing configuration.
 
-## About
+Successful login to an older password format migrates the encrypted
+configuration to the current format and shows a new recovery key. An already
+locked legacy installation cannot be recovered with its old recovery file
+because that file was encrypted with the forgotten password.
 
-Developed by: Busy Wyvern
-Website: [Busy Wyvern](https://www.busywyvern.com)
-Built with Python, PySide6, SQLAlchemy, and Vector Search technologies
-© 2025 All Rights Reserved
+If the recovery key is unavailable, **Reset configuration** requires typing
+`RESET` and a new password. File Tagger quarantines the encrypted configuration
+and credential files under `<per-user data>/password-reset-backups/` before
+creating a new default encrypted configuration. SQLite tagging/search data,
+index data, cache data, and legacy `file_tags.db`/`.chroma` data are not removed.
+Treat the backup as recovery material: a manual restoration can be attempted
+only after understanding the original password and credential format.
+
+## Configure Ollama
+
+1. Start Ollama locally.
+2. Open **Settings > Ollama Readiness**.
+3. Review the required embedding, decision, and generation model tags.
+4. Pull only the tags suggested by the dialog:
+
+```powershell
+ollama pull <model-tag>
+```
+
+For example, a typical recommended profile may include:
+
+```text
+embeddinggemma-2:270m
+nimble:9b
+gemma4:e4b
+```
+
+The dialog will show the exact compatible tags for the detected hardware and
+installed Ollama catalog. Model names ending in `:cloud` or remote Ollama hosts
+are rejected.
+
+## Configure Gemini
+
+1. Open **Settings > AI Provider**.
+2. Select **Gemini**.
+3. Enter a Gemini API key. The key is not shown after it is saved.
+4. Save and refresh Gemini readiness.
+
+The Gemini API key is stored inside the existing encrypted per-user
+configuration, never in a log or environment file by this application. Leave
+the masked field blank to preserve a configured key, enter a new nonblank value
+to replace it, or use **Clear Gemini Key** to remove it.
+
+Gemini uses these fixed model IDs:
+
+```text
+gemini-4-hydrogen
+gemini-decision-1
+gemini-embedding-2
+```
+
+Gemini is not contacted when the Ollama provider is active. Selecting Gemini,
+changing the Gemini embedding profile, or switching providers queues a reindex
+of the index for that provider/profile before normal semantic search resumes.
+Gemini readiness failure does not silently fall back to Ollama.
+
+## Per-user data
+
+Normal runtime data is stored outside the repository:
+
+- SQLite database: `<per-user data>/file_tagger.sqlite3`
+- Configuration: `<per-user config>/config.encrypted`
+- Password/recovery metadata: `<per-user config>/`
+- Logs: `<per-user data>/logs`
+- Cache and extraction files: `<per-user cache>/`
+
+Set `FILE_TAGGER_DATA_DIR` only for portable or test deployments:
+
+```powershell
+$env:FILE_TAGGER_DATA_DIR = "C:\portable-file-tagger"
+uv run file-tagger
+```
+
+Print the resolved modern and legacy paths without starting the Qt UI:
+
+```powershell
+uv run python -m file_tagger --print-paths
+uv run file-tagger --print-paths
+```
+
+## Build and package
+
+Build the wheel and source distribution:
+
+```powershell
+uv sync --locked --all-extras
+python -m build
+```
+
+Build the Windows PyInstaller bundle:
+
+```powershell
+uv run pyinstaller --clean --noconfirm packaging/file-tagger.spec
+```
+
+The packaged diagnostic executable is also available:
+
+```powershell
+.\dist\file-tagger\file-tagger.exe --print-paths
+```
+
+The package does not include Ollama or downloaded models. Package and model
+installation remain separate local operations.
+
+## Development checks
+
+Run the default test suite:
+
+```powershell
+uv run pytest -q
+```
+
+Run lint and type checks:
+
+```powershell
+uv run ruff check src tests
+uv run mypy src
+```
+
+Run a migration lifecycle smoke check:
+
+```powershell
+uv run alembic upgrade head
+uv run alembic downgrade base
+uv run alembic upgrade head
+```
+
+Real-model Ollama tests are opt-in and skipped by default:
+
+```powershell
+$env:FILE_TAGGER_RUN_OLLAMA_TESTS = "1"
+uv run pytest tests/integration_ollama -v -m ollama
+Remove-Item Env:FILE_TAGGER_RUN_OLLAMA_TESTS
+```
+
+## Main features
+
+- File browsing, sorting, tagging, and tag search
+- Typed Ollama/Nimble/Tev1 tag decisions
+- Cached tag recommendations with model-digest invalidation
+- Docling PDF, Office, Markdown, image, and text extraction
+- OCR fallback for low-text or scanned pages
+- Provenance-aware chunks and full-coverage embeddings
+- SQLite FTS5 and hybrid `sqlite-vec` retrieval
+- Reciprocal-rank fusion and cited search results
+- Markdown-context planning and cited local RAG answers
+- Resumable, transactionally swapped indexing jobs
+- Ollama readiness, hardware, disk, and benchmark diagnostics
+- Optional Gemini readiness and provider-specific settings
+- Explicit migration backup and legacy Chroma inventory
+
+## Project layout
+
+```text
+src/file_tagger/
+  adapters/       Ollama and Gemini external adapters
+  domain/         Pydantic contracts and application errors
+  extraction/     Docling extraction and page/vision quality
+  indexing/       Chunking, embedding coverage, and resumable jobs
+  infrastructure/ SQLite, app paths, and extension setup
+  migration/      Explicit legacy SQLite/config/Chroma migration
+  ollama/         Hardware, recommendations, readiness, benchmarks
+  rag/            Search planning, evidence, reranking, and cited answers
+  search/         FTS5, sqlite-vec, RRF, and result hydration
+  tagging/        Candidate generation and typed decisions
+  ui/             Ollama settings, indexing status, contextual search
+  file_tag_manager.py
+  main.py
+  login.py
+```
+
+## Security
+
+- Ollama endpoints must resolve to loopback hosts.
+- Ollama cloud model tags and remote Ollama hosts are rejected.
+- Gemini is optional; its API key is stored in the encrypted per-user
+  configuration and is never written to logs or status text.
+- Legacy cloud credentials and provider fields are not migrated.
+- Configuration is password-protected and encrypted locally.
+- Recovery keys are displayed once and never written to logs or status text.
+- Reset quarantines encrypted settings while preserving SQLite and index data.
+- Legacy cleanup requires explicit confirmation.
+- RAG answers require resolved chunk citations and do not use uncited model
+  knowledge as evidence.
 
 ## License
 

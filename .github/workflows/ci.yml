@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --locked --all-extras
+      - name: Ruff
+        run: uv run ruff check src tests
+      - name: Mypy
+        run: uv run mypy src
+      - name: Tests
+        run: uv run pytest -q
+      - name: Build distributions
+        run: uv run python -m build
+
+  package:
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync packaging dependencies
+        run: uv sync --locked --all-extras
+      - name: Build PyInstaller bundle
+        run: uv run pyinstaller --clean --noconfirm packaging/file-tagger.spec
+      - name: Package smoke
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:TEMP "file-tagger-ci-$env:GITHUB_RUN_ID"
+          $env:FILE_TAGGER_DATA_DIR = $data
+          Push-Location $env:TEMP
+          try {
+            & .\dist\file-tagger\file-tagger.exe --print-paths
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }

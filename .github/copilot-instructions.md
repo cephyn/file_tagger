@@ -1,0 +1,1 @@
+When using the `browsermcp` tool, always pass a single `commands` string containing newline-separated CLI commands (for example: `{"commands": "goto https://example.com\nsnapshot -i"}`). Never call it with an empty `{}` object.

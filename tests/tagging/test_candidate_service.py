@@ -1,0 +1,1955 @@
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import json
+from pathlib import Path
+import struct
+from threading import Barrier
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from sqlalchemy import event, inspect, select, text
+
+from file_tagger.domain.contracts import GeminiReadiness, ModelProfile, TagDecision
+from file_tagger.domain.errors import (
+    EmbeddingContextRejectedError,
+    GenerationContextRejectedError,
+    GeminiUnavailableError,
+)
+from file_tagger.ollama.readiness import ReadinessReport, RequiredModels
+from file_tagger.infrastructure.database import create_session_factory, upgrade_database
+from file_tagger.infrastructure.app_paths import AppPaths
+from file_tagger.persistence.models import (
+    Chunk,
+    Document,
+    File,
+    FileTag,
+    ModelProfileRecord,
+    Page,
+    Tag,
+)
+from file_tagger.tagging.cache import (
+    CachedTagRecommendations,
+    DatabaseTagRecommendationCache,
+    InMemoryTagRecommendationCache,
+)
+from file_tagger.tagging.candidate_service import (
+    _embed_document_query,
+    _generate_candidates,
+    _split_document_state_text,
+    recommend_tags,
+)
+
+
+class FakeSearch:
+    def __init__(self, tags: Sequence[str]) -> None:
+        self.tags = tuple(tags)
+        self.calls: list[dict[str, Any]] = []
+
+    def search(
+        self,
+        query: str,
+        query_embedding: Sequence[float] | None = None,
+        **kwargs: Any,
+    ) -> tuple[SimpleNamespace, ...]:
+        self.calls.append(
+            {
+                "query": query,
+                "query_embedding": query_embedding,
+                **kwargs,
+            }
+        )
+        return (SimpleNamespace(tags=self.tags),)
+
+
+class FakeGateway:
+    def __init__(self, generated: Sequence[str]) -> None:
+        self.generated = tuple(generated)
+        self.chat_calls: list[dict[str, Any]] = []
+        self.decision_calls: list[dict[str, Any]] = []
+
+    async def model_profile(self, role: str, model: str) -> ModelProfile:
+        return ModelProfile(
+            role=role,  # type: ignore[arg-type]
+            model=model,
+            digest=f"{role}-digest",
+            context_length=32_768,
+            capabilities=("completion",) if role == "generation" else ("systemone",),
+        )
+
+    async def chat(
+        self,
+        model: str,
+        *,
+        messages: Sequence[Mapping[str, Any]],
+        schema: Mapping[str, Any] | None = None,
+        keep_alive: float | str | None = "5m",
+    ) -> str:
+        self.chat_calls.append(
+            {
+                "model": model,
+                "messages": messages,
+                "schema": schema,
+                "keep_alive": keep_alive,
+            }
+        )
+        return json.dumps({"candidates": list(self.generated)})
+
+    async def system_one(
+        self,
+        model: str,
+        *,
+        state: Any,
+        questions: Mapping[str, Any],
+        keep_alive: float | str | None = "5m",
+    ) -> SimpleNamespace:
+        self.decision_calls.append(
+            {
+                "model": model,
+                "state": state,
+                "questions": questions,
+                "keep_alive": keep_alive,
+            }
+        )
+        answers = {}
+        for index, name in enumerate(questions):
+            confidence = 0.9 if index == 0 else 0.55
+            answers[name] = {
+                "type": "choice",
+                "choice": "accept",
+                "probabilities": {
+                    "accept": confidence,
+                    "review": (1.0 - confidence) / 2.0,
+                    "reject": (1.0 - confidence) / 2.0,
+                },
+                "confidence": confidence,
+            }
+        return SimpleNamespace(answers=answers)
+
+
+def test_gemini_candidate_and_decision_models_use_injected_gateways() -> None:
+    candidate_gateway = FakeGateway(["flooded ruin"])
+
+    class DecisionOnlyGateway:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def model_profile(self, role: str, model: str) -> ModelProfile:
+            return ModelProfile(
+                role="decision",
+                model=model,
+                digest="gemini-decision-digest",
+                context_length=32_768,
+                capabilities=("systemone",),
+            )
+
+        async def system_one(
+            self,
+            model: str,
+            *,
+            state: Any,
+            questions: Mapping[str, Any],
+        ) -> SimpleNamespace:
+            self.calls.append(
+                {"model": model, "state": state, "questions": questions}
+            )
+            answer = {
+                "type": "choice",
+                "choice": "accept",
+                "probabilities": {"accept": 0.9, "review": 0.05, "reject": 0.05},
+                "confidence": 0.9,
+            }
+            return SimpleNamespace(
+                answers={name: answer for name in questions}
+            )
+
+    selected_decision_gateway = DecisionOnlyGateway()
+    result = recommend_tags(
+        "A flooded ruin",
+        file_hash="gemini-content",
+        extraction_version="docling-v1",
+        search=FakeSearch([]),
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        gateway=candidate_gateway,
+        decision_gateway=selected_decision_gateway,
+        semantic_limit=12,
+    )
+
+    assert [call["model"] for call in candidate_gateway.chat_calls] == [
+        "gemini-4-hydrogen"
+    ]
+    assert [call["model"] for call in selected_decision_gateway.calls] == [
+        "gemini-decision-1"
+    ]
+    assert {item.tag for item in result.decisions} == {"flooded ruin"}
+
+
+def test_exact_gemini_candidate_model_without_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.tagging.candidate_service as candidate_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(
+        candidate_service,
+        "OllamaGateway",
+        unexpected_ollama_gateway,
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-no-candidate-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="gemini-4-hydrogen",
+            decision_model="gemini-decision-1",
+        )
+
+
+def test_exact_gemini_embedding_model_without_embedding_gateway_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import file_tagger.tagging.candidate_service as candidate_service
+
+    def unexpected_ollama_gateway() -> None:
+        raise AssertionError("OllamaGateway must not be constructed")
+
+    monkeypatch.setattr(
+        candidate_service,
+        "OllamaGateway",
+        unexpected_ollama_gateway,
+    )
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    with pytest.raises(GeminiUnavailableError):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-no-embedding-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+            embedding_profile=profile,
+        )
+
+
+def test_exact_gemini_embedding_profile_rejects_generation_gateway_reuse() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    generation_gateway = FakeGateway(["flooded ruin"])
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-reused-embedding-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+            gateway=generation_gateway,
+            embedding_gateway=generation_gateway,
+            embedding_profile=profile,
+            query_embedding=(0.0,),
+        )
+
+
+def test_exact_gemini_embedding_profile_rejects_gateway_without_gemini_provider() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class DuckTypedEmbeddingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            **kwargs: Any,
+        ) -> tuple[tuple[float, ...], ...]:
+            return ((0.0,),)
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        recommend_tags(
+            "A flooded ruin",
+            file_hash="gemini-unmarked-embedding-gateway",
+            extraction_version="docling-v1",
+            search=FakeSearch([]),
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+            gateway=FakeGateway(["flooded ruin"]),
+            embedding_gateway=DuckTypedEmbeddingGateway(),
+            embedding_profile=profile,
+            query_embedding=(0.0,),
+        )
+
+
+def test_exact_gemini_embedding_profile_accepts_distinct_gemini_gateway() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiEmbeddingGateway:
+        provider = "gemini"
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            **kwargs: Any,
+        ) -> tuple[tuple[float, ...], ...]:
+            return ((0.0,),)
+
+    result = recommend_tags(
+        "A flooded ruin",
+        file_hash="gemini-distinct-embedding-gateway",
+        extraction_version="docling-v1",
+        search=FakeSearch([]),
+        candidate_model="inkling-2-mini",
+        decision_model="nimble:9b",
+        gateway=FakeGateway(["flooded ruin"]),
+        embedding_gateway=GeminiEmbeddingGateway(),
+        embedding_profile=profile,
+        query_embedding=(0.0,),
+    )
+
+    assert result is not None
+
+
+def test_tag_query_embedding_splits_context_rejections() -> None:
+    document_state = "left paragraph\n\nright paragraph"
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="embedding-digest",
+        context_length=128,
+        dimensions=2,
+    )
+
+    class RejectingEmbeddingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.embedding_calls: list[dict[str, Any]] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            assert isinstance(text, str)
+            self.embedding_calls.append(
+                {
+                    "model": model,
+                    "text": text,
+                    "dimensions": dimensions,
+                    "truncate": truncate,
+                    "keep_alive": keep_alive,
+                }
+            )
+            if len(text) > 12:
+                raise EmbeddingContextRejectedError(
+                    "Embedding input exceeded the model context without truncation."
+                )
+            if "left" in text:
+                return ((1.0, 0.0),)
+            if "right" in text:
+                return ((0.0, 1.0),)
+            return ((0.5, 0.5),)
+
+    gateway = RejectingEmbeddingGateway()
+    search = FakeSearch(["existing"])
+
+    recommend_tags(
+        document_state,
+        file_hash="same-content",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        candidate_model_digest="candidate-digest",
+        decision_model_digest="decision-digest",
+        embedding_profile=profile,
+        max_candidates=4,
+    )
+
+    query_embedding = search.calls[0]["query_embedding"]
+    assert abs(query_embedding[0] - 0.5) < 0.1
+    assert abs(query_embedding[1] - 0.5) < 0.1
+    assert gateway.embedding_calls[0]["text"] == document_state
+    paragraph_split = _split_document_state_text(document_state)
+    assert paragraph_split is not None
+    assert paragraph_split[0] + paragraph_split[1] == document_state
+    assert len(gateway.embedding_calls) >= 3
+    assert all(call["truncate"] is False for call in gateway.embedding_calls)
+    assert all(
+        call["dimensions"] == 2
+        and (call["text"] in document_state or call["text"] == document_state)
+        for call in gateway.embedding_calls
+    )
+
+
+def test_tag_query_split_preserves_exact_document_state() -> None:
+    document_state = "left paragraph\n\nright paragraph"
+
+    split = _split_document_state_text(document_state)
+
+    assert split == ("left paragraph", "\n\nright paragraph")
+
+
+def test_tag_query_split_keeps_heading_marker_with_heading() -> None:
+    document_state = "Intro\n# Heading\nBody"
+
+    split = _split_document_state_text(document_state)
+
+    assert split == ("Intro", "\n# Heading\nBody")
+
+
+def test_tag_query_split_does_not_break_unicode_grapheme() -> None:
+    split = _split_document_state_text("A👩‍💻B")
+
+    assert split == ("A", "👩‍💻B")
+
+
+def test_tag_query_embedding_rejects_unsplittable_text() -> None:
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="embedding-digest",
+        context_length=128,
+        dimensions=2,
+    )
+
+    class UnsplittableEmbeddingGateway:
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            del model, text, dimensions, truncate, keep_alive
+            raise EmbeddingContextRejectedError(
+                "Embedding input exceeded the model context without truncation."
+            )
+
+    with pytest.raises(EmbeddingContextRejectedError, match="unsplittable"):
+        asyncio.run(
+            _embed_document_query(
+                UnsplittableEmbeddingGateway(),
+                "x",
+                profile,
+            )
+        )
+
+
+def test_candidate_chat_splits_context_rejections() -> None:
+    document_state = "left paragraph\n\nright paragraph"
+
+    class ContextSplittingGateway:
+        def __init__(self) -> None:
+            self.chat_calls: list[dict[str, Any]] = []
+
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            del model, schema, keep_alive
+            self.chat_calls.append({"messages": messages})
+            content = str(messages[1]["content"])
+            if content.endswith(document_state):
+                raise GenerationContextRejectedError("generation context rejected")
+            if "left" in content:
+                candidates = ("left-tag", "shared")
+            elif "right" in content:
+                candidates = ("right-tag", "shared")
+            else:
+                candidates = ("shared",)
+            return json.dumps({"candidates": candidates})
+
+    gateway = ContextSplittingGateway()
+
+    result = asyncio.run(
+        _generate_candidates(
+            gateway,
+            document_state=document_state,
+            model="inkling-2-mini",
+            limit=4,
+            existing=("existing",),
+        )
+    )
+
+    assert len(gateway.chat_calls) >= 3
+    assert document_state in str(gateway.chat_calls[0]["messages"][1]["content"])
+    for call in gateway.chat_calls[1:]:
+        content = str(call["messages"][1]["content"])
+        assert document_state not in content
+    assert len(result) <= 4
+    assert len(set(result)) == len(result)
+    assert sum(candidate == "shared" for candidate in result) == 1
+
+
+def test_candidate_chat_rejects_unsplittable_text() -> None:
+    class UnsplittableCandidateGateway:
+        async def chat(
+            self,
+            model: str,
+            *,
+            messages: Sequence[Mapping[str, Any]],
+            schema: Mapping[str, Any] | None = None,
+            keep_alive: float | str | None = "5m",
+        ) -> str:
+            del model, messages, schema, keep_alive
+            raise GenerationContextRejectedError("generation context rejected")
+
+    with pytest.raises(GenerationContextRejectedError, match="unsplittable"):
+        asyncio.run(
+            _generate_candidates(
+                UnsplittableCandidateGateway(),
+                document_state="x",
+                model="inkling-2-mini",
+                limit=4,
+                existing=(),
+            )
+        )
+
+
+def test_model_digest_change_invalidates_cached_tags() -> None:
+    cache = InMemoryTagRecommendationCache()
+    stored = CachedTagRecommendations(
+        file_hash="abc123",
+        extraction_version="docling-v1",
+        candidate_model_digest="old",
+        decision_model_digest="old",
+        decisions=(
+            TagDecision(tag="research", decision="accept", confidence=0.9),
+        ),
+    )
+
+    cache.store(stored)
+
+    assert cache.lookup(stored.file_hash, model_digest="old") == stored
+    assert cache.lookup(stored.file_hash, model_digest="new") is None
+
+
+def test_recommendations_prefer_existing_tags_and_require_low_confidence_review() -> None:
+    search = FakeSearch(["Research", "reference"])
+    gateway = FakeGateway(["research", "New", " new ", "invoice"])
+    cache = InMemoryTagRecommendationCache()
+
+    result = recommend_tags(
+        "A new research report with reference material.",
+        file_hash="abc123",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        candidate_model="inkling-2-mini",
+        decision_model="nimble:9b",
+        max_candidates=4,
+        confirmation_threshold=0.7,
+    )
+
+    assert [item.tag for item in result.decisions] == [
+        "Research",
+        "reference",
+        "New",
+        "invoice",
+    ]
+    assert result.decisions[0].decision == "accept"
+    assert result.decisions[0].is_new is False
+    assert result.decisions[1].decision == "review"
+    assert result.decisions[2].decision == "review"
+    assert result.decisions[2].is_new is True
+    assert result.requires_confirmation == ("reference", "New", "invoice")
+    assert len(gateway.decision_calls[0]["questions"]) == 4
+    assert search.calls[0]["query"] == "A new research report with reference material."
+    assert "Research" in gateway.chat_calls[0]["messages"][1]["content"]
+    assert "reference" in gateway.chat_calls[0]["messages"][1]["content"]
+
+
+def test_recommendations_use_existing_tag_spelling_case_insensitively() -> None:
+    search = FakeSearch([])
+    gateway = FakeGateway(["adventure", "Adventure", "new tag"])
+    cache = InMemoryTagRecommendationCache()
+
+    result = recommend_tags(
+        "A fantasy adventure.",
+        file_hash="case-insensitive-existing",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        existing_tags=("Adventure", "Shadowdark"),
+        max_candidates=4,
+        confirmation_threshold=0.7,
+    )
+
+    assert [item.tag for item in result.decisions] == ["Adventure", "new tag"]
+    assert result.decisions[0].decision == "accept"
+    assert result.decisions[0].is_new is False
+    assert result.decisions[1].decision == "review"
+    assert result.decisions[1].is_new is True
+
+
+def test_recommendations_are_cache_hits_without_repeating_model_requests() -> None:
+    search = FakeSearch(["Research"])
+    gateway = FakeGateway(["invoice"])
+    cache = InMemoryTagRecommendationCache()
+    kwargs = {
+        "file_hash": "abc123",
+        "extraction_version": "docling-v1",
+        "search": search,
+        "gateway": gateway,
+        "cache": cache,
+        "candidate_model_digest": "generation-old",
+        "decision_model_digest": "decision-old",
+    }
+
+    first = recommend_tags("research report", **kwargs)
+    second = recommend_tags("research report", **kwargs)
+
+    assert second == first
+    assert len(gateway.chat_calls) == 1
+    assert len(gateway.decision_calls) == 1
+    assert len(search.calls) == 2
+
+
+def test_force_refresh_bypasses_cache_and_replaces_persistent_result() -> None:
+    search = FakeSearch(["Research"])
+    gateway = FakeGateway(["invoice"])
+    cache = InMemoryTagRecommendationCache()
+    kwargs = {
+        "file_hash": "abc123",
+        "file_path": r"C:\docs\report.md",
+        "extraction_version": "docling-v1",
+        "search": search,
+        "gateway": gateway,
+        "cache": cache,
+        "candidate_model_digest": "generation-old",
+        "decision_model_digest": "decision-old",
+    }
+
+    first = recommend_tags("research report", **kwargs)
+    second = recommend_tags("research report", force_refresh=True, **kwargs)
+
+    assert len(gateway.chat_calls) == 2
+    assert len(gateway.decision_calls) == 2
+    assert second.cached_at >= first.cached_at
+    assert cache.lookup(
+        "abc123",
+        file_path=r"C:\docs\report.md",
+        extraction_version="docling-v1",
+        candidate_model_digest="generation-old",
+        decision_model_digest="decision-old",
+        document_state_digest=second.document_state_digest,
+    ) == second
+
+
+def test_cache_does_not_cross_target_file_boundaries_with_duplicate_content() -> None:
+    search = FakeSearch(["Research"])
+    gateway = FakeGateway(["invoice"])
+    cache = InMemoryTagRecommendationCache()
+
+    first = recommend_tags(
+        "Filename: first.md\nreport",
+        file_hash="same-content",
+        file_path=r"C:\docs\first.md",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        candidate_model_digest="generation-old",
+        decision_model_digest="decision-old",
+    )
+    second = recommend_tags(
+        "Filename: second.md\nreport",
+        file_hash="same-content",
+        file_path=r"C:\docs\second.md",
+        extraction_version="docling-v1",
+        search=search,
+        gateway=gateway,
+        cache=cache,
+        candidate_model_digest="generation-old",
+        decision_model_digest="decision-old",
+    )
+
+    assert first.file_path == r"C:\docs\first.md"
+    assert second.file_path == r"C:\docs\second.md"
+    assert first.document_state_digest != second.document_state_digest
+    assert len(gateway.chat_calls) == 2
+    assert len(gateway.decision_calls) == 2
+
+
+def test_candidate_digest_preserves_bounded_order_and_refreshes_exact_spelling() -> None:
+    search = FakeSearch(["Research", "invoice", "ignored"])
+    gateway = FakeGateway([])
+    cache = InMemoryTagRecommendationCache()
+    kwargs = {
+        "file_hash": "abc123",
+        "extraction_version": "docling-v1",
+        "search": search,
+        "gateway": gateway,
+        "cache": cache,
+        "candidate_model_digest": "generation-v1",
+        "decision_model_digest": "decision-v1",
+        "max_candidates": 2,
+    }
+
+    first = recommend_tags("research invoice", **kwargs)
+    search.tags = ("research", " INVOICE ", "ignored-change")
+    same_catalog = recommend_tags("research invoice", **kwargs)
+    search.tags = ("invoice", "Research", "ignored")
+    reordered_catalog = recommend_tags("research invoice", **kwargs)
+
+    assert [item.tag for item in first.decisions] == ["Research", "invoice"]
+    assert [item.tag for item in same_catalog.decisions] == ["research", "INVOICE"]
+    assert same_catalog.candidate_set_digest == first.candidate_set_digest
+    assert reordered_catalog.candidate_set_digest != first.candidate_set_digest
+    assert len(search.calls) == 3
+    assert len(gateway.chat_calls) == 0
+    assert len(gateway.decision_calls) == 2
+
+
+def test_exact_extraction_and_model_identities_are_part_of_cache_key() -> None:
+    cache = InMemoryTagRecommendationCache()
+    stored = CachedTagRecommendations(
+        file_hash="abc123",
+        extraction_version="docling-v1",
+        candidate_model_digest="candidate-v1",
+        decision_model_digest="decision-v1",
+        candidate_set_digest="catalog-v1",
+        max_candidates=4,
+        confirmation_threshold=0.7,
+        decisions=(),
+    )
+    cache.store(stored)
+
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+        == stored
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v2",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v2",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v2",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=3,
+            confirmation_threshold=0.7,
+        )
+        is None
+    )
+    assert (
+        cache.lookup(
+            stored.file_hash,
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.6,
+        )
+        is None
+    )
+
+
+def test_database_cache_round_trips_typed_recommendations(tmp_path: Path) -> None:
+    database_path = tmp_path / "tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    with session_factory.begin() as session:
+        file = File(
+            canonical_path=r"C:\docs\report.md",
+            content_hash="abc123",
+            size_bytes=10,
+            mtime_ns=1,
+            mime_type="text/markdown",
+        )
+        session.add(file)
+        session.flush()
+        DatabaseTagRecommendationCache(session).store(
+            CachedTagRecommendations(
+                file_id=file.id,
+                file_path=file.canonical_path,
+                file_hash="abc123",
+                extraction_version="docling-v1",
+                candidate_model_digest="candidate-v1",
+                decision_model_digest="decision-v1",
+                candidate_set_digest="catalog-v1",
+                max_candidates=4,
+                confirmation_threshold=0.7,
+                decisions=(
+                    TagDecision(
+                        tag="research",
+                        decision="review",
+                        confidence=0.55,
+                        is_new=True,
+                    ),
+                ),
+            )
+        )
+
+    with session_factory() as session:
+        cached = DatabaseTagRecommendationCache(session).lookup(
+            "abc123",
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+        columns = {column["name"] for column in inspect(session.get_bind()).get_columns(
+            "tag_suggestion_cache"
+        )}
+
+    assert cached is not None
+    assert cached.decisions == (
+        TagDecision(
+            tag="research",
+            decision="review",
+            confidence=0.55,
+            is_new=True,
+        ),
+    )
+    assert {
+        "extraction_version",
+        "candidate_model_digest",
+        "decision_model_digest",
+        "candidate_set_digest",
+        "max_candidates",
+        "confirmation_threshold",
+        "document_state_digest",
+    } <= columns
+
+
+def test_database_cache_creates_identity_for_unindexed_file(tmp_path: Path) -> None:
+    database_path = tmp_path / "unindexed-tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    canonical_path = str((tmp_path / "new-document.pdf").resolve())
+
+    with session_factory.begin() as session:
+        DatabaseTagRecommendationCache(session).store(
+            CachedTagRecommendations(
+                file_path=canonical_path,
+                file_hash="new-document-hash",
+                document_state_digest="document-state-v1",
+                extraction_version="docling-v1",
+                candidate_model_digest="candidate-v1",
+                decision_model_digest="decision-v1",
+                candidate_set_digest="catalog-v1",
+                max_candidates=4,
+                confirmation_threshold=0.7,
+                decisions=(),
+            )
+        )
+
+    with session_factory() as session:
+        file = session.scalar(
+            select(File).where(File.canonical_path == canonical_path)
+        )
+        cached = DatabaseTagRecommendationCache(session).lookup(
+            "new-document-hash",
+            file_path=canonical_path,
+            document_state_digest="document-state-v1",
+            extraction_version="docling-v1",
+        )
+
+    assert file is not None
+    assert file.content_hash == "new-document-hash"
+    assert file.indexing_state == "not_indexed"
+    assert cached is not None
+    assert cached.file_id == file.id
+
+
+def test_database_cache_lookup_is_scoped_to_the_target_file(tmp_path: Path) -> None:
+    database_path = tmp_path / "duplicate-tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    with session_factory.begin() as session:
+        files = [
+            File(
+                canonical_path=path,
+                content_hash="same-content",
+                size_bytes=10,
+                mtime_ns=index,
+                mime_type="text/markdown",
+            )
+            for index, path in enumerate(
+                (r"C:\docs\first.md", r"C:\docs\second.md"),
+                start=1,
+            )
+        ]
+        session.add_all(files)
+        session.flush()
+        for file in files:
+            DatabaseTagRecommendationCache(session).store(
+                CachedTagRecommendations(
+                    file_id=file.id,
+                    file_path=file.canonical_path,
+                    file_hash="same-content",
+                    document_state_digest=f"state-{file.id}",
+                    extraction_version="docling-v1",
+                    candidate_model_digest="candidate-v1",
+                    decision_model_digest="decision-v1",
+                    candidate_set_digest="catalog-v1",
+                    max_candidates=4,
+                    confirmation_threshold=0.7,
+                    decisions=(),
+                )
+            )
+
+    with session_factory() as session:
+        first = DatabaseTagRecommendationCache(session).lookup(
+            "same-content",
+            file_path=r"C:\docs\first.md",
+            document_state_digest="state-1",
+            extraction_version="docling-v1",
+        )
+        second = DatabaseTagRecommendationCache(session).lookup(
+            "same-content",
+            file_path=r"C:\docs\second.md",
+            document_state_digest="state-2",
+            extraction_version="docling-v1",
+        )
+        wrong = DatabaseTagRecommendationCache(session).lookup(
+            "same-content",
+            file_path=r"C:\docs\second.md",
+            document_state_digest="state-1",
+            extraction_version="docling-v1",
+        )
+
+    assert first is not None and first.file_path == r"C:\docs\first.md"
+    assert second is not None and second.file_path == r"C:\docs\second.md"
+    assert wrong is None
+
+
+def test_database_cache_store_is_safe_across_separate_sessions(tmp_path: Path) -> None:
+    database_path = tmp_path / "concurrent-tag-cache.sqlite3"
+    upgrade_database(database_path)
+    session_factory = create_session_factory(database_path)
+    with session_factory.begin() as session:
+        file = File(
+            canonical_path=r"C:\docs\concurrent.md",
+            content_hash="concurrent-hash",
+            size_bytes=10,
+            mtime_ns=1,
+            mime_type="text/markdown",
+        )
+        session.add(file)
+        session.flush()
+        file_id = file.id
+
+    insert_barrier = Barrier(2)
+    engine = session_factory.kw["bind"]
+
+    def synchronize_cache_inserts(
+        connection: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        del connection, cursor, parameters, context, executemany
+        if "insert into tag_suggestion_cache" in statement.lower():
+            insert_barrier.wait(timeout=5)
+
+    event.listen(engine, "before_cursor_execute", synchronize_cache_inserts)
+
+    def store(tag: str) -> None:
+        with session_factory.begin() as session:
+            DatabaseTagRecommendationCache(session).store(
+                CachedTagRecommendations(
+                    file_id=file_id,
+                    file_path=r"C:\docs\concurrent.md",
+                    file_hash="concurrent-hash",
+                    extraction_version="docling-v1",
+                    candidate_model_digest="candidate-v1",
+                    decision_model_digest="decision-v1",
+                    candidate_set_digest="catalog-v1",
+                    max_candidates=4,
+                    confirmation_threshold=0.7,
+                    decisions=(
+                        TagDecision(
+                            tag=tag,
+                            decision="accept",
+                            confidence=0.9,
+                        ),
+                    ),
+                )
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(store, tag) for tag in ("first", "second")]
+            for future in futures:
+                future.result(timeout=10)
+    finally:
+        event.remove(engine, "before_cursor_execute", synchronize_cache_inserts)
+
+    with session_factory() as session:
+        cached = DatabaseTagRecommendationCache(session).lookup(
+            "concurrent-hash",
+            extraction_version="docling-v1",
+            candidate_model_digest="candidate-v1",
+            decision_model_digest="decision-v1",
+            candidate_set_digest="catalog-v1",
+            max_candidates=4,
+            confirmation_threshold=0.7,
+        )
+
+    assert cached is not None
+    assert cached.decisions[0].tag in {"first", "second"}
+
+
+def test_generation_is_bounded_before_decision() -> None:
+    gateway = FakeGateway([f"tag-{index}" for index in range(10)])
+
+    result = recommend_tags(
+        "report",
+        file_hash="bounded",
+        extraction_version="v1",
+        search=FakeSearch(["existing"]),
+        gateway=gateway,
+        max_candidates=3,
+    )
+
+    assert [item.tag for item in result.decisions] == [
+        "existing",
+        "tag-0",
+        "tag-1",
+    ]
+
+
+def test_low_confidence_rejection_still_requires_confirmation() -> None:
+    class RejectingGateway(FakeGateway):
+        async def system_one(
+            self,
+            model: str,
+            *,
+            state: Any,
+            questions: Mapping[str, Any],
+            keep_alive: float | str | None = "5m",
+        ) -> SimpleNamespace:
+            result = await super().system_one(
+                model,
+                state=state,
+                questions=questions,
+                keep_alive=keep_alive,
+            )
+            for answer in result.answers.values():
+                answer["choice"] = "reject"
+                answer["confidence"] = 0.55
+                answer["probabilities"] = {
+                    "accept": 0.225,
+                    "review": 0.225,
+                    "reject": 0.55,
+                }
+            return result
+
+    result = recommend_tags(
+        "report",
+        file_hash="review",
+        extraction_version="v1",
+        search=FakeSearch([]),
+        gateway=RejectingGateway(["possibly-relevant"]),
+        candidate_model_digest="candidate",
+        decision_model_digest="decision",
+        confirmation_threshold=0.7,
+    )
+
+    assert result.decisions[0].decision == "review"
+    assert result.requires_confirmation == ("possibly-relevant",)
+
+
+def _seed_production_chunk(
+    session: Any,
+    *,
+    path: Path,
+    stable_id: str,
+    text_value: str,
+    vector: tuple[float, ...],
+    tags: Sequence[str],
+    model_digest: str,
+    index_version: str,
+) -> None:
+    file = File(
+        canonical_path=str(path.resolve()),
+        mime_type="text/markdown",
+        indexing_state="indexed",
+    )
+    session.add(file)
+    session.flush()
+    document = Document(
+        file_id=file.id,
+        revision=1,
+        file_hash=f"hash-{stable_id}",
+        extraction_version="test",
+        parser="test",
+        page_count=1,
+        extraction_status="complete",
+        diagnostics=[],
+    )
+    session.add(document)
+    session.flush()
+    page = Page(
+        document_id=document.id,
+        page_number=1,
+        ordinal=0,
+        text=text_value,
+        markdown=text_value,
+        headings=[],
+        quality="good",
+    )
+    session.add(page)
+    session.flush()
+    chunk = Chunk(
+        stable_id=stable_id,
+        document_id=document.id,
+        page_id=page.id,
+        ordinal=0,
+        text=text_value,
+        content_hash=f"content-{stable_id}",
+        model_digest=model_digest,
+        index_version=index_version,
+    )
+    session.add(chunk)
+    session.flush()
+    session.execute(
+        text(
+            "INSERT INTO chunk_embeddings_256 "
+            "(chunk_id, embedding) VALUES (:chunk_id, :embedding)"
+        ),
+        {
+            "chunk_id": chunk.id,
+            "embedding": struct.pack("<256f", *vector),
+        },
+    )
+    for tag_name in tags:
+        tag = Tag(name=tag_name)
+        session.add(tag)
+        session.flush()
+        session.add(FileTag(file_id=file.id, tag_id=tag.id))
+
+
+def test_production_tag_suggester_uses_semantic_hybrid_search_and_new_quota(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    profile = ModelProfile(
+        role="embedding",
+        model="embeddinggemma-2:270m",
+        digest="sha256:embedding",
+        context_length=32_768,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    assert profile.default_index_version is not None
+    relevant_vector = (1.0, 0.0, *((0.0,) * 254))
+    irrelevant_vector = (0.0, 1.0, *((0.0,) * 254))
+    factory = create_session_factory(paths.database)
+    with factory.begin() as session:
+        session.add(
+            ModelProfileRecord(
+                role=profile.role,
+                model=profile.model,
+                digest=profile.digest,
+                dimensions=profile.dimensions,
+                context_length=profile.context_length,
+                index_version=profile.default_index_version,
+                capabilities=list(profile.capabilities),
+                benchmark_data={},
+            )
+        )
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "semantic-map.md",
+            stable_id="semantic-map",
+            text_value="A catalog of subterranean cartography.",
+            vector=relevant_vector,
+            tags=tuple(f"existing-{index:02d}" for index in range(26)),
+            model_digest=profile.digest,
+            index_version=profile.default_index_version,
+        )
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "unrelated-ledger.md",
+            stable_id="unrelated-ledger",
+            text_value="Quarterly invoices and account balances.",
+            vector=irrelevant_vector,
+            tags=("invoice-only",),
+            model_digest=profile.digest,
+            index_version=profile.default_index_version,
+        )
+
+    source = tmp_path / "friendly-woodland-animal.txt"
+    source.write_text("friendly woodland animal habitat", encoding="utf-8")
+
+    class EmbeddingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([f"new-{index:02d}" for index in range(12)])
+            self.embedding_calls: list[dict[str, Any]] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            self.embedding_calls.append(
+                {
+                    "model": model,
+                    "text": text,
+                    "dimensions": dimensions,
+                    "truncate": truncate,
+                    "keep_alive": keep_alive,
+                }
+            )
+            return (relevant_vector,)
+
+    gateway = EmbeddingGateway()
+    result = TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=gateway,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=SimpleNamespace(
+            session_factory=factory,
+            embedding_profile=profile,
+            candidate_model="inkling-2-mini",
+            decision_model="nimble:9b",
+        ),
+    ).recommend_tags_for_file(str(source))
+
+    assert len(result.decisions) == 24
+    assert sum(not item.is_new for item in result.decisions) == 12
+    assert sum(item.is_new for item in result.decisions) == 12
+    assert "invoice-only" not in {item.tag for item in result.decisions}
+    assert {item.tag for item in result.decisions if item.is_new} == {
+        f"new-{index:02d}" for index in range(12)
+    }
+    assert len(gateway.embedding_calls) == 1
+    assert "friendly woodland animal habitat" in str(gateway.embedding_calls[0]["text"])
+
+
+def test_production_tag_suggester_uses_runtime_selected_embedding_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    profile_a = ModelProfile(
+        role="embedding",
+        model="embedding-a",
+        digest="sha256:embedding-a",
+        context_length=32_768,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    profile_b = ModelProfile(
+        role="embedding",
+        model="embedding-b",
+        digest="sha256:embedding-b",
+        context_length=32_768,
+        dimensions=512,
+        capabilities=("embedding",),
+    )
+    decision_profile = ModelProfile(
+        role="decision",
+        model="decision-a",
+        digest="sha256:decision-a",
+        context_length=32_768,
+        capabilities=("systemone",),
+    )
+    generation_profile = ModelProfile(
+        role="generation",
+        model="candidate-a",
+        digest="sha256:candidate-a",
+        context_length=32_768,
+        capabilities=("completion",),
+    )
+    factory = create_session_factory(paths.database)
+    with factory.begin() as session:
+        for profile in (profile_a, profile_b):
+            session.add(
+                ModelProfileRecord(
+                    role=profile.role,
+                    model=profile.model,
+                    digest=profile.digest,
+                    dimensions=profile.dimensions,
+                    context_length=profile.context_length,
+                    index_version=profile.default_index_version,
+                    capabilities=list(profile.capabilities),
+                    benchmark_data={},
+                )
+            )
+
+    source = tmp_path / "selected-profile.txt"
+    source.write_text("selected profile", encoding="utf-8")
+
+    class EmbeddingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__(["generated"])
+            self.embedding_calls: list[str] = []
+
+        async def embed(
+            self,
+            model: str,
+            text: str | Sequence[str],
+            *,
+            dimensions: int | None = None,
+            truncate: bool = False,
+            keep_alive: float | str | None = "5m",
+        ) -> tuple[tuple[float, ...], ...]:
+            del text, truncate, keep_alive
+            self.embedding_calls.append(model)
+            assert dimensions == profile_a.dimensions
+            return (tuple(0.0 for _ in range(profile_a.dimensions or 0)),)
+
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        readiness=ReadinessReport(
+            ready=True,
+            profiles=(
+                profile_a,
+                profile_b,
+                decision_profile,
+                generation_profile,
+            ),
+            selected_models=RequiredModels(
+                embedding=profile_a.model,
+                decision="decision-a",
+                generation="candidate-a",
+            ),
+        ),
+    )
+    gateway = EmbeddingGateway()
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=gateway,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert gateway.embedding_calls == ["embedding-a"]
+    assert [call["model"] for call in gateway.chat_calls] == ["candidate-a"]
+    assert [call["model"] for call in gateway.decision_calls] == ["decision-a"]
+
+
+def test_production_tag_suggester_rejects_incomplete_runtime_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    factory = create_session_factory(paths.database)
+    source = tmp_path / "incomplete-selection.txt"
+    source.write_text("incomplete selection", encoding="utf-8")
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        readiness=ReadinessReport(
+            ready=False,
+            selected_models=RequiredModels(
+                embedding="embedding-a",
+                decision="decision-a",
+                generation="candidate-a",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Modern runtime model selection is incomplete",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            gateway=FakeGateway(["generated"]),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_production_tag_suggester_reports_gemini_readiness_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    factory = create_session_factory(paths.database)
+    source = tmp_path / "gemini-readiness.txt"
+    source.write_text("gemini readiness", encoding="utf-8")
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        candidate_model=None,
+        decision_model=None,
+        embedding_profile=None,
+        readiness=ReadinessReport(
+            ready=False,
+            provider="gemini",
+            blocked_model_roles=("embedding", "decision", "generation"),
+            errors=("Gemini authentication failed.",),
+            gemini=GeminiReadiness(
+                available=False,
+                key_configured=True,
+                api_key_configured=True,
+                missing_key=False,
+                errors=("Gemini authentication failed.",),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Gemini authentication failed",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_production_tag_suggester_reports_gemini_readiness_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    factory = create_session_factory(paths.database)
+    source = tmp_path / "gemini-initializing.txt"
+    source.write_text("gemini initializing", encoding="utf-8")
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        candidate_model=None,
+        decision_model=None,
+        embedding_profile=None,
+        readiness=None,
+        unavailable_reason="Gemini readiness is still being checked.",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Gemini readiness is still being checked",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_tag_suggester_prefers_modern_gemini_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "gemini-routing.sqlite")
+    source = tmp_path / "gemini-routing.txt"
+    source.write_text("gemini routing", encoding="utf-8")
+
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    candidate_gateway = object()
+    decision_gateway = object()
+    embedding_gateway = SimpleNamespace(provider="gemini")
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=candidate_gateway,
+        decision_gateway=decision_gateway,
+        embedding_gateway=embedding_gateway,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["gateway"] is candidate_gateway
+    assert captured["decision_gateway"] is decision_gateway
+    assert captured["embedding_gateway"] is embedding_gateway
+
+
+def test_tag_suggester_runtime_exact_gemini_uses_runtime_embedding_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "runtime-gemini-embedding.sqlite")
+    source = tmp_path / "runtime-gemini-embedding.txt"
+    source.write_text("runtime gemini embedding", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiGateway:
+        provider = "gemini"
+
+    candidate_gateway = GeminiGateway()
+    decision_gateway = GeminiGateway()
+    embedding_gateway = GeminiGateway()
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=candidate_gateway,
+        decision_gateway=decision_gateway,
+        embedding_gateway=embedding_gateway,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["gateway"] is candidate_gateway
+    assert captured["embedding_gateway"] is embedding_gateway
+
+
+def test_tag_suggester_runtime_exact_gemini_rejects_candidate_gateway_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "runtime-gemini-reuse.sqlite")
+    source = tmp_path / "runtime-gemini-reuse.txt"
+    source.write_text("runtime gemini reuse", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiGateway:
+        provider = "gemini"
+
+    candidate_gateway = GeminiGateway()
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            raise AssertionError("CandidateService must not be constructed")
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=candidate_gateway,
+        decision_gateway=GeminiGateway(),
+        embedding_gateway=candidate_gateway,
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_tag_suggester_runtime_exact_gemini_rejects_unmarked_embedding_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "runtime-gemini-unmarked.sqlite")
+    source = tmp_path / "runtime-gemini-unmarked.txt"
+    source.write_text("runtime gemini unmarked", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+
+    class GeminiGateway:
+        provider = "gemini"
+
+    class DuckTypedEmbeddingGateway:
+        pass
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            raise AssertionError("CandidateService must not be constructed")
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        active_provider="gemini",
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=GeminiGateway(),
+        decision_gateway=GeminiGateway(),
+        embedding_gateway=DuckTypedEmbeddingGateway(),
+    )
+
+    with pytest.raises(
+        GeminiUnavailableError,
+        match="The Gemini embedding gateway is unavailable.",
+    ):
+        TagSuggester(
+            SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+            cache=InMemoryTagRecommendationCache(),
+            modern_runtime=runtime,
+        ).recommend_tags_for_file(str(source))
+
+
+def test_tag_suggester_preserves_explicit_gateways_over_modern_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "explicit-routing.sqlite")
+    source = tmp_path / "explicit-routing.txt"
+    source.write_text("explicit routing", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    explicit_candidate = object()
+    explicit_decision = object()
+    runtime_embedding = SimpleNamespace(provider="gemini")
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=object(),
+        decision_gateway=object(),
+        embedding_gateway=runtime_embedding,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=explicit_candidate,
+        decision_gateway=explicit_decision,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["gateway"] is explicit_candidate
+    assert captured["decision_gateway"] is explicit_decision
+    assert captured["embedding_gateway"] is runtime_embedding
+
+
+def test_tag_suggester_explicit_embedding_gateway_overrides_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger import tag_suggestion
+    from file_tagger.tag_suggestion import TagSuggester
+
+    factory = create_session_factory(tmp_path / "explicit-embedding-routing.sqlite")
+    source = tmp_path / "explicit-embedding-routing.txt"
+    source.write_text("explicit embedding routing", encoding="utf-8")
+    profile = ModelProfile(
+        role="embedding",
+        model="gemini-embedding-2",
+        digest="gemini-embedding-digest",
+        context_length=32_768,
+        dimensions=768,
+        capabilities=("embedding",),
+    )
+    explicit_embedding = SimpleNamespace(provider="gemini")
+    runtime_embedding = SimpleNamespace(provider="gemini")
+    captured: dict[str, Any] = {}
+
+    class CapturingCandidateService:
+        def __init__(self, search: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def recommend(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(decisions=())
+
+    monkeypatch.setattr(tag_suggestion, "CandidateService", CapturingCandidateService)
+    runtime = SimpleNamespace(
+        session_factory=factory,
+        embedding_profile=profile,
+        candidate_model="gemini-4-hydrogen",
+        decision_model="gemini-decision-1",
+        candidate_gateway=object(),
+        decision_gateway=object(),
+        embedding_gateway=runtime_embedding,
+    )
+
+    TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        embedding_gateway=explicit_embedding,
+        cache=InMemoryTagRecommendationCache(),
+        modern_runtime=runtime,
+    ).recommend_tags_for_file(str(source))
+
+    assert captured["embedding_gateway"] is explicit_embedding
+
+
+def test_runtime_helpers_do_not_fall_back_to_stale_readiness_report() -> None:
+    from file_tagger.tag_suggestion import (
+        _runtime_embedding_profile,
+        _runtime_selected_model,
+    )
+
+    profile = ModelProfile(
+        role="embedding",
+        model="embedding-a",
+        digest="sha256:embedding-a",
+        context_length=32_768,
+        dimensions=256,
+        capabilities=("embedding",),
+    )
+    runtime = SimpleNamespace(
+        embedding_profile=None,
+        candidate_model=None,
+        decision_model=None,
+        readiness=ReadinessReport(
+            ready=True,
+            profiles=(profile,),
+            selected_models=RequiredModels(
+                embedding=profile.model,
+                decision="decision-a",
+                generation="candidate-a",
+            ),
+        ),
+    )
+
+    assert _runtime_embedding_profile(runtime) is None
+    assert _runtime_selected_model(runtime, "generation") is None
+    assert _runtime_selected_model(runtime, "decision") is None
+
+
+def test_production_tag_suggester_uses_query_aware_fts_without_embedding_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from file_tagger.tag_suggestion import TagSuggester
+
+    data_dir = tmp_path / "app-data"
+    monkeypatch.setenv("FILE_TAGGER_DATA_DIR", str(data_dir))
+    paths = AppPaths.discover()
+    upgrade_database(paths.database)
+    model_digest = "sha256:index-only"
+    index_version = f"embeddinggemma-2:270m@{model_digest}:256"
+    relevant_vector = (1.0, 0.0, *((0.0,) * 254))
+    factory = create_session_factory(paths.database)
+    with factory.begin() as session:
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "cathedral-budget.md",
+            stable_id="cathedral-budget",
+            text_value="Cathedral restoration project budget and masonry.",
+            vector=relevant_vector,
+            tags=tuple(f"architecture-{index:02d}" for index in range(26)),
+            model_digest=model_digest,
+            index_version=index_version,
+        )
+        _seed_production_chunk(
+            session,
+            path=tmp_path / "garden-notes.md",
+            stable_id="garden-notes",
+            text_value="Seasonal planting notes and compost.",
+            vector=relevant_vector,
+            tags=("gardening-only",),
+            model_digest=model_digest,
+            index_version=index_version,
+        )
+
+    source = tmp_path / "cathedral-budget.txt"
+    source.write_text("Cathedral restoration budget", encoding="utf-8")
+    gateway = FakeGateway([f"new-{index:02d}" for index in range(12)])
+
+    result = TagSuggester(
+        SimpleNamespace(get_pdf_extractor=lambda: "accurate"),
+        gateway=gateway,
+        cache=InMemoryTagRecommendationCache(),
+    ).recommend_tags_for_file(str(source))
+
+    selected = {item.tag for item in result.decisions}
+    assert len(selected) == 24
+    assert "gardening-only" not in selected
+    assert sum(not item.is_new for item in result.decisions) == 12
+    assert sum(item.is_new for item in result.decisions) == 12

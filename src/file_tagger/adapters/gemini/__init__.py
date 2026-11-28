@@ -1,0 +1,1 @@
+"""Google Gemini cloud adapter."""

@@ -15,6 +15,41 @@ while replacing Chroma and cloud/direct model loading with one SQLite database,
 SQLite FTS5, `sqlite-vec 0.1.9`, Docling 2.152.0, Ollama 0.6.3, Pydantic
 2.14.4, pytest 9.2.0, Ruff 0.17.6, Mypy 2.4.1.
 
+## Implementation Status
+
+Last updated: 2026-11-24
+
+| Tasks | Status | Commits |
+| --- | --- | --- |
+| 1-3: Python toolchain, package layout, per-user paths | Complete | `7626340`, `32896c5`, `4da9b2e` |
+| 4-6: domain contracts, SQLite extensions, unified schema | Complete | `a00c206`, `49a25ea`, `b90fcfb` |
+| 7: legacy SQLite/config migration | Complete | `894ddc8` |
+| 8: legacy Chroma inventory | Complete | `a5dfebb` |
+| 9: loopback-only Ollama gateway | Complete | `117de1e` |
+| 10: hardware-based model recommendations | Complete | `9ffdba5` |
+| 11: Ollama readiness benchmarks | Complete | `fe8adfd` |
+| 12: Docling extraction adapter | Complete | `eda16f8` |
+| 13: selective PDF vision fallback | Complete | `ad941b0` |
+| 14: provenance-aware chunking | Complete | `a23e027` |
+| 15: complete embedding coverage | Complete | `89c7b34` |
+| 16: resumable transactional indexing | Complete | `a6bcb05`, `c8fe9f1`, `284bed4`, `cf7de50`, `fbdd6fd` |
+| 17: SQLite hybrid search | Complete | `ad05116`, `82c395e`, `fbdd6fd` |
+| 18: citation-first search results | Complete | `4f117a3`, `c3ec25a` |
+| 19: typed Ollama tag decisions | Complete | `eae8b89`, `862df67`, `50e588c`, `3ab3ebe`, `3b7dc81` |
+| 20: cached typed tag recommendations | Complete | `b1bd9bc`, `1b3e677`, `d2e1681`, `3b7dc81`, `10a9fd5`, `d44bbdd`, `7ae3dd2`, `cd5ede3`, `6817c13`, `fa87cea` |
+| 21: Markdown-context search planning | Complete | `43f17f4`, `37c8aaf`, `89fba5a`, `321f312`, `3b7dc81` |
+| 22: citation-validated RAG answers | Complete | `e67bb06`, `484f5c1`, `621a118`, `da9c1d9`, `4015089`, `210e038`, `89a84ae`, `072830b`, `bf92703`, `1f23a19`, `f761fb4`, `ae330c3` |
+| 23: Ollama readiness settings UI | Complete | `bccb13a`, `b71d123`, `52f67f8`, `04826c9`, `ec35f5e` |
+| 24: resumable indexing UI | Complete | `5298446`, `8d35480`, `70c3709`, `0d173d1`, `1907872`, `9faa796`, `7e5edc3`, `4015089`, `210e038` |
+| 25: contextual Markdown search and chat | Complete | `59d4209`, `70351f8`, `f4e55da`, `77cc525`, `52d4a64`, `cd076f0`, `154347c` |
+| 26: remove cloud and legacy runtime stacks | Complete | `f994df67`, `e137eb0`, `89d9e54`, `d23a07a` |
+| 27: golden migration/retrieval acceptance | Complete | `eb2e9fd`, `76f6713` |
+| 28: Windows packaging and per-user migration | Complete | `f5b4d76`, `637d926`, `2a2d0fd`, `35f4f27`, `0359291` |
+| 29: opt-in real Ollama quality suite | Complete | `41a3fb3`, `839df2f`, `c7ff483` |
+
+Completed work is marked below with `Status: Complete`. Any task without that
+marker remains unimplemented unless this table is updated.
+
 ---
 
 ## Execution Rules
@@ -47,6 +82,8 @@ SQLite FTS5, `sqlite-vec 0.1.9`, Docling 2.152.0, Ollama 0.6.3, Pydantic
 ## Phase 0: Project Foundation
 
 ### Task 1: Lock the Modern Python Toolchain
+
+**Status: Complete**
 
 **Files:**
 - Modify: `pyproject.toml`
@@ -104,6 +141,8 @@ git commit -m "build: lock modern Python toolchain"
 
 ### Task 2: Create the Importable Application Package
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/__init__.py`
 - Create: `src/file_tagger/__main__.py`
@@ -155,6 +194,8 @@ git commit -m "refactor: create file_tagger package"
 
 ### Task 3: Define Per-User Application Paths
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/infrastructure/app_paths.py`
 - Modify: `src/file_tagger/main.py`
@@ -200,6 +241,8 @@ git commit -m "feat: isolate application data paths"
 ```
 
 ### Task 4: Add Typed Domain Records and Explicit Errors
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/domain/errors.py`
@@ -252,6 +295,8 @@ git commit -m "feat: add typed local AI contracts"
 
 ### Task 5: Load FTS5 and sqlite-vec on Every Connection
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/infrastructure/database.py`
 - Test: `tests/infrastructure/test_database.py`
@@ -294,6 +339,8 @@ git commit -m "feat: bootstrap sqlite search extensions"
 ```
 
 ### Task 6: Create the Versioned Unified Schema
+
+**Status: Complete**
 
 **Files:**
 - Create: `alembic.ini`
@@ -356,6 +403,8 @@ git commit -m "feat: add unified search database schema"
 
 ### Task 7: Migrate Existing Tags, Files, and Config
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/migration/sqlite_migration.py`
 - Create: `src/file_tagger/migration/config_migration.py`
@@ -399,6 +448,8 @@ git commit -m "feat: migrate legacy tags and settings"
 
 ### Task 8: Detect and Retire Legacy Chroma State
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/migration/legacy_chroma.py`
 - Create: `tests/migration/test_legacy_chroma.py`
@@ -440,6 +491,8 @@ git commit -m "feat: inventory legacy chroma content"
 ## Phase 2: Ollama and Hardware Readiness
 
 ### Task 9: Add the Loopback-Only Ollama Gateway
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/adapters/ollama/gateway.py`
@@ -487,6 +540,8 @@ git commit -m "feat: add local Ollama gateway"
 ```
 
 ### Task 10: Recommend Models from Hardware
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/ollama/hardware.py`
@@ -540,6 +595,8 @@ git commit -m "feat: recommend Ollama models from hardware"
 
 ### Task 11: Benchmark and Persist Model Profiles
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/ollama/benchmarks.py`
 - Create: `src/file_tagger/ollama/readiness.py`
@@ -584,6 +641,8 @@ git commit -m "feat: add Ollama readiness benchmarks"
 
 ### Task 12: Replace PDF/Office Extraction with Docling
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/extraction/docling_adapter.py`
 - Create: `src/file_tagger/extraction/quality.py`
@@ -626,6 +685,8 @@ git commit -m "feat: extract documents with Docling"
 ```
 
 ### Task 13: Add Selective Vision Augmentation
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/extraction/vision_candidates.py`
@@ -672,6 +733,8 @@ git commit -m "feat: add selective PDF vision fallback"
 
 ### Task 14: Make Chunking Structure- and Context-Aware
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/indexing/chunker.py`
 - Delete behavior in: `src/file_tagger/vector_search/document_chunker.py`
@@ -712,6 +775,8 @@ git commit -m "feat: add provenance-aware document chunking"
 ```
 
 ### Task 15: Enforce Full Coverage at the Embedding Boundary
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/indexing/embedder.py`
@@ -755,6 +820,8 @@ git commit -m "feat: guarantee complete embedding coverage"
 ```
 
 ### Task 16: Add Transactional, Resumable Index Jobs
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/indexing/service.py`
@@ -801,6 +868,8 @@ git commit -m "feat: add resumable transactional indexing"
 
 ### Task 17: Implement FTS5 and Vector Search with RRF
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/search/hybrid.py`
 - Create: `src/file_tagger/search/rrf.py`
@@ -845,6 +914,8 @@ git commit -m "feat: add SQLite hybrid search"
 
 ### Task 18: Add Citation-First Search Results
 
+**Status: Complete**
+
 **Files:**
 - Modify: `src/file_tagger/search/hybrid.py`
 - Create: `src/file_tagger/search/results.py`
@@ -888,6 +959,8 @@ git commit -m "feat: add cited hybrid search results"
 ## Phase 5: Typed Tagging
 
 ### Task 19: Replace Free-Form Tag Parsing with Nimble/Tev1
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/tagging/decision_service.py`
@@ -934,6 +1007,8 @@ git commit -m "feat: add typed Ollama tag decisions"
 
 ### Task 20: Generate and Cache Tag Candidates
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/tagging/candidate_service.py`
 - Create: `src/file_tagger/tagging/cache.py`
@@ -975,6 +1050,8 @@ git commit -m "feat: cache typed tag recommendations"
 ## Phase 6: Contextual RAG
 
 ### Task 21: Build a Typed Search Plan from Question Plus Markdown
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/rag/planner.py`
@@ -1019,10 +1096,12 @@ git commit -m "feat: plan searches from Markdown context"
 
 ### Task 22: Rerank Evidence and Generate Cited Answers
 
+**Status: Complete**
+
 **Files:**
 - Create: `src/file_tagger/rag/service.py`
 - Create: `src/file_tagger/rag/citations.py`
-- Test: `tests/rag/test_service.py`
+- Test: `tests/rag/test_rag_service.py`
 
 **Step 1: Write the failing citation-validation test**
 
@@ -1037,7 +1116,7 @@ def test_answer_without_valid_citation_is_rejected(fake_model, evidence) -> None
 
 **Step 2: Run the test to verify it fails**
 
-Run: `pytest tests/rag/test_service.py -v`
+Run: `pytest tests/rag/test_rag_service.py -v`
 Expected: FAIL because citation-aware RAG is absent.
 
 **Step 3: Implement bounded RAG**
@@ -1049,7 +1128,7 @@ Use "not found in indexed files" when evidence is insufficient.
 
 **Step 4: Run RAG quality and failure tests**
 
-Run: `pytest tests/rag/test_service.py -v`
+Run: `pytest tests/rag/test_rag_service.py -v`
 Expected: citation IDs resolve, follow-up chat reuses evidence, unsupported
 claims fail, and model context overflow triggers further evidence reduction.
 
@@ -1063,6 +1142,8 @@ git commit -m "feat: generate citation-validated local answers"
 ## Phase 7: PySide6 Integration
 
 ### Task 23: Replace API Settings with Ollama Readiness Settings
+
+**Status: Complete**
 
 **Files:**
 - Create: `src/file_tagger/ui/ollama_settings.py`
@@ -1108,6 +1189,8 @@ git commit -m "feat: replace provider settings with Ollama readiness"
 
 ### Task 24: Wire Indexing, Reindex, and Migration Progress
 
+**Status: Complete**
+
 **Files:**
 - Modify: `src/file_tagger/initialization.py`
 - Modify: `src/file_tagger/file_tag_manager.py`
@@ -1149,6 +1232,8 @@ git commit -m "feat: expose resumable indexing in desktop UI"
 ```
 
 ### Task 25: Add Contextual Markdown Search and Chat
+
+**Status: Complete**
 
 **Files:**
 - Modify: `src/file_tagger/file_tag_manager.py`
@@ -1193,6 +1278,8 @@ git commit -m "feat: add Markdown-contextual local search"
 ## Phase 8: Cleanup, Packaging, and Acceptance
 
 ### Task 26: Remove Cloud and Competing Runtime Stacks
+
+**Status: Complete**
 
 **Files:**
 - Delete: `src/file_tagger/ai_service.py` if not already removed
@@ -1258,6 +1345,8 @@ git commit -m "refactor: remove cloud and legacy model stacks"
 
 ### Task 27: Add Golden Migration and Retrieval Acceptance Tests
 
+**Status: Complete**
+
 **Files:**
 - Create: `tests/acceptance/test_full_upgrade.py`
 - Create: `tests/fixtures/legacy/file_tags.sqlite3`
@@ -1315,6 +1404,8 @@ git commit -m "test: cover local upgrade and contextual search"
 
 ### Task 28: Package the Windows Application and Per-User Migration
 
+**Status: Complete**
+
 **Files:**
 - Modify: `pyproject.toml`
 - Create: `packaging/file-tagger.spec`
@@ -1366,6 +1457,8 @@ git commit -m "build: package local-first File Tagger"
 ```
 
 ### Task 29: Run the Opt-In Real Ollama Quality Suite
+
+**Status: Complete**
 
 **Files:**
 - Create: `tests/integration_ollama/conftest.py`
